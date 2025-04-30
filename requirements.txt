@@ -7,3 +7,4 @@ biopython
 py3Dmol
 stmol
 plotly
+ipython_genutils
