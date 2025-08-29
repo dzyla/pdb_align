@@ -8,3 +8,5 @@ py3Dmol
 stmol
 plotly
 ipython_genutils
+matplotlib
+streamlit-molstar
