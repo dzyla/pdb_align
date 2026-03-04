@@ -81,6 +81,22 @@ class PDBAligner:
                         if not __import__('numpy').isnan(ident):
                             print(f"  Chain {r_ch} (ref) - Chain {m_ch} (mobile): {ident:.1f}%")
 
+    def set_reference_chains(self, chains: List[Union[str, int]]):
+        """Changes the reference chains to use for alignment."""
+        if not self.ref_file:
+            raise ValueError("Reference structure must be set first.")
+        self.chains_ref = chains
+        if self.verbose:
+            print(f"Reference chains updated to: {chains}")
+
+    def set_mobile_chains(self, chains: List[Union[str, int]]):
+        """Changes the mobile chains to use for alignment."""
+        if not self.mob_file:
+            raise ValueError("Mobile structure must be set first.")
+        self.chains_mob = chains
+        if self.verbose:
+            print(f"Mobile chains updated to: {chains}")
+
     def align(self, mode: str = "auto", seq_gap_open: float = -10, seq_gap_extend: float = -0.5, **kwargs):
         """
         Runs the alignment process.
@@ -219,8 +235,12 @@ class PDBAligner:
             return chosen["seqfree"].pairs
         return None
 
+    def get_structure_based_sequence_alignment(self) -> Optional[tuple]:
+        """Alias for get_sequence_alignment(). Returns the structure-derived sequence alignment (seqA, seqB, score)."""
+        return self.get_sequence_alignment()
+
     def get_sequence_alignment(self) -> Optional[tuple]:
-        """Returns sequence alignment tuple (seqA, seqB, score)."""
+        """Returns structure-derived sequence alignment tuple (seqA, seqB, score)."""
         if not self.last_result:
             return None
         chosen = self.last_result["chosen"]
@@ -354,6 +374,89 @@ class PDBAligner:
         if score is not None:
             print(f"Alignment Score: {score}")
 
+    def get_general_sequence_alignment(self, ref_chain: str, mob_chain: str, gap_open: float = -10.0, gap_extend: float = -0.5) -> Optional[tuple]:
+        """
+        Computes a classic sequence alignment between two specified chains.
+        Returns a tuple (seqA_aln, seqB_aln, score).
+        """
+        if not self.ref_file or not self.mob_file:
+            raise ValueError("Reference and mobile structures must be loaded first.")
+
+        if ref_chain not in self.ref_seqs:
+            raise ValueError(f"Reference chain '{ref_chain}' not found.")
+        if mob_chain not in self.mob_seqs:
+            raise ValueError(f"Mobile chain '{mob_chain}' not found.")
+
+        seqA = str(self.ref_seqs[ref_chain].seq)
+        seqB = str(self.mob_seqs[mob_chain].seq)
+
+        aln = perform_sequence_alignment(seqA, seqB, gap_open, gap_extend)
+        if aln:
+            return aln.seqA, aln.seqB, aln.score
+        return None
+
+    def print_general_sequence_alignment(self, ref_chain: str, mob_chain: str, interval: int = 10, gap_open: float = -10.0, gap_extend: float = -0.5):
+        """
+        Prints a classic sequence alignment directly between two specified chains.
+        """
+        aln_data = self.get_general_sequence_alignment(ref_chain, mob_chain, gap_open, gap_extend)
+        if not aln_data:
+            print("No general alignment data could be produced.")
+            return
+
+        seqA, seqB, score = aln_data
+        ref_id = f"Ref ({os.path.basename(self.ref_file)} - {ref_chain})"
+        mob_id = f"Mob ({os.path.basename(self.mob_file)} - {mob_chain})"
+
+        def numline(aln: str, interval=10):
+            line = [' '] * len(aln)
+            c = 0
+            nxt = interval
+            for i, ch in enumerate(aln):
+                if ch != '-':
+                    c += 1
+                    if c == nxt:
+                        s = str(nxt)
+                        start = max(0, i - len(s) + 1)
+                        for k, d in enumerate(s):
+                            if start + k < len(aln):
+                                line[start + k] = d
+                        nxt += interval
+            return ''.join(line)
+
+        pad = max(len(ref_id), len(mob_id))
+        id1p = ref_id.ljust(pad)
+        id2p = mob_id.ljust(pad)
+        mp = "Match".ljust(pad)
+
+        from Bio.Align import substitution_matrices
+        try:
+            blosum62 = substitution_matrices.load("BLOSUM62")
+        except:
+            blosum62 = {}
+
+        match = ""
+        for a, b in zip(seqA, seqB):
+            if a == b and a != '-':
+                match += "|"
+            elif a != '-' and b != '-' and (blosum62.get((a, b), blosum62.get((b, a), 0)) > 0):
+                match += ":"
+            elif a == '-' or b == '-':
+                match += " "
+            else:
+                match += "."
+
+        loc1, loc2 = numline(seqA, interval), numline(seqB, interval)
+        padsp = " " * (pad + 2)
+
+        print("General Pairwise Alignment:")
+        print(f"{padsp}{loc1}")
+        print(f"{id1p}: {seqA}")
+        print(f"{mp}  {match}")
+        print(f"{id2p}: {seqB}")
+        print(f"{padsp}{loc2}")
+        print(f"Alignment Score: {score}")
+
     def get_rotation(self) -> Optional['numpy.ndarray']:
         """Returns the rotation matrix of the best alignment."""
         if not self.last_result: return None
@@ -370,6 +473,74 @@ class PDBAligner:
         elif chosen["seqfree"]: return chosen["seqfree"].translation
         return None
 
+    def get_rmsd_df(self, on: str = 'reference'):
+        """
+        Returns a Pandas DataFrame containing per-residue RMSD.
+
+        on: 'reference' or 'mobile' numbering.
+        """
+        import pandas as pd
+        import numpy as np
+
+        if not self.last_result:
+            raise ValueError("No alignment results available. Run align() first.")
+
+        chosen = self.last_result["chosen"]
+
+        labels = []
+        chains = []
+        distances = []
+
+        if chosen["seqguided"]:
+            atoms = chosen["seqguided"]["ref_atoms"] if on == 'reference' else chosen["seqguided"]["mob_atoms"]
+            per_res_rmsd = chosen["seqguided"]["si"]["per_residue_rmsd"]
+
+            for idx, a in enumerate(atoms):
+                p = a.get_parent()
+                chain = p.get_parent().id
+                rid = p.get_id()
+                lbl = f"{chain}:{rid[1]}{rid[2].strip()}" if str(rid[2]).strip() else f"{chain}:{rid[1]}"
+                labels.append(lbl)
+                chains.append(chain)
+                distances.append(per_res_rmsd[idx])
+
+        elif chosen["seqfree"]:
+            ref_subset = chosen["seqfree"].ref_subset_infos
+            mob_subset = chosen["seqfree"].mob_subset_infos
+            pairs = chosen["seqfree"].pairs
+
+            for (i, j) in pairs:
+                r_info = ref_subset[i]
+                m_info = mob_subset[j]
+
+                diff = chosen["seqfree"].ref_subset_ca_coords[i] - chosen["seqfree"].mob_subset_ca_coords_aligned[j]
+                dist = np.linalg.norm(diff)
+
+                if on == 'reference':
+                    lbl = f"{r_info.chain_id}:{r_info.resseq}{r_info.icode.strip()}"
+                    chain = r_info.chain_id
+                else:
+                    lbl = f"{m_info.chain_id}:{m_info.resseq}{m_info.icode.strip()}"
+                    chain = m_info.chain_id
+
+                labels.append(lbl)
+                chains.append(chain)
+                distances.append(dist)
+
+        df = pd.DataFrame({
+            "Residue": labels,
+            "Chain": chains,
+            "RMSD": distances
+        })
+        return df
+
+    def save_rmsd_csv(self, filename: str, on: str = 'reference'):
+        """Saves the per-C-alpha RMSD to a CSV file."""
+        df = self.get_rmsd_df(on=on)
+        df.to_csv(filename, index=False)
+        if self.verbose:
+            print(f"Saved per-residue RMSD to {filename}")
+
     def report_peaks(self, on: str = 'reference', top_n: int = 5):
         """
         Reports the largest C-alpha RMSD peaks between the aligned structures.
@@ -383,41 +554,10 @@ class PDBAligner:
 
         chosen = self.last_result["chosen"]
 
-        if chosen["seqguided"]:
-            atoms = chosen["seqguided"]["ref_atoms"] if on == 'reference' else chosen["seqguided"]["mob_atoms"]
-            per_res_rmsd = chosen["seqguided"]["si"]["per_residue_rmsd"]
-
-            peaks = []
-            for idx, a in enumerate(atoms):
-                p = a.get_parent()
-                chain = p.get_parent().id
-                rid = p.get_id()
-                lbl = f"{chain}:{rid[1]}{rid[2].strip()}" if str(rid[2]).strip() else f"{chain}:{rid[1]}"
-                peaks.append((lbl, per_res_rmsd[idx]))
-
-        elif chosen["seqfree"]:
-            # Recalculate per-res RMSD on the subset
-            import numpy as np
-            ref_subset = chosen["seqfree"].ref_subset_infos
-            mob_subset = chosen["seqfree"].mob_subset_infos
-            pairs = chosen["seqfree"].pairs
-
-            peaks = []
-            for (i, j) in pairs:
-                r_info = ref_subset[i]
-                m_info = mob_subset[j]
-
-                # compute the local distance
-                diff = chosen["seqfree"].ref_subset_ca_coords[i] - chosen["seqfree"].mob_subset_ca_coords_aligned[j]
-                dist = np.linalg.norm(diff)
-
-                if on == 'reference':
-                    lbl = f"{r_info.chain_id}:{r_info.resseq}{r_info.icode.strip()}"
-                else:
-                    lbl = f"{m_info.chain_id}:{m_info.resseq}{m_info.icode.strip()}"
-
-                peaks.append((lbl, dist))
-        else:
+        try:
+            df = self.get_rmsd_df(on=on)
+            peaks = list(zip(df['Residue'], df['RMSD']))
+        except Exception:
             return []
 
         peaks.sort(key=lambda x: x[1], reverse=True)
@@ -440,49 +580,16 @@ class PDBAligner:
         if not self.last_result:
             raise ValueError("No alignment results available. Run align() first.")
 
-        # Get the peaks data
-        peaks = self.report_peaks(on=on, top_n=None)
-        if not peaks:
+        # Get the DataFrame data
+        try:
+            df = self.get_rmsd_df(on=on)
+        except Exception:
             print("No data to plot.")
             return
 
-        # We need to maintain order for plotting
-        labels = []
-        distances = []
-
-        chosen = self.last_result["chosen"]
-
-        if chosen["seqguided"]:
-            atoms = chosen["seqguided"]["ref_atoms"] if on == 'reference' else chosen["seqguided"]["mob_atoms"]
-            per_res_rmsd = chosen["seqguided"]["si"]["per_residue_rmsd"]
-
-            for idx, a in enumerate(atoms):
-                p = a.get_parent()
-                chain = p.get_parent().id
-                rid = p.get_id()
-                lbl = f"{chain}:{rid[1]}{rid[2].strip()}" if str(rid[2]).strip() else f"{chain}:{rid[1]}"
-                labels.append(lbl)
-                distances.append(per_res_rmsd[idx])
-
-        elif chosen["seqfree"]:
-            import numpy as np
-            ref_subset = chosen["seqfree"].ref_subset_infos
-            mob_subset = chosen["seqfree"].mob_subset_infos
-            pairs = chosen["seqfree"].pairs
-
-            for (i, j) in pairs:
-                r_info = ref_subset[i]
-                m_info = mob_subset[j]
-                diff = chosen["seqfree"].ref_subset_ca_coords[i] - chosen["seqfree"].mob_subset_ca_coords_aligned[j]
-                dist = np.linalg.norm(diff)
-
-                if on == 'reference':
-                    lbl = f"{r_info.chain_id}:{r_info.resseq}{r_info.icode.strip()}"
-                else:
-                    lbl = f"{m_info.chain_id}:{m_info.resseq}{m_info.icode.strip()}"
-
-                labels.append(lbl)
-                distances.append(dist)
+        if df.empty:
+            print("No data to plot.")
+            return
 
         with plt.style.context('default'):
             if style == "scientific":
@@ -500,16 +607,16 @@ class PDBAligner:
 
             fig, ax = plt.subplots(figsize=(10, 4))
 
-            # Plot as line + markers
-            ax.plot(range(len(labels)), distances, marker='o', markersize=3, linestyle='-', linewidth=1, color='#1f77b4')
+            # Plot as line + markers with hue by chain
+            sns.lineplot(data=df, x=df.index, y="RMSD", hue="Chain", marker='o', markersize=4, linestyle='-', linewidth=1, ax=ax)
 
             # Formatting X-axis
             # Only show every Nth label to avoid crowding
-            n_labels = len(labels)
+            n_labels = len(df)
             step = max(1, n_labels // 10)
 
             ax.set_xticks(range(0, n_labels, step))
-            ax.set_xticklabels([labels[i] for i in range(0, n_labels, step)], rotation=45, ha='right')
+            ax.set_xticklabels(df["Residue"].iloc[::step], rotation=45, ha='right')
 
             ax.set_xlabel(f"Residue ({on.capitalize()})")
             ax.set_ylabel(r"C$\alpha$ RMSD ($\AA$)")

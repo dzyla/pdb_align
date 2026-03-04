@@ -86,6 +86,36 @@ def test_pdb_aligner():
     except Exception as e:
         print(f"get_log error: {e}")
 
+    print("Testing set_reference_chains and set_mobile_chains...")
+    try:
+        aligner.set_reference_chains(["A"])
+        aligner.set_mobile_chains(["A"])
+        aligner.align(mode="auto")
+        print("Chain setters successful.")
+    except Exception as e:
+        print(f"Chain setters error: {e}")
+
+    print("Testing save_rmsd_csv...")
+    try:
+        aligner.save_rmsd_csv("test_rmsd.csv")
+        if os.path.exists("test_rmsd.csv"):
+            print("save_rmsd_csv successful.")
+            os.remove("test_rmsd.csv")
+        else:
+            print("save_rmsd_csv failed.")
+    except Exception as e:
+        print(f"save_rmsd_csv error: {e}")
+
+    print("Testing general sequence alignment...")
+    try:
+        res = aligner.get_general_sequence_alignment("A", "A")
+        if res:
+            print("get_general_sequence_alignment successful.")
+        else:
+            print("get_general_sequence_alignment failed.")
+    except Exception as e:
+        print(f"get_general_sequence_alignment error: {e}")
+
 if __name__ == "__main__":
     if not os.path.exists("1CRN.pdb") or not os.path.exists("2CRN.pdb"):
         print("Please run get_pdbs.py to download test PDBs.")
