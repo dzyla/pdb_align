@@ -1,22 +1,54 @@
-from struct_pair_align import sequence_independent_alignment_joined_v2, _parse_path, _extract_ca_infos
+import os
+from pdb_align.aligner import PDBAligner
 
-print("Testing sequence_independent_alignment_joined_v2 (auto)")
-try:
-    res_auto = sequence_independent_alignment_joined_v2("1CRN.pdb", "2CRN.pdb", chains_ref=["A"], chains_mob=["A"], method="auto")
-    print(f"Auto RMSD: {res_auto.rmsd}, Method chosen: {res_auto.method}, Keep Pairs: {res_auto.kept_pairs}")
-except Exception as e:
-    print(f"Error (auto): {e}")
+def test_pdb_aligner():
+    print("Initializing PDBAligner...")
+    aligner = PDBAligner("1CRN.pdb", chains_ref=["A"])
+    aligner.add_mobile("2CRN.pdb", chains=["A"])
 
-print("Testing sequence_independent_alignment_joined_v2 (shape)")
-try:
-    res_shape = sequence_independent_alignment_joined_v2("1CRN.pdb", "2CRN.pdb", chains_ref=["A"], chains_mob=["A"], method="shape")
-    print(f"Shape RMSD: {res_shape.rmsd}, Method chosen: {res_shape.method}, Matrix shape: {res_shape.shift_matrix.shape if res_shape.shift_matrix is not None else None}")
-except Exception as e:
-    print(f"Error (shape): {e}")
+    print("Testing auto mode...")
+    try:
+        res = aligner.align(mode="auto")
+        print(f"Auto mode successful. RMSD: {aligner.get_rmsd()}, Chosen: {res['chosen']['name']}")
+    except Exception as e:
+        print(f"Auto mode error: {e}")
 
-print("Testing sequence_independent_alignment_joined_v2 (window)")
-try:
-    res_window = sequence_independent_alignment_joined_v2("1CRN.pdb", "2CRN.pdb", chains_ref=["A"], chains_mob=["A"], method="window")
-    print(f"Window RMSD: {res_window.rmsd}, Method chosen: {res_window.method}, Scores len: {len(res_window.shift_scores) if res_window.shift_scores is not None else None}")
-except Exception as e:
-    print(f"Error (window): {e}")
+    print("Testing seq_free_shape mode...")
+    try:
+        res = aligner.align(mode="seq_free_shape")
+        print(f"Shape mode successful. RMSD: {aligner.get_rmsd()}, Chosen: {res['chosen']['name']}")
+    except Exception as e:
+        print(f"Shape mode error: {e}")
+
+    print("Testing seq_free_window mode...")
+    try:
+        res = aligner.align(mode="seq_free_window")
+        print(f"Window mode successful. RMSD: {aligner.get_rmsd()}, Chosen: {res['chosen']['name']}")
+    except Exception as e:
+        print(f"Window mode error: {e}")
+
+    print("Testing seq_guided mode...")
+    try:
+        res = aligner.align(mode="seq_guided")
+        print(f"Seq guided mode successful. RMSD: {aligner.get_rmsd()}, Chosen: {res['chosen']['name']}")
+    except Exception as e:
+        print(f"Seq guided mode error: {e}")
+
+    print("Testing batch alignment...")
+    os.makedirs("batch_test_mob", exist_ok=True)
+    import shutil
+    shutil.copy("2CRN.pdb", "batch_test_mob/2CRN_copy.pdb")
+    try:
+        results = aligner.batch_align("batch_test_mob", "batch_test_out", mode="auto")
+        print(f"Batch align successful. Results: {results}")
+    except Exception as e:
+        print(f"Batch align error: {e}")
+    finally:
+        shutil.rmtree("batch_test_mob", ignore_errors=True)
+        shutil.rmtree("batch_test_out", ignore_errors=True)
+
+if __name__ == "__main__":
+    if not os.path.exists("1CRN.pdb") or not os.path.exists("2CRN.pdb"):
+        print("Please run get_pdbs.py to download test PDBs.")
+    else:
+        test_pdb_aligner()
