@@ -16,6 +16,7 @@ setup(
         "plotly",
         "ipython_genutils",
         "matplotlib",
+        "seaborn",
         "streamlit",
         "streamlit-molstar"
     ],

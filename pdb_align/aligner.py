@@ -13,9 +13,17 @@ from .core import (
 
 class PDBAligner:
     """
-    Object-oriented interface for protein structure alignment.
+    Object-oriented API for protein 3D structural alignment.
+
+    This class supports single and batch alignments, offering various methods:
+    - Sequence-guided structural superposition.
+    - Sequence-free structural superposition (useful for low sequence identity).
+
+    Attributes:
+        verbose (bool): If True, prints status messages during operations.
     """
-    def __init__(self, ref_file: Optional[str] = None, chains_ref: Optional[List[Union[str, int]]] = None):
+    def __init__(self, ref_file: Optional[str] = None, chains_ref: Optional[List[Union[str, int]]] = None, verbose: bool = False):
+        self.verbose = verbose
         self.ref_file = None
         self.ref_struct = None
         self.ref_seqs = {}
@@ -33,6 +41,10 @@ class PDBAligner:
         if ref_file:
             self.set_reference(ref_file, chains_ref)
 
+    def add_reference(self, ref_file: str, chains: Optional[List[Union[str, int]]] = None):
+        """Sets the reference structure. Alias for set_reference."""
+        self.set_reference(ref_file, chains)
+
     def set_reference(self, ref_file: str, chains: Optional[List[Union[str, int]]] = None):
         """Sets the reference structure."""
         if not os.path.exists(ref_file):
@@ -41,6 +53,10 @@ class PDBAligner:
         self.chains_ref = chains
         self.ref_struct = _parse_path(ref_file)
         self.ref_seqs, self.ref_lens = extract_sequences_and_lengths(self.ref_struct, os.path.basename(ref_file))
+        if self.verbose:
+            print(f"Reference set to: {self.ref_file}")
+            for ch in (self.chains_ref if self.chains_ref else self.ref_seqs.keys()):
+                print(f"  Chain {ch}: {self.ref_lens.get(ch, 0)} aa")
 
     def add_mobile(self, mob_file: str, chains: Optional[List[Union[str, int]]] = None):
         """Sets the mobile structure to align."""
@@ -50,6 +66,20 @@ class PDBAligner:
         self.chains_mob = chains
         self.mob_struct = _parse_path(mob_file)
         self.mob_seqs, self.mob_lens = extract_sequences_and_lengths(self.mob_struct, os.path.basename(mob_file))
+        if self.verbose:
+            print(f"Mobile set to: {self.mob_file}")
+            for ch in (self.chains_mob if self.chains_mob else self.mob_seqs.keys()):
+                print(f"  Chain {ch}: {self.mob_lens.get(ch, 0)} aa")
+            if self.ref_file:
+                print("\nSimilarity Matrix:")
+                id_mat, sc_mat = compute_chain_similarity_matrix(self.ref_seqs, self.mob_seqs)
+                ref_chains = list(self.ref_seqs.keys())
+                mob_chains = list(self.mob_seqs.keys())
+                for i, r_ch in enumerate(ref_chains):
+                    for j, m_ch in enumerate(mob_chains):
+                        ident = id_mat.iloc[i, j] if hasattr(id_mat, "iloc") else id_mat[i, j]
+                        if not __import__('numpy').isnan(ident):
+                            print(f"  Chain {r_ch} (ref) - Chain {m_ch} (mobile): {ident:.1f}%")
 
     def align(self, mode: str = "auto", seq_gap_open: float = -10, seq_gap_extend: float = -0.5, **kwargs):
         """
@@ -118,9 +148,20 @@ class PDBAligner:
                           seqfree=seqfree if "seq_free" in mode or "Sequence-free" in mode else None)
 
         self.last_result = dict(seqguided=seqguided, seqfree=seqfree, chosen=chosen)
+
+        if self.verbose:
+            print(f"\nAlignment Completed:")
+            print(f"  Mode evaluated: {mode}")
+            if seqguided:
+                print(f"  Sequence-based RMSD: {seqguided['si']['rmsd']:.3f} Å")
+            if seqfree:
+                print(f"  Sequence-free RMSD: {seqfree.rmsd:.3f} Å")
+            print(f"  Chosen method: {chosen['name']}")
+            print(f"  Reason: {chosen['reason']}")
+
         return self.last_result
 
-    def batch_align(self, mob_dir: str, out_dir: str, mode: str = "auto"):
+    def batch_align(self, mob_dir: str, out_dir: str, mode: str = "auto", **kwargs):
         """
         Aligns a directory of PDBs against the current reference structure.
         """
@@ -134,13 +175,17 @@ class PDBAligner:
                 fpath = os.path.join(mob_dir, fname)
                 try:
                     self.add_mobile(fpath)
-                    res = self.align(mode=mode)
+                    if self.verbose:
+                        print(f"Batch processing: {fname}")
+                    res = self.align(mode=mode, **kwargs)
                     rmsd = self.get_rmsd()
                     results[fname] = {"rmsd": rmsd, "status": "success"}
                     out_pdb = os.path.join(out_dir, f"aligned_{fname}")
                     self.save_aligned_pdb(out_pdb)
                 except Exception as e:
                     results[fname] = {"status": "error", "message": str(e)}
+                    if self.verbose:
+                        print(f"Failed to process {fname}: {e}")
         return results
 
     def get_rmsd(self) -> Optional[float]:
@@ -175,14 +220,302 @@ class PDBAligner:
         return None
 
     def get_sequence_alignment(self) -> Optional[tuple]:
-        """Returns sequence alignment text if sequence-guided method was used."""
+        """Returns sequence alignment tuple (seqA, seqB, score)."""
         if not self.last_result:
             return None
         chosen = self.last_result["chosen"]
         if chosen["seqguided"]:
             aln = chosen["seqguided"]["aln"]
             return aln.seqA, aln.seqB, aln.score
+        elif chosen["seqfree"]:
+            # Need to synthesize an alignment string from pairs
+            ref_subset = chosen["seqfree"].ref_subset_infos
+            mob_subset = chosen["seqfree"].mob_subset_infos
+            pairs = chosen["seqfree"].pairs
+
+            # This returns the synthesized alignment as shown in Streamlit
+            ref_aln = ""
+            mob_aln = ""
+
+            from Bio.PDB.Polypeptide import protein_letters_3to1
+            def to_1l(resname):
+                return protein_letters_3to1.get(resname, 'X')
+
+            ref_idx_to_info = {i: info for i, info in enumerate(ref_subset)}
+            mob_idx_to_info = {i: info for i, info in enumerate(mob_subset)}
+
+            matched_ref = {r for r, m in pairs}
+            matched_mob = {m for r, m in pairs}
+
+            pair_dict = {r: m for r, m in pairs}
+
+            r_idx = 0
+            m_idx = 0
+
+            while r_idx < len(ref_subset) or m_idx < len(mob_subset):
+                if r_idx in matched_ref and m_idx in matched_mob and pair_dict.get(r_idx) == m_idx:
+                    ref_aln += to_1l(ref_idx_to_info[r_idx].resname)
+                    mob_aln += to_1l(mob_idx_to_info[m_idx].resname)
+                    r_idx += 1
+                    m_idx += 1
+                else:
+                    if r_idx < len(ref_subset) and r_idx not in matched_ref:
+                        ref_aln += to_1l(ref_idx_to_info[r_idx].resname)
+                        mob_aln += "-"
+                        r_idx += 1
+                    elif m_idx < len(mob_subset) and m_idx not in matched_mob:
+                        ref_aln += "-"
+                        mob_aln += to_1l(mob_idx_to_info[m_idx].resname)
+                        m_idx += 1
+                    else:
+                        ref_aln += "-"
+                        mob_aln += "-"
+                        if r_idx < len(ref_subset): r_idx += 1
+                        if m_idx < len(mob_subset): m_idx += 1
+
+            return ref_aln, mob_aln, None
         return None
+
+    def get_sequence_alignment_fasta(self) -> str:
+        """Returns sequence alignment in FASTA format."""
+        aln_data = self.get_sequence_alignment()
+        if not aln_data:
+            raise ValueError("No alignment data available.")
+        seqA, seqB, _ = aln_data
+
+        fasta = f">Reference_{os.path.basename(self.ref_file)}\n{seqA}\n"
+        fasta += f">Mobile_{os.path.basename(self.mob_file)}\n{seqB}\n"
+        return fasta
+
+    def save_sequence_alignment_fasta(self, filename: str):
+        """Saves sequence alignment to a file in FASTA format."""
+        fasta = self.get_sequence_alignment_fasta()
+        with open(filename, "w") as f:
+            f.write(fasta)
+
+    def print_sequence_alignment(self, interval: int = 10):
+        """Prints the sequence alignment in a formatted way."""
+        aln_data = self.get_sequence_alignment()
+        if not aln_data:
+            print("No alignment data available.")
+            return
+
+        seqA, seqB, score = aln_data
+        ref_id = f"Ref ({os.path.basename(self.ref_file)})"
+        mob_id = f"Mob ({os.path.basename(self.mob_file)})"
+
+        def numline(aln: str, interval=10):
+            line = [' '] * len(aln)
+            c = 0
+            nxt = interval
+            for i, ch in enumerate(aln):
+                if ch != '-':
+                    c += 1
+                    if c == nxt:
+                        s = str(nxt)
+                        start = max(0, i - len(s) + 1)
+                        for k, d in enumerate(s):
+                            if start + k < len(aln):
+                                line[start + k] = d
+                        nxt += interval
+            return ''.join(line)
+
+        pad = max(len(ref_id), len(mob_id))
+        id1p = ref_id.ljust(pad)
+        id2p = mob_id.ljust(pad)
+        mp = "Match".ljust(pad)
+
+        from Bio.Align import substitution_matrices
+        try:
+            blosum62 = substitution_matrices.load("BLOSUM62")
+        except:
+            blosum62 = {}
+
+        match = ""
+        for a, b in zip(seqA, seqB):
+            if a == b and a != '-':
+                match += "|"
+            elif a != '-' and b != '-' and (blosum62.get((a, b), blosum62.get((b, a), 0)) > 0):
+                match += ":"
+            elif a == '-' or b == '-':
+                match += " "
+            else:
+                match += "."
+
+        loc1, loc2 = numline(seqA, interval), numline(seqB, interval)
+        padsp = " " * (pad + 2)
+
+        print("Pairwise Alignment:")
+        print(f"{padsp}{loc1}")
+        print(f"{id1p}: {seqA}")
+        print(f"{mp}  {match}")
+        print(f"{id2p}: {seqB}")
+        print(f"{padsp}{loc2}")
+        if score is not None:
+            print(f"Alignment Score: {score}")
+
+    def get_rotation(self) -> Optional['numpy.ndarray']:
+        """Returns the rotation matrix of the best alignment."""
+        if not self.last_result: return None
+        chosen = self.last_result["chosen"]
+        if chosen["seqguided"]: return chosen["seqguided"]["si"]["rotation"]
+        elif chosen["seqfree"]: return chosen["seqfree"].rotation
+        return None
+
+    def get_translation(self) -> Optional['numpy.ndarray']:
+        """Returns the translation vector of the best alignment."""
+        if not self.last_result: return None
+        chosen = self.last_result["chosen"]
+        if chosen["seqguided"]: return chosen["seqguided"]["si"]["translation"]
+        elif chosen["seqfree"]: return chosen["seqfree"].translation
+        return None
+
+    def report_peaks(self, on: str = 'reference', top_n: int = 5):
+        """
+        Reports the largest C-alpha RMSD peaks between the aligned structures.
+
+        on: "reference" or "mobile" numbering.
+        """
+        import numpy as np
+
+        if not self.last_result:
+            raise ValueError("No alignment results available. Run align() first.")
+
+        chosen = self.last_result["chosen"]
+
+        if chosen["seqguided"]:
+            atoms = chosen["seqguided"]["ref_atoms"] if on == 'reference' else chosen["seqguided"]["mob_atoms"]
+            per_res_rmsd = chosen["seqguided"]["si"]["per_residue_rmsd"]
+
+            peaks = []
+            for idx, a in enumerate(atoms):
+                p = a.get_parent()
+                chain = p.get_parent().id
+                rid = p.get_id()
+                lbl = f"{chain}:{rid[1]}{rid[2].strip()}" if str(rid[2]).strip() else f"{chain}:{rid[1]}"
+                peaks.append((lbl, per_res_rmsd[idx]))
+
+        elif chosen["seqfree"]:
+            # Recalculate per-res RMSD on the subset
+            import numpy as np
+            ref_subset = chosen["seqfree"].ref_subset_infos
+            mob_subset = chosen["seqfree"].mob_subset_infos
+            pairs = chosen["seqfree"].pairs
+
+            peaks = []
+            for (i, j) in pairs:
+                r_info = ref_subset[i]
+                m_info = mob_subset[j]
+
+                # compute the local distance
+                diff = chosen["seqfree"].ref_subset_ca_coords[i] - chosen["seqfree"].mob_subset_ca_coords_aligned[j]
+                dist = np.linalg.norm(diff)
+
+                if on == 'reference':
+                    lbl = f"{r_info.chain_id}:{r_info.resseq}{r_info.icode.strip()}"
+                else:
+                    lbl = f"{m_info.chain_id}:{m_info.resseq}{m_info.icode.strip()}"
+
+                peaks.append((lbl, dist))
+        else:
+            return []
+
+        peaks.sort(key=lambda x: x[1], reverse=True)
+        top_peaks = peaks[:top_n] if top_n is not None else peaks
+
+        if top_n is not None:
+            print(f"Top {top_n} RMSD Peaks (on {on} numbering):")
+            for lbl, dist in top_peaks:
+                print(f"  Residue {lbl}: {dist:.3f} Å")
+
+        return top_peaks
+
+    def plot_rmsd(self, filename: str = "rmsd.pdf", style: str = "scientific", on: str = 'reference'):
+        """
+        Plots the per-residue C-alpha RMSD.
+        """
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        if not self.last_result:
+            raise ValueError("No alignment results available. Run align() first.")
+
+        # Get the peaks data
+        peaks = self.report_peaks(on=on, top_n=None)
+        if not peaks:
+            print("No data to plot.")
+            return
+
+        # We need to maintain order for plotting
+        labels = []
+        distances = []
+
+        chosen = self.last_result["chosen"]
+
+        if chosen["seqguided"]:
+            ref_atoms = chosen["seqguided"]["ref_atoms"]
+            per_res_rmsd = chosen["seqguided"]["si"]["per_residue_rmsd"]
+
+            for idx, a in enumerate(ref_atoms):
+                p = a.get_parent()
+                chain = p.get_parent().id
+                rid = p.get_id()
+                lbl = f"{chain}:{rid[1]}{rid[2].strip()}" if str(rid[2]).strip() else f"{chain}:{rid[1]}"
+                labels.append(lbl)
+                distances.append(per_res_rmsd[idx])
+
+        elif chosen["seqfree"]:
+            import numpy as np
+            ref_subset = chosen["seqfree"].ref_subset_infos
+            mob_subset = chosen["seqfree"].mob_subset_infos
+            pairs = chosen["seqfree"].pairs
+
+            for (i, j) in pairs:
+                r_info = ref_subset[i]
+                m_info = mob_subset[j]
+                diff = chosen["seqfree"].ref_subset_ca_coords[i] - chosen["seqfree"].mob_subset_ca_coords_aligned[j]
+                dist = np.linalg.norm(diff)
+
+                if on == 'reference':
+                    lbl = f"{r_info.chain_id}:{r_info.resseq}{r_info.icode.strip()}"
+                else:
+                    lbl = f"{m_info.chain_id}:{m_info.resseq}{m_info.icode.strip()}"
+
+                labels.append(lbl)
+                distances.append(dist)
+
+        if style == "scientific":
+            sns.set_theme(style="whitegrid", context="paper")
+            plt.rcParams.update({
+                "font.family": "serif",
+                "axes.titlesize": 14,
+                "axes.labelsize": 12,
+                "xtick.labelsize": 10,
+                "ytick.labelsize": 10,
+                "legend.fontsize": 10,
+                "figure.dpi": 300,
+            })
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+
+        # Plot as line + markers
+        ax.plot(range(len(labels)), distances, marker='o', markersize=3, linestyle='-', linewidth=1, color='#1f77b4')
+
+        # Formatting X-axis
+        # Only show every Nth label to avoid crowding
+        n_labels = len(labels)
+        step = max(1, n_labels // 10)
+
+        ax.set_xticks(range(0, n_labels, step))
+        ax.set_xticklabels([labels[i] for i in range(0, n_labels, step)], rotation=45, ha='right')
+
+        ax.set_xlabel(f"Residue ({on.capitalize()})")
+        ax.set_ylabel(r"C$\alpha$ RMSD ($\AA$)")
+        ax.set_title("Per-Residue Structural Deviation")
+
+        plt.tight_layout()
+        plt.savefig(filename, bbox_inches='tight')
+        plt.close()
 
     def get_similarity_matrix(self):
         """Returns the chain similarity matrices (Identity and BLOSUM62 scores)."""
@@ -213,15 +546,22 @@ class PDBAligner:
             io_obj.set_structure(self.mob_struct)
             io_obj.save(filename, _AllAtomsSelect(R=R, t=t))
 
-    def save_log(self, filename: str):
-        """Saves alignment log summary."""
+    def get_log(self) -> str:
+        """Returns the alignment log summary as a string."""
         if not self.last_result:
             raise ValueError("No alignment results available. Run align() first.")
+        lines = []
+        lines.append("PDB Aligner Result Log")
+        lines.append("="*20)
+        lines.append(f"Reference: {self.ref_file}")
+        lines.append(f"Mobile: {self.mob_file}")
+        chosen = self.last_result["chosen"]
+        lines.append(f"Chosen method: {chosen['name']}")
+        lines.append(f"RMSD: {self.get_rmsd():.3f} Å" if self.get_rmsd() is not None else "RMSD: None")
+        lines.append(f"Reason: {chosen['reason']}")
+        return "\n".join(lines)
+
+    def save_log(self, filename: str):
+        """Saves alignment log summary."""
         with open(filename, "w") as f:
-            f.write("PDB Aligner Result Log\n")
-            f.write("="*20 + "\n")
-            f.write(f"Reference: {self.ref_file}\n")
-            f.write(f"Mobile: {self.mob_file}\n")
-            chosen = self.last_result["chosen"]
-            f.write(f"Chosen method: {chosen['name']}\n")
-            f.write(f"RMSD: {self.get_rmsd()}\n")
+            f.write(self.get_log() + "\n")

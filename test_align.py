@@ -47,6 +47,45 @@ def test_pdb_aligner():
         shutil.rmtree("batch_test_mob", ignore_errors=True)
         shutil.rmtree("batch_test_out", ignore_errors=True)
 
+    print("Testing report_peaks...")
+    try:
+        peaks = aligner.report_peaks(on="reference", top_n=3)
+        print(f"report_peaks successful: {peaks}")
+    except Exception as e:
+        print(f"report_peaks error: {e}")
+
+    print("Testing plot_rmsd...")
+    try:
+        aligner.plot_rmsd("test_rmsd_plot.pdf")
+        if os.path.exists("test_rmsd_plot.pdf"):
+            print("plot_rmsd successful: File created.")
+        else:
+            print("plot_rmsd error: File not created.")
+    except Exception as e:
+        print(f"plot_rmsd error: {e}")
+
+    print("Testing get_sequence_alignment_fasta...")
+    try:
+        aligner.align(mode="seq_guided")
+        fasta = aligner.get_sequence_alignment_fasta()
+        if ">Reference_1CRN" in fasta and ">Mobile_2CRN" in fasta:
+            print("get_sequence_alignment_fasta successful.")
+        else:
+            print("get_sequence_alignment_fasta failed formatting. Output:")
+            print(fasta)
+    except Exception as e:
+        print(f"get_sequence_alignment_fasta error: {e}")
+
+    print("Testing get_log...")
+    try:
+        log = aligner.get_log()
+        if "PDB Aligner Result Log" in log and "RMSD" in log:
+            print("get_log successful.")
+        else:
+            print("get_log failed formatting.")
+    except Exception as e:
+        print(f"get_log error: {e}")
+
 if __name__ == "__main__":
     if not os.path.exists("1CRN.pdb") or not os.path.exists("2CRN.pdb"):
         print("Please run get_pdbs.py to download test PDBs.")

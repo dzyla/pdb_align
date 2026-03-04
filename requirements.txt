@@ -9,4 +9,5 @@ stmol
 plotly
 ipython_genutils
 matplotlib
+seaborn
 streamlit-molstar
