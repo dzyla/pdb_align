@@ -453,10 +453,10 @@ class PDBAligner:
         chosen = self.last_result["chosen"]
 
         if chosen["seqguided"]:
-            ref_atoms = chosen["seqguided"]["ref_atoms"]
+            atoms = chosen["seqguided"]["ref_atoms"] if on == 'reference' else chosen["seqguided"]["mob_atoms"]
             per_res_rmsd = chosen["seqguided"]["si"]["per_residue_rmsd"]
 
-            for idx, a in enumerate(ref_atoms):
+            for idx, a in enumerate(atoms):
                 p = a.get_parent()
                 chain = p.get_parent().id
                 rid = p.get_id()
@@ -484,38 +484,40 @@ class PDBAligner:
                 labels.append(lbl)
                 distances.append(dist)
 
-        if style == "scientific":
-            sns.set_theme(style="whitegrid", context="paper")
-            plt.rcParams.update({
-                "font.family": "serif",
-                "axes.titlesize": 14,
-                "axes.labelsize": 12,
-                "xtick.labelsize": 10,
-                "ytick.labelsize": 10,
-                "legend.fontsize": 10,
-                "figure.dpi": 300,
-            })
+        with plt.style.context('default'):
+            if style == "scientific":
+                sns.set_style("whitegrid")
+                sns.set_context("paper")
+                plt.rcParams.update({
+                    "font.family": "serif",
+                    "axes.titlesize": 14,
+                    "axes.labelsize": 12,
+                    "xtick.labelsize": 10,
+                    "ytick.labelsize": 10,
+                    "legend.fontsize": 10,
+                    "figure.dpi": 300,
+                })
 
-        fig, ax = plt.subplots(figsize=(10, 4))
+            fig, ax = plt.subplots(figsize=(10, 4))
 
-        # Plot as line + markers
-        ax.plot(range(len(labels)), distances, marker='o', markersize=3, linestyle='-', linewidth=1, color='#1f77b4')
+            # Plot as line + markers
+            ax.plot(range(len(labels)), distances, marker='o', markersize=3, linestyle='-', linewidth=1, color='#1f77b4')
 
-        # Formatting X-axis
-        # Only show every Nth label to avoid crowding
-        n_labels = len(labels)
-        step = max(1, n_labels // 10)
+            # Formatting X-axis
+            # Only show every Nth label to avoid crowding
+            n_labels = len(labels)
+            step = max(1, n_labels // 10)
 
-        ax.set_xticks(range(0, n_labels, step))
-        ax.set_xticklabels([labels[i] for i in range(0, n_labels, step)], rotation=45, ha='right')
+            ax.set_xticks(range(0, n_labels, step))
+            ax.set_xticklabels([labels[i] for i in range(0, n_labels, step)], rotation=45, ha='right')
 
-        ax.set_xlabel(f"Residue ({on.capitalize()})")
-        ax.set_ylabel(r"C$\alpha$ RMSD ($\AA$)")
-        ax.set_title("Per-Residue Structural Deviation")
+            ax.set_xlabel(f"Residue ({on.capitalize()})")
+            ax.set_ylabel(r"C$\alpha$ RMSD ($\AA$)")
+            ax.set_title("Per-Residue Structural Deviation")
 
-        plt.tight_layout()
-        plt.savefig(filename, bbox_inches='tight')
-        plt.close()
+            plt.tight_layout()
+            plt.savefig(filename, bbox_inches='tight')
+            plt.close()
 
     def get_similarity_matrix(self):
         """Returns the chain similarity matrices (Identity and BLOSUM62 scores)."""
