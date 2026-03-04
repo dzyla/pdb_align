@@ -168,6 +168,8 @@ class AlignmentResultSF:
     mob_all_infos: List[ResidueInfo]
     mob_all_ca_coords_aligned: np.ndarray
     summaries: Dict[str, AlignSummary]
+    shift_matrix: Optional[np.ndarray] = None
+    shift_scores: Optional[np.ndarray] = None
 
 from Bio.PDB import Structure as _Structure
 def _parse_path(path:str) -> _Structure.Structure:
@@ -236,19 +238,21 @@ def _robust_inlier_mask(d:np.ndarray, hard_cut:float, q_keep:float)->np.ndarray:
     if d.size==0: return np.zeros(0, dtype=bool)
     qthr=float(np.quantile(d, q_keep)); return (d <= max(hard_cut, qthr))
 
-def _window_pairs(D1:np.ndarray, D2:np.ndarray)->List[Tuple[int,int]]:
+def _window_pairs(D1:np.ndarray, D2:np.ndarray)->Tuple[List[Tuple[int,int]], np.ndarray]:
     n1,n2=D1.shape[0], D2.shape[0]
-    if n1==0 or n2==0: return []
+    if n1==0 or n2==0: return [], np.array([])
     swapped=False; A,B,aN,bN=D1,D2,n1,n2
     if aN>bN: A,B,aN,bN=D2,D1,n2,n1; swapped=True
     best_score, best_offset = -np.inf, -1
+    scores = np.zeros(bN-aN+1)
     for offset in range(bN-aN+1):
         subB=B[offset:offset+aN, offset:offset+aN]
         score=-np.sum(np.abs(A - subB))
+        scores[offset] = score
         if score>best_score: best_score, best_offset = score, offset
-    if best_offset<0: return []
-    if swapped: return [(best_offset+i, i) for i in range(aN)]
-    else: return [(i, best_offset+i) for i in range(aN)]
+    if best_offset<0: return [], scores
+    if swapped: return [(best_offset+i, i) for i in range(aN)], scores
+    else: return [(i, best_offset+i) for i in range(aN)], scores
 
 def _radial_histograms(D:np.ndarray, nbins:int=24, rmax_mode:str="p98"):
     N=D.shape[0]
@@ -305,14 +309,14 @@ def _banded_dp_maxscore(S:np.ndarray, gap:float, band:int):
     pairs.reverse(); total=float(dp[N,M])
     return pairs,total
 
-def _shape_pairs(coords1:np.ndarray, coords2:np.ndarray, nbins:int=24, gap_penalty:float=2.0, band_frac:float=0.20):
+def _shape_pairs(coords1:np.ndarray, coords2:np.ndarray, nbins:int=24, gap_penalty:float=2.0, band_frac:float=0.20)->Tuple[List[Tuple[int,int]], np.ndarray, np.ndarray]:
     D1=_pairwise_dists(coords1); D2=_pairwise_dists(coords2)
     H1,_=_radial_histograms(D1, nbins=nbins, rmax_mode="p98")
     H2,_=_radial_histograms(D2, nbins=nbins, rmax_mode="p98")
     C=_chi2_distance(H1,H2); S=-C
     N,M=S.shape; band=max(3, int(band_frac*max(N,M)))
     pairs,_=_banded_dp_maxscore(S, gap=gap_penalty, band=band)
-    return pairs
+    return pairs, S, C
 
 class _AllAtomsSelect(Select):
     def __init__(self, R:np.ndarray, t:np.ndarray):
@@ -340,9 +344,13 @@ def sequence_independent_alignment_joined_v2(
     D1=_pairwise_dists(ref_subset); D2=_pairwise_dists(mob_subset)
 
     summaries={}; candidates={}
+    shift_matrix = None
+    shift_scores = None
+
     # shape
     if method in ("shape","auto"):
-        pairs_s=_shape_pairs(ref_subset, mob_subset, nbins=shape_nbins, gap_penalty=shape_gap_penalty, band_frac=shape_band_frac)
+        pairs_s, S, C = _shape_pairs(ref_subset, mob_subset, nbins=shape_nbins, gap_penalty=shape_gap_penalty, band_frac=shape_band_frac)
+        shift_matrix = S
         R_s,t_s,rmsd_s=np.eye(3), np.zeros(3), float("inf")
         mob_aln_s=mob_subset.copy()
         if len(pairs_s)>=3:
@@ -362,7 +370,8 @@ def sequence_independent_alignment_joined_v2(
 
     # window
     if method in ("window","auto"):
-        pairs_w=_window_pairs(D1,D2)
+        pairs_w, scores = _window_pairs(D1,D2)
+        shift_scores = scores
         R_w,t_w,rmsd_w=np.eye(3), np.zeros(3), float("inf")
         mob_aln_w=mob_subset.copy()
         if len(pairs_w)>=3:
@@ -400,7 +409,9 @@ def sequence_independent_alignment_joined_v2(
         ref_subset_ca_coords=ref_subset,
         mob_subset_ca_coords_aligned=_transform(mob_subset, R, t),
         mob_all_infos=mob_all_infos, mob_all_ca_coords_aligned=mob_all_ca_aligned,
-        summaries=summaries
+        summaries=summaries,
+        shift_matrix=shift_matrix if chosen == "shape" else None,
+        shift_scores=shift_scores if chosen == "window" else None
     )
 
 # ===========================================
@@ -459,8 +470,13 @@ def superimpose_atoms(ref_atoms, mob_atoms):
     mob_coords=np.array([a.get_coord() for a in mob_atoms])
     mob_aligned=(mob_coords@R) + t
     per_res=np.sqrt(np.sum((ref_coords - mob_aligned)**2, axis=1))
-    res_ids=[a.get_parent().get_id() for a in ref_atoms]
-    res_labels=[f"{rid[1]}{rid[2].strip()}" if str(rid[2]).strip() else f"{rid[1]}" for rid in res_ids]
+    res_labels=[]
+    for a in ref_atoms:
+        p = a.get_parent()
+        chain = p.get_parent().id
+        rid = p.get_id()
+        lbl = f"{chain}:{rid[1]}{rid[2].strip()}" if str(rid[2]).strip() else f"{chain}:{rid[1]}"
+        res_labels.append(lbl)
     return dict(rmsd=float(SI.rms), rotation=R, translation=t,
                 ref_coords=ref_coords, mob_coords_transformed=mob_aligned,
                 per_residue_rmsd=per_res, residue_labels=res_labels)
@@ -776,6 +792,12 @@ def export_zip_seqguided(results: dict, aln_text: str, ref_atoms, mob_atoms) -> 
     })
     csv_buf = io.StringIO(); df.to_csv(csv_buf, index=False)
 
+    rmsd_df = pd.DataFrame({
+        "Residue Label": results["residue_labels"],
+        "RMSD": results["per_residue_rmsd"]
+    })
+    rmsd_csv_buf = io.StringIO(); rmsd_df.to_csv(rmsd_csv_buf, index=False)
+
     def pdb_from_atoms(atoms, chain_letter, override=None):
         lines=["MODEL        1"]; serial=1
         for idx, atom in enumerate(atoms):
@@ -792,14 +814,17 @@ def export_zip_seqguided(results: dict, aln_text: str, ref_atoms, mob_atoms) -> 
     zbuf=io.BytesIO()
     with zipfile.ZipFile(zbuf,"w") as z:
         z.writestr("per_residue_data.csv", csv_buf.getvalue())
+        z.writestr("rmsd_per_position.csv", rmsd_csv_buf.getvalue())
         z.writestr("aligned_ref_CA_only.pdb", ref_pdb)
         z.writestr("aligned_mobile_CA_only.pdb", mob_pdb)
         z.writestr("alignment.txt", aln_text)
     zbuf.seek(0); name=f"seqguided_export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     return zbuf, name
 
-def export_zip_seqfree(ref_file: str, mob_file: str, R: np.ndarray, t: np.ndarray,
+def export_zip_seqfree(ref_file: str, mob_file: str, seqfree: AlignmentResultSF,
                        ref_subset_pairs_df: pd.DataFrame) -> Tuple[io.BytesIO, str]:
+    R = seqfree.rotation
+    t = seqfree.translation
     pathA, pathB = write_uploads_to_temp_files(ref_file, mob_file)
     parser = MMCIFParser(QUIET=True) if pathB.lower().endswith((".cif",".mmcif")) else PDBParser(QUIET=True)
     mob_struct = parser.get_structure(os.path.basename(pathB), pathB)
@@ -811,10 +836,23 @@ def export_zip_seqfree(ref_file: str, mob_file: str, R: np.ndarray, t: np.ndarra
         try: os.unlink(p)
         except Exception: pass
 
+    sf_rmsd_labels = [f"{seqfree.ref_subset_infos[i].chain_id}:{seqfree.ref_subset_infos[i].resseq}{(seqfree.ref_subset_infos[i].icode or '').strip()}" for (i, _) in seqfree.pairs]
+    sf_per_res_rmsd = [np.linalg.norm(seqfree.ref_subset_ca_coords[i] - seqfree.mob_subset_ca_coords_aligned[j]) for (i, j) in seqfree.pairs]
+    sf_rmsd_df = pd.DataFrame({
+        "Residue Label": sf_rmsd_labels,
+        "RMSD": sf_per_res_rmsd
+    })
+
     zbuf=io.BytesIO()
     with zipfile.ZipFile(zbuf,"w") as z:
         z.writestr("aligned_mobile_fullatom_on_reference.pdb", aligned_mobile_full)
         z.writestr("matched_pairs.csv", ref_subset_pairs_df.to_csv(index=False))
+        z.writestr("rmsd_per_position.csv", sf_rmsd_df.to_csv(index=False))
+        if seqfree.method == "shape" and seqfree.shift_matrix is not None:
+            z.writestr("shift_matrix.csv", pd.DataFrame(seqfree.shift_matrix).to_csv(index=False))
+        elif seqfree.method == "window" and seqfree.shift_scores is not None:
+            z.writestr("shift_scores.csv", pd.DataFrame({"Score": seqfree.shift_scores}).to_csv(index=False))
+
     zbuf.seek(0); name=f"seqfree_export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     return zbuf, name
 
@@ -950,41 +988,46 @@ if run:
         ref_struct = st.session_state.structures[ref_file]
         mob_struct = st.session_state.structures[mob_file]
 
-        # Sequence-guided (if needed)
-        seqguided=None
-        if st.session_state.align_mode in ("Auto (best RMSD)","Sequence-guided"):
-            seqA="".join(str(st.session_state.sequences[ref_file][c].seq) for c in ref_chs if c in st.session_state.sequences[ref_file])
-            seqB="".join(str(st.session_state.sequences[mob_file][c].seq) for c in mob_chs if c in st.session_state.sequences[mob_file])
-            aln=perform_sequence_alignment(seqA, seqB, st.session_state.seq_gap_open, st.session_state.seq_gap_extend)
-            if aln:
-                ref_atoms, mob_atoms = get_aligned_atoms_by_alignment(ref_struct, ref_chs, mob_struct, mob_chs, aln)
-                if ref_atoms and mob_atoms:
-                    si = superimpose_atoms(ref_atoms, mob_atoms)
-                    if si:
-                        seqguided = dict(aln=aln, ref_atoms=ref_atoms, mob_atoms=mob_atoms, si=si)
-                        log(f"Sequence-guided RMSD = {si['rmsd']:.3f} Å with {len(ref_atoms)} pairs.")
-            else:
-                log("Sequence-guided alignment could not be built.")
+        try:
+            # Sequence-guided (if needed)
+            seqguided=None
+            if st.session_state.align_mode in ("Auto (best RMSD)","Sequence-guided"):
+                seqA="".join(str(st.session_state.sequences[ref_file][c].seq) for c in ref_chs if c in st.session_state.sequences[ref_file])
+                seqB="".join(str(st.session_state.sequences[mob_file][c].seq) for c in mob_chs if c in st.session_state.sequences[mob_file])
+                aln=perform_sequence_alignment(seqA, seqB, st.session_state.seq_gap_open, st.session_state.seq_gap_extend)
+                if aln:
+                    ref_atoms, mob_atoms = get_aligned_atoms_by_alignment(ref_struct, ref_chs, mob_struct, mob_chs, aln)
+                    if ref_atoms and mob_atoms:
+                        si = superimpose_atoms(ref_atoms, mob_atoms)
+                        if si:
+                            seqguided = dict(aln=aln, ref_atoms=ref_atoms, mob_atoms=mob_atoms, si=si)
+                            log(f"Sequence-guided RMSD = {si['rmsd']:.3f} Å with {len(ref_atoms)} pairs.")
+                else:
+                    log("Sequence-guided alignment could not be built.")
 
-        # Sequence-free (if needed)
-        seqfree=None
-        if st.session_state.align_mode in ("Auto (best RMSD)","Sequence-free (auto)","Sequence-free (shape)","Sequence-free (window)"):
-            pathA, pathB = write_uploads_to_temp_files(ref_file, mob_file)
-            try:
-                method = "auto" if st.session_state.align_mode in ("Auto (best RMSD)","Sequence-free (auto)") else (
-                         "shape" if st.session_state.align_mode=="Sequence-free (shape)" else "window")
-                res = sequence_independent_alignment_joined_v2(
-                    file_ref=pathA, file_mob=pathB,
-                    chains_ref=ref_chs, chains_mob=mob_chs,
-                    method=method, shape_nbins=48, shape_gap_penalty=2.0, shape_band_frac=0.30,
-                    inlier_rmsd_cut=5.0, inlier_quantile=0.85, refinement_iters=50
-                )
-                seqfree=res
-                log(f"Sequence-free [{res.method}] RMSD = {res.rmsd:.3f} Å with {res.kept_pairs} pairs.")
-            finally:
-                for p in (pathA, pathB):
-                    try: os.unlink(p)
-                    except Exception: pass
+            # Sequence-free (if needed)
+            seqfree=None
+            if st.session_state.align_mode in ("Auto (best RMSD)","Sequence-free (auto)","Sequence-free (shape)","Sequence-free (window)"):
+                pathA, pathB = write_uploads_to_temp_files(ref_file, mob_file)
+                try:
+                    method = "auto" if st.session_state.align_mode in ("Auto (best RMSD)","Sequence-free (auto)") else (
+                             "shape" if st.session_state.align_mode=="Sequence-free (shape)" else "window")
+                    res = sequence_independent_alignment_joined_v2(
+                        file_ref=pathA, file_mob=pathB,
+                        chains_ref=ref_chs, chains_mob=mob_chs,
+                        method=method, shape_nbins=48, shape_gap_penalty=2.0, shape_band_frac=0.30,
+                        inlier_rmsd_cut=5.0, inlier_quantile=0.85, refinement_iters=50
+                    )
+                    seqfree=res
+                    log(f"Sequence-free [{res.method}] RMSD = {res.rmsd:.3f} Å with {res.kept_pairs} pairs.")
+                finally:
+                    for p in (pathA, pathB):
+                        try: os.unlink(p)
+                        except Exception: pass
+        except Exception as e:
+            st.error(f"Alignment failed: {str(e)}")
+            log(f"Error during alignment: {str(e)}")
+            st.stop()
 
         # Decide best
         if st.session_state.align_mode == "Auto (best RMSD)":
@@ -1046,17 +1089,86 @@ if st.session_state.last_run_summary:
         with st.expander("Show alignment text", expanded=False):
             st.code(txt_block)
 
-        id_pairs = [(i,i) for i in range(len(seqguided["si"]["residue_labels"]))]
-        sg_key_prefix = f"sg3d_{_san_key(st.session_state.selected_ref_file)}_{_san_key(st.session_state.selected_mobile_file)}"
-        plot_superposition_3d(
-            ref_coords=seqguided["si"]["ref_coords"],
-            mob_coords=seqguided["si"]["mob_coords_transformed"],
-            title="Sequence-guided superposition with RMSD peaks",
-            labels=seqguided["si"]["residue_labels"],
-            pairs=id_pairs,
-            default_top_k=10,
-            key_prefix=sg_key_prefix
+        # NEW: toggle full chains vs matched subset
+        sg_show_full = st.checkbox(
+            "Show whole structure (all chains)",
+            value=False, key="sg_show_full"
         )
+
+        id_pairs = [(i,i) for i in range(len(seqguided["si"]["residue_labels"]))]
+
+        if sg_show_full:
+            # Extract full structures for reference and mobile
+            ref_full_infos = _extract_ca_infos(st.session_state.structures[st.session_state.selected_ref_file], chain_filter=None)
+            mob_full_infos = _extract_ca_infos(st.session_state.structures[st.session_state.selected_mobile_file], chain_filter=None)
+
+            ref_full_coords = np.vstack([ri.coord for ri in ref_full_infos])
+            mob_full_coords = np.vstack([mi.coord for mi in mob_full_infos])
+
+            # Align full mobile coords
+            mob_full_coords_aligned = _transform(mob_full_coords, seqguided["si"]["rotation"], seqguided["si"]["translation"])
+
+            # To highlight matching pairs within full structures, we need to map matched pairs to indices in the full structure arrays
+            ref_res_to_full_idx = {f"{ri.chain_id}{ri.resseq}{ri.icode.strip()}": i for i, ri in enumerate(ref_full_infos)}
+            mob_res_to_full_idx = {f"{mi.chain_id}{mi.resseq}{mi.icode.strip()}": j for j, mi in enumerate(mob_full_infos)}
+
+            full_pairs = []
+            # Labels for ALL residues in the full structure
+            all_labels = [f"{ri.chain_id}:{ri.resseq}{ri.icode.strip()}" for ri in ref_full_infos]
+
+            # `seqguided["ref_atoms"]` have ids like (' ', 42, ' ')
+            # map the parent residue back to `ref_full_infos`
+            for i, (ref_atom, mob_atom) in enumerate(zip(seqguided["ref_atoms"], seqguided["mob_atoms"])):
+                r_res = ref_atom.get_parent()
+                m_res = mob_atom.get_parent()
+
+                # Biopython get_id() returns (het, resseq, icode)
+                # `res_labels` in `superimpose_atoms` gives us chain information via `get_parent().get_parent().id`
+                r_chain = r_res.get_parent().id
+                r_key = f"{r_chain}{r_res.get_id()[1]}{(r_res.get_id()[2] or '').strip()}"
+
+                m_chain = m_res.get_parent().id
+                m_key = f"{m_chain}{m_res.get_id()[1]}{(m_res.get_id()[2] or '').strip()}"
+
+                if r_key in ref_res_to_full_idx and m_key in mob_res_to_full_idx:
+                    idx_ref = ref_res_to_full_idx[r_key]
+                    idx_mob = mob_res_to_full_idx[m_key]
+                    full_pairs.append((idx_ref, idx_mob))
+
+            sg_key_prefix = f"sg3d_full_{_san_key(st.session_state.selected_ref_file)}_{_san_key(st.session_state.selected_mobile_file)}"
+            plot_superposition_3d(
+                ref_coords=ref_full_coords,
+                mob_coords=mob_full_coords_aligned,
+                title="Sequence-guided superposition (FULL structure)",
+                labels=all_labels,
+                pairs=full_pairs,
+                default_top_k=10,
+                key_prefix=sg_key_prefix
+            )
+        else:
+            sg_key_prefix = f"sg3d_pairs_{_san_key(st.session_state.selected_ref_file)}_{_san_key(st.session_state.selected_mobile_file)}"
+            plot_superposition_3d(
+                ref_coords=seqguided["si"]["ref_coords"],
+                mob_coords=seqguided["si"]["mob_coords_transformed"],
+                title="Sequence-guided superposition (MATCHED subset)",
+                labels=seqguided["si"]["residue_labels"],
+                pairs=id_pairs,
+                default_top_k=10,
+                key_prefix=sg_key_prefix
+            )
+
+        st.subheader("Per-Position Cα RMSD")
+        rmsd_fig = go.Figure(data=[go.Bar(x=seqguided["si"]["residue_labels"], y=seqguided["si"]["per_residue_rmsd"])])
+        rmsd_fig.update_layout(xaxis_title="Reference Residue (Chain:ResSeq)", yaxis_title="RMSD (Å)", height=400)
+        st.plotly_chart(rmsd_fig, use_container_width=True)
+
+        # Prepare CSV for per position RMSD
+        rmsd_df = pd.DataFrame({
+            "Residue Label": seqguided["si"]["residue_labels"],
+            "RMSD": seqguided["si"]["per_residue_rmsd"]
+        })
+        csv_data = rmsd_df.to_csv(index=False).encode('utf-8')
+        st.download_button("⬇️ Download RMSD per position (CSV)", data=csv_data, file_name="rmsd_per_position_seqguided.csv", mime="text/csv")
 
         zbuf, zname = export_zip_seqguided(seqguided["si"], txt_block, seqguided["ref_atoms"], seqguided["mob_atoms"])
         st.download_button("⬇️ Download sequence-guided ZIP (CA, CSV, TXT)", data=zbuf, file_name=zname, mime="application/zip")
@@ -1076,31 +1188,74 @@ if st.session_state.last_run_summary:
                 plot_pair_distance_hist(dists, "Per-pair distances after superposition")
 
         if len(seqfree.pairs) >= 1:
+            if seqfree.method == "shape" and seqfree.shift_matrix is not None:
+                with st.expander("Alignment shift diagnostics (Shape Method Matrix)", expanded=False):
+                    st.write("Heatmap of matching similarities between residues based on 3D neighborhood context. The alignment follows a path of highest similarity.")
+                    fig = go.Figure(data=go.Heatmap(z=seqfree.shift_matrix, colorscale='Viridis'))
+                    fig.update_layout(xaxis_title="Mobile Residue Index", yaxis_title="Reference Residue Index", height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+            elif seqfree.method == "window" and seqfree.shift_scores is not None:
+                with st.expander("Alignment shift diagnostics (Window Method Scores)", expanded=False):
+                    st.write("Score plot of alignment across multiple sliding window offsets. The peak score indicates the best matching structural regions.")
+                    fig = go.Figure(data=go.Scatter(x=np.arange(len(seqfree.shift_scores)), y=seqfree.shift_scores, mode='lines+markers'))
+                    fig.update_layout(xaxis_title="Shift offset", yaxis_title="Correlation Score", height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+
             # NEW: toggle full chains vs matched subset
-            show_full = st.checkbox(
-                "Show FULL selected chains (Cα) transformed by the seq-free alignment",
-                value=True, key="sf_show_full"
+            sf_show_mode = st.radio(
+                "Superposition view mode",
+                options=["Matched Subset", "Selected Chains", "Whole Structure (All Chains)"],
+                index=1,
+                key="sf_show_mode",
+                horizontal=True
             )
 
-            # Labels for peaks come from the matched pairs (ref side)
-            labels = [f"{seqfree.ref_subset_infos[i].chain_id}:{seqfree.ref_subset_infos[i].resseq}" for (i,_) in seqfree.pairs]
+            if sf_show_mode == "Whole Structure (All Chains)":
+                ref_full_infos = _extract_ca_infos(st.session_state.structures[st.session_state.selected_ref_file], chain_filter=None)
+                mob_full_infos = seqfree.mob_all_infos
 
-            if show_full:
-                # Draw FULL selected chains; compute peaks over matched pairs
+                ref_full_coords = np.vstack([ri.coord for ri in ref_full_infos])
+                mob_full_coords_aligned = seqfree.mob_all_ca_coords_aligned
+
+                ref_res_to_full_idx = {f"{ri.chain_id}{ri.resseq}{ri.icode.strip()}": i for i, ri in enumerate(ref_full_infos)}
+                mob_res_to_full_idx = {f"{mi.chain_id}{mi.resseq}{mi.icode.strip()}": j for j, mi in enumerate(mob_full_infos)}
+
+                full_pairs = []
+                for (i, j) in seqfree.pairs:
+                    ri = seqfree.ref_subset_infos[i]
+                    mi = seqfree.mob_subset_infos[j]
+                    r_key = f"{ri.chain_id}{ri.resseq}{ri.icode.strip()}"
+                    m_key = f"{mi.chain_id}{mi.resseq}{mi.icode.strip()}"
+                    if r_key in ref_res_to_full_idx and m_key in mob_res_to_full_idx:
+                        full_pairs.append((ref_res_to_full_idx[r_key], mob_res_to_full_idx[m_key]))
+
+                all_labels = [f"{ri.chain_id}:{ri.resseq}{ri.icode.strip()}" for ri in ref_full_infos]
+                sf_key_prefix = f"sf3d_whole_{_san_key(st.session_state.selected_ref_file)}_{_san_key(st.session_state.selected_mobile_file)}_{seqfree.method}"
+                plot_superposition_3d(
+                    ref_coords=ref_full_coords,
+                    mob_coords=mob_full_coords_aligned,
+                    title=f"Seq-free superposition [{seqfree.method}] • WHOLE structure • RMSD {seqfree.rmsd:.3f} Å",
+                    labels=all_labels,
+                    pairs=full_pairs,
+                    default_top_k=10,
+                    key_prefix=sf_key_prefix
+                )
+            elif sf_show_mode == "Selected Chains":
+                labels = [f"{ri.chain_id}:{ri.resseq}{ri.icode.strip()}" for ri in seqfree.ref_subset_infos]
                 sf_key_prefix = f"sf3d_full_{_san_key(st.session_state.selected_ref_file)}_{_san_key(st.session_state.selected_mobile_file)}_{seqfree.method}"
                 plot_superposition_3d(
-                    ref_coords=seqfree.ref_subset_ca_coords,                 # all CA of selected ref chains
-                    mob_coords=seqfree.mob_subset_ca_coords_aligned,         # all CA of selected mob chains (after R,t)
-                    title=f"Seq-free superposition [{seqfree.method}] • FULL selected chains • RMSD {seqfree.rmsd:.3f} Å",
+                    ref_coords=seqfree.ref_subset_ca_coords,
+                    mob_coords=seqfree.mob_subset_ca_coords_aligned,
+                    title=f"Seq-free superposition [{seqfree.method}] • SELECTED chains • RMSD {seqfree.rmsd:.3f} Å",
                     labels=labels,
-                    pairs=seqfree.pairs,                                     # peaks computed on matched pairs
+                    pairs=seqfree.pairs,
                     default_top_k=10,
                     key_prefix=sf_key_prefix
                 )
             else:
-                # Draw only matched subset for both structures (as before)
                 ref_pts = np.vstack([seqfree.ref_subset_ca_coords[i] for (i,j) in seqfree.pairs])
                 mob_pts = np.vstack([seqfree.mob_subset_ca_coords_aligned[j] for (i,j) in seqfree.pairs])
+                labels = [f"{seqfree.ref_subset_infos[i].chain_id}:{seqfree.ref_subset_infos[i].resseq}{(seqfree.ref_subset_infos[i].icode or '').strip()}" for (i,_) in seqfree.pairs]
                 id_pairs = [(k,k) for k in range(len(labels))]
                 sf_key_prefix = f"sf3d_pairs_{_san_key(st.session_state.selected_ref_file)}_{_san_key(st.session_state.selected_mobile_file)}_{seqfree.method}"
                 plot_superposition_3d(
@@ -1125,6 +1280,22 @@ if st.session_state.last_run_summary:
             df_pairs = pd.DataFrame(rows)
             st.dataframe(df_pairs, use_container_width=True, hide_index=True)
 
+            st.subheader("Per-Position Cα RMSD (Matched Subset)")
+            # Labels and RMSD for seqfree
+            sf_rmsd_labels = [f"{seqfree.ref_subset_infos[i].chain_id}:{seqfree.ref_subset_infos[i].resseq}{(seqfree.ref_subset_infos[i].icode or '').strip()}" for (i, _) in seqfree.pairs]
+            sf_per_res_rmsd = [np.linalg.norm(seqfree.ref_subset_ca_coords[i] - seqfree.mob_subset_ca_coords_aligned[j]) for (i, j) in seqfree.pairs]
+
+            sf_rmsd_fig = go.Figure(data=[go.Bar(x=sf_rmsd_labels, y=sf_per_res_rmsd)])
+            sf_rmsd_fig.update_layout(xaxis_title="Reference Residue (Chain:ResSeq)", yaxis_title="RMSD (Å)", height=400)
+            st.plotly_chart(sf_rmsd_fig, use_container_width=True)
+
+            sf_rmsd_df = pd.DataFrame({
+                "Residue Label": sf_rmsd_labels,
+                "RMSD": sf_per_res_rmsd
+            })
+            sf_csv_data = sf_rmsd_df.to_csv(index=False).encode('utf-8')
+            st.download_button("⬇️ Download RMSD per position (CSV)", data=sf_csv_data, file_name="rmsd_per_position_seqfree.csv", mime="text/csv")
+
             # Structure-based sequence alignment (derived from matched pairs path)
             a1,a2,_ = structure_based_alignment_strings(seqfree.ref_subset_infos, seqfree.mob_subset_infos, seqfree.pairs)
             with st.expander("Show structure-based sequence alignment", expanded=False):
@@ -1135,7 +1306,7 @@ if st.session_state.last_run_summary:
             # Export full-atom transformed + pairs.csv
             zbuf2, zname2 = export_zip_seqfree(st.session_state.selected_ref_file,
                                                st.session_state.selected_mobile_file,
-                                               seqfree.rotation, seqfree.translation,
+                                               seqfree,
                                                df_pairs)
             st.download_button("⬇️ Download seq-free ZIP (full-atom aligned PDB + pairs.csv)",
                                data=zbuf2, file_name=zname2, mime="application/zip")
