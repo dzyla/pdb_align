@@ -111,9 +111,10 @@ result.plot_rmsd("rmsd_plot.pdf", style="scientific", on="reference")
 result.save_aligned_pdb("aligned_mobile.pdb")
 result.save_log("alignment_log.txt") # Save formatted summary of run
 
-# Generate a PyMOL script that automatically loads both structures,
+# Generate a PyMOL or ChimeraX script that automatically loads both structures,
 # applies the transformation, and visualizes the mobile chain colored by local RMSD.
 result.save_pymol_script("visualization.pml", aligned_mobile_filename="aligned_mobile.pdb")
+result.save_chimerax_script("visualization.cxc", aligned_mobile_filename="aligned_mobile.pdb")
 
 # Batch process a whole directory across multiple cores natively
 # Using the iterative generator allows tracking progress natively
@@ -122,4 +123,8 @@ for fname, res in aligner.batch_align_iter(mob_dir="path/", out_dir="out/", mode
 
 # Or get a pandas DataFrame immediately
 df_batch = aligner.batch_align(mob_dir="path/", out_dir="out/", mode="auto", workers=4)
+
+# And then calculate ensemble-wide metrics across all targets
+stats = aligner.get_ensemble_statistics(df_batch)
+print(stats) # Mean RMSD, Median TM-score, etc.
 ```

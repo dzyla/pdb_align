@@ -25,13 +25,15 @@ class AlignmentResult:
     Encapsulates the result of a structural alignment, providing a clean, stateless
     interface to properties like RMSD, matrices, and plotting tools.
     """
-    def __init__(self, chosen: dict, seqguided: dict, seqfree: dict, ref_file: str, mob_file: str, mob_struct, verbose: bool = False):
+    def __init__(self, chosen: dict, seqguided: dict, seqfree: dict, ref_file: str, mob_file: str, mob_struct, ref_lens: dict, mob_lens: dict, verbose: bool = False):
         self._chosen = chosen
         self._seqguided = seqguided
         self._seqfree = seqfree
         self.ref_file = ref_file
         self.mob_file = mob_file
         self.mob_struct = mob_struct
+        self.ref_lens = ref_lens
+        self.mob_lens = mob_lens
         self.verbose = verbose
 
     @property
@@ -61,8 +63,15 @@ class AlignmentResult:
             mob_atoms = self._chosen["seqguided"]["mob_atoms"]
             per_res_rmsd = self._chosen["seqguided"]["si"]["per_residue_rmsd"]
 
-            L_ref = len(ref_atoms)
-            L_mob = len(mob_atoms)
+            # Filter to CA only for TM-score if backbone/all_heavy was used
+            ca_indices = [i for i, a in enumerate(ref_atoms) if a.get_name() == "CA"]
+            if not ca_indices:
+                return None
+            ca_rmsd = per_res_rmsd[ca_indices]
+
+            # The length should be the total length of the chains, not just the matched atoms
+            L_ref = sum(self.ref_lens.values())
+            L_mob = sum(self.mob_lens.values())
 
             if normalize_by == 'reference': L = L_ref
             elif normalize_by == 'mobile': L = L_mob
@@ -73,7 +82,7 @@ class AlignmentResult:
                 return None
             d0 = 1.24 * (L - 15)**(1.0/3.0) - 1.8
             d0_sq = d0**2
-            tm = np.sum(1.0 / (1.0 + (per_res_rmsd**2) / d0_sq)) / L
+            tm = np.sum(1.0 / (1.0 + (ca_rmsd**2) / d0_sq)) / L
             return float(tm)
 
         elif self._chosen["seqfree"]:
@@ -81,10 +90,8 @@ class AlignmentResult:
             mob_subset = self._chosen["seqfree"].mob_subset_infos
             pairs = self._chosen["seqfree"].pairs
 
-            # For sequence-free, the length of the subsets dictates the alignment length.
-            # To get the full length of the chain, we could parse it, but for subsets we use subset length.
-            L_ref = len(ref_subset)
-            L_mob = len(mob_subset)
+            L_ref = sum(self.ref_lens.values())
+            L_mob = sum(self.mob_lens.values())
 
             if normalize_by == 'reference': L = L_ref
             elif normalize_by == 'mobile': L = L_mob
@@ -396,8 +403,81 @@ center
         if self.verbose:
             print(f"Saved PyMOL script to {filename}")
 
+    def save_chimerax_script(self, filename: str, aligned_mobile_filename: str = "aligned_mobile.pdb"):
+        """
+        Generates a .cxc script for ChimeraX to easily visualize the alignment.
+        This assumes you have saved the aligned mobile structure using `save_aligned_pdb`.
+        """
+        script = f"""# ChimeraX Script for visualizing alignment
+# Load structures
+open {self.ref_file}
+open {aligned_mobile_filename}
+
+# Hide atoms, show cartoon
+hide atoms
+show cartoons
+
+# Color structures
+color #1 white
+color #2 cyan
+
+# Update B-factors with RMSD values for heatmapping
+"""
+
+        df = self.get_rmsd_df(on="mobile")
+        if not df.empty:
+            for _, row in df.iterrows():
+                try:
+                    res_parts = row["Residue"].split(":")
+                    if len(res_parts) == 2:
+                        chain = res_parts[0]
+                        res_id = res_parts[1]
+                        import re
+                        match = re.match(r"(\d+)([a-zA-Z]*)", res_id)
+                        if match:
+                            res_num = match.group(1)
+                            # ChimeraX setattr syntax
+                            script += f"setattr #2/{chain}:{res_num} atoms bfactor {row['RMSD']:.3f}\n"
+                except Exception:
+                    pass
+
+            script += """
+# Color by B-factor (RMSD)
+color byattribute bfactor #2 palette blue:white:red range 0,10
+"""
+
+        script += """
+# Center and orient
+view
+"""
+        with open(filename, "w") as f:
+            f.write(script)
+        if self.verbose:
+            print(f"Saved ChimeraX script to {filename}")
+
     def __repr__(self):
         return f"<AlignmentResult RMSD: {self.rmsd:.3f}Å, Method: {self._chosen['name']}>"
+
+def _process_single_alignment(task_payload: dict):
+    """
+    Stateless module-level function for multiprocessing batch jobs.
+    Avoids pickling the heavy Biopython objects in PDBAligner.
+    """
+    try:
+        aligner = PDBAligner(
+            ref_file=task_payload["ref_file"],
+            chains_ref=task_payload["chains_ref"],
+            verbose=False
+        )
+        aligner.add_mobile(task_payload["fpath"], chains=task_payload["chains_mob"])
+        res = aligner.align(mode=task_payload["mode"], **task_payload["kwargs"])
+
+        import os
+        out_pdb = os.path.join(task_payload["out_dir"], f"aligned_{task_payload['fname']}")
+        res.save_aligned_pdb(out_pdb)
+        return task_payload["fname"], {"rmsd": res.rmsd, "tm_score": res.tm_score, "status": "success"}
+    except Exception as e:
+        return task_payload["fname"], {"status": "error", "message": str(e)}
 
 class PDBAligner:
     """
@@ -585,10 +665,17 @@ class PDBAligner:
                           seqfree=seqfree if "seq_free" in mode or "Sequence-free" in mode else None)
 
         self.last_result = dict(seqguided=seqguided, seqfree=seqfree, chosen=chosen)
+
+        # Calculate restricted lengths for TM-score based on specific chains aligned
+        active_ref_lens = {c: self.ref_lens[c] for c in ref_chs if c in self.ref_lens}
+        active_mob_lens = {c: self.mob_lens[c] for c in mob_chs if c in self.mob_lens}
+
         result_obj = AlignmentResult(
             chosen=chosen, seqguided=seqguided, seqfree=seqfree,
             ref_file=self.ref_file, mob_file=self.mob_file,
-            mob_struct=self.mob_struct, verbose=self.verbose
+            mob_struct=self.mob_struct,
+            ref_lens=active_ref_lens, mob_lens=active_mob_lens,
+            verbose=self.verbose
         )
 
         if self.verbose:
@@ -602,18 +689,6 @@ class PDBAligner:
             print(f"  Reason: {chosen['reason']}")
 
         return result_obj
-
-    def _align_single_file(self, fpath: str, fname: str, mode: str, out_dir: str, **kwargs):
-        try:
-            # We must instantiate a new aligner to be fully stateless in multiprocessing
-            aligner = PDBAligner(ref_file=self.ref_file, chains_ref=self.chains_ref, verbose=self.verbose)
-            aligner.add_mobile(fpath, chains=self.chains_mob)
-            res = aligner.align(mode=mode, **kwargs)
-            out_pdb = os.path.join(out_dir, f"aligned_{fname}")
-            res.save_aligned_pdb(out_pdb)
-            return fname, {"rmsd": res.rmsd, "tm_score": res.tm_score, "status": "success"}
-        except Exception as e:
-            return fname, {"status": "error", "message": str(e)}
 
     def batch_align_iter(self, mob_dir: str, out_dir: str, mode: str = "auto", workers: int = 1, **kwargs):
         """
@@ -631,11 +706,20 @@ class PDBAligner:
         for fname in os.listdir(mob_dir):
             if fname.lower().endswith((".pdb", ".cif", ".mmcif")):
                 fpath = os.path.join(mob_dir, fname)
-                tasks.append((fpath, fname))
+                tasks.append({
+                    "ref_file": self.ref_file,
+                    "chains_ref": self.chains_ref,
+                    "chains_mob": self.chains_mob,
+                    "fpath": fpath,
+                    "fname": fname,
+                    "mode": mode,
+                    "out_dir": out_dir,
+                    "kwargs": kwargs
+                })
 
         if workers > 1:
             with ProcessPoolExecutor(max_workers=workers) as executor:
-                futures = [executor.submit(self._align_single_file, fpath, fname, mode, out_dir, **kwargs) for fpath, fname in tasks]
+                futures = [executor.submit(_process_single_alignment, task) for task in tasks]
                 for future in futures:
                     fname, r = future.result()
                     if self.verbose:
@@ -646,8 +730,8 @@ class PDBAligner:
                             print(f"Failed to process {fname}: {r.get('message')}")
                     yield fname, r
         else:
-            for fpath, fname in tasks:
-                fname, r = self._align_single_file(fpath, fname, mode, out_dir, **kwargs)
+            for task in tasks:
+                fname, r = _process_single_alignment(task)
                 if self.verbose:
                     status = r.get("status")
                     if status == "success":
@@ -667,6 +751,30 @@ class PDBAligner:
             r["filename"] = fname
             results.append(r)
         return pd.DataFrame(results)
+
+    def get_ensemble_statistics(self, df) -> dict:
+        """
+        Calculates summary statistics for a batch alignment ensemble (DataFrame).
+        """
+        if df.empty:
+            return {}
+
+        stats = {}
+        if "rmsd" in df.columns:
+            valid_rmsd = df["rmsd"].dropna()
+            if not valid_rmsd.empty:
+                stats["rmsd_mean"] = valid_rmsd.mean()
+                stats["rmsd_median"] = valid_rmsd.median()
+                stats["rmsd_std"] = valid_rmsd.std()
+
+        if "tm_score" in df.columns:
+            valid_tm = df["tm_score"].dropna()
+            if not valid_tm.empty:
+                stats["tm_score_mean"] = valid_tm.mean()
+                stats["tm_score_median"] = valid_tm.median()
+                stats["tm_score_max"] = valid_tm.max()
+
+        return stats
 
     def get_general_sequence_alignment(self, ref_chain: str, mob_chain: str, gap_open: float = -10.0, gap_extend: float = -0.5) -> Optional[tuple]:
         """

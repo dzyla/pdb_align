@@ -87,6 +87,7 @@ init_state()
 # IO / parsing
 # ===========================================
 def parse_structure(uploaded_file):
+    from pdb_align.core import extract_sequences_and_lengths, _extract_ca_infos
     try:
         raw = uploaded_file.getvalue()
         suffix = os.path.splitext(uploaded_file.name)[1].lower()
@@ -95,7 +96,13 @@ def parse_structure(uploaded_file):
         parser = MMCIFParser(QUIET=True) if suffix in (".cif",".mmcif") else PDBParser(QUIET=True)
         s = parser.get_structure(os.path.splitext(uploaded_file.name)[0], tmp_path)
         os.unlink(tmp_path)
-        return s, None
+
+        seqs, lengths = extract_sequences_and_lengths(s, uploaded_file.name)
+        # Instead of saving the full Bio.PDB Structure, we save the extracted minimal ResidueInfos
+        # which contain coords, chains, and resids for rendering, dropping the heavy graph context natively.
+        infos = _extract_ca_infos(s, chain_filter=None)
+
+        return {"infos": infos, "seqs": seqs, "lengths": lengths}, None
     except Exception as e:
         try:
             os.unlink(tmp_path)
@@ -167,21 +174,17 @@ def plot_superposition_3d(ref_coords: np.ndarray,
                           pairs: Optional[List[Tuple[int,int]]] = None,
                           default_top_k: int = 10,
                           key_prefix: Optional[str] = None,
-                          pdb_str: Optional[str] = None):
+                          pdb_file_path: Optional[str] = None):
 
-    if pdb_str:
-        import py3Dmol
-        from stmol import showmol
-        st.subheader(title)
-        st.markdown("*Note: Rendering uses Py3Dmol cartoon representations. Mobile chain colored by B-factor (RMSD gradient).*")
-        view = py3Dmol.view(width=800, height=600)
-        view.addModel(pdb_str, "pdb")
-        # Color first model (reference) blue, second model (mobile) by b-factor
-        view.setStyle({'model': 0}, {"cartoon": {'color': 'blue'}})
-        view.setStyle({'model': 1}, {"cartoon": {'colorscheme': {'prop': 'b', 'gradient': 'rwb', 'min': 0, 'max': 10}}})
-        view.zoomTo()
-        showmol(view, height=600, width=800)
-        return
+    if pdb_file_path:
+        try:
+            from streamlit_molstar import st_molstar
+            st.subheader(title)
+            st.markdown("*Note: Rendering uses Molstar cartoon representations. Model 1 is Reference, Model 2 is Aligned Mobile.*")
+            st_molstar(pdb_file_path, key=key_prefix, height="600px")
+            return
+        except Exception as e:
+            st.warning(f"Molstar rendering failed: {e}. Falling back to Plotly.")
 
     kp = _san_key(key_prefix if key_prefix else f"k_{title}_{id(ref_coords)}_{id(mob_coords)}")
 
@@ -469,18 +472,26 @@ with st.sidebar:
     st.header("📤 Upload")
     uploads = st.file_uploader("Select PDB or mmCIF files", type=["pdb","cif","mmcif"], accept_multiple_files=True)
     if uploads:
-        st.session_state.uploaded_blob_map = {f.name: f for f in uploads}
-        new_names = sorted([f.name for f in uploads]); old_names = sorted(list(st.session_state.structures.keys()))
+        # Filter files by size (10 MB max) to prevent OOM in Streamlit Cloud
+        MAX_SIZE = 10 * 1024 * 1024
+        valid_uploads = []
+        for f in uploads:
+            if f.size > MAX_SIZE:
+                st.error(f"File {f.name} is too large ({f.size / 1024 / 1024:.1f} MB). Max allowed size is 10 MB.")
+            else:
+                valid_uploads.append(f)
+
+        st.session_state.uploaded_blob_map = {f.name: f for f in valid_uploads}
+        new_names = sorted([f.name for f in valid_uploads]); old_names = sorted(list(st.session_state.structures.keys()))
         if new_names != old_names:
             st.session_state.structures.clear(); st.session_state.sequences.clear(); st.session_state.chain_lengths.clear()
             with st.spinner("Parsing structures..."):
-                for f in uploads:
+                for f in valid_uploads:
                     s, err = parse_structure(f)
                     if s:
-                        st.session_state.structures[f.name] = s
-                        seqs, lens = extract_sequences_and_lengths(s, f.name)
-                        st.session_state.sequences[f.name] = seqs
-                        st.session_state.chain_lengths[f.name] = lens
+                        st.session_state.structures[f.name] = s["infos"]
+                        st.session_state.sequences[f.name] = s["seqs"]
+                        st.session_state.chain_lengths[f.name] = s["lengths"]
                     else:
                         log(err or f"Failed to parse {f.name}")
 
@@ -564,10 +575,14 @@ if run:
         result_bundle = st.session_state.results_cache[key]
     else:
         log(f"Running mode: {st.session_state.align_mode}")
-        ref_struct = st.session_state.structures[ref_file]
-        mob_struct = st.session_state.structures[mob_file]
-
         try:
+            # Re-parse structures locally to save global memory footprint
+            pathA, pathB = write_uploads_to_temp_files(ref_file, mob_file)
+            parserA = MMCIFParser(QUIET=True) if pathA.lower().endswith((".cif",".mmcif")) else PDBParser(QUIET=True)
+            parserB = MMCIFParser(QUIET=True) if pathB.lower().endswith((".cif",".mmcif")) else PDBParser(QUIET=True)
+            ref_struct = parserA.get_structure("ref", pathA)
+            mob_struct = parserB.get_structure("mob", pathB)
+
             # Sequence-guided (if needed)
             seqguided=None
             if st.session_state.align_mode in ("Auto (best RMSD)","Sequence-guided"):
@@ -587,7 +602,6 @@ if run:
             # Sequence-free (if needed)
             seqfree=None
             if st.session_state.align_mode in ("Auto (best RMSD)","Sequence-free (auto)","Sequence-free (shape)","Sequence-free (window)"):
-                pathA, pathB = write_uploads_to_temp_files(ref_file, mob_file)
                 try:
                     method = "auto" if st.session_state.align_mode in ("Auto (best RMSD)","Sequence-free (auto)") else (
                              "shape" if st.session_state.align_mode=="Sequence-free (shape)" else "window")
@@ -668,6 +682,26 @@ if st.session_state.last_run_summary:
         with st.expander("Show alignment text", expanded=False):
             st.code(txt_block)
 
+        try:
+            from streamlit_molstar import st_molstar
+            pathA, pathB = write_uploads_to_temp_files(st.session_state.selected_ref_file, st.session_state.selected_mobile_file)
+            import tempfile
+            out = tempfile.NamedTemporaryFile(delete=False, suffix=".pdb")
+            out_path = out.name; out.close()
+            from Bio.PDB import PDBIO, MMCIFParser, PDBParser
+            from pdb_align.core import _AllAtomsSelect
+            parserB = MMCIFParser(QUIET=True) if pathB.lower().endswith((".cif",".mmcif")) else PDBParser(QUIET=True)
+            mob_struct = parserB.get_structure(os.path.basename(pathB), pathB)
+            io_obj = PDBIO()
+            io_obj.set_structure(mob_struct)
+            io_obj.save(out_path, _AllAtomsSelect(R=seqguided["si"]["rotation"], t=seqguided["si"]["translation"]))
+
+            st.subheader("Molstar 3D Interactive View")
+            st.markdown("*Model 1 (Blue/Default) is Reference. Model 2 (Green/Default) is Aligned Mobile.*")
+            st_molstar([pathA, out_path], key="molstar_sg", height="600px")
+        except Exception as e:
+            st.warning(f"Molstar visualization failed: {e}")
+
         # NEW: toggle full chains vs matched subset
         sg_show_full = st.checkbox(
             "Show whole structure (all chains)",
@@ -678,8 +712,8 @@ if st.session_state.last_run_summary:
 
         if sg_show_full:
             # Extract full structures for reference and mobile
-            ref_full_infos = _extract_ca_infos(st.session_state.structures[st.session_state.selected_ref_file], chain_filter=None)
-            mob_full_infos = _extract_ca_infos(st.session_state.structures[st.session_state.selected_mobile_file], chain_filter=None)
+            ref_full_infos = st.session_state.structures[st.session_state.selected_ref_file]
+            mob_full_infos = st.session_state.structures[st.session_state.selected_mobile_file]
 
             ref_full_coords = np.vstack([ri.coord for ri in ref_full_infos])
             mob_full_coords = np.vstack([mi.coord for mi in mob_full_infos])
@@ -767,6 +801,35 @@ if st.session_state.last_run_summary:
                 plot_pair_distance_hist(dists, "Per-pair distances after superposition")
 
         if len(seqfree.pairs) >= 1:
+            # Render using streamlit_molstar from the exported Zip (which creates the aligned mobile PDB)
+            zbuf2, zname2 = export_zip_seqfree(st.session_state.selected_ref_file,
+                                               st.session_state.selected_mobile_file,
+                                               seqfree,
+                                               pd.DataFrame())
+
+            # The exported Zip function writes temporary files for extraction. Let's create an ephemeral combined PDB.
+            # However, `st_molstar` accepts multiple files if passed as a list of strings: `st_molstar([pathA, pathB])`
+            try:
+                from streamlit_molstar import st_molstar
+                pathA, pathB = write_uploads_to_temp_files(st.session_state.selected_ref_file, st.session_state.selected_mobile_file)
+                import tempfile
+                # We need the aligned mobile coordinates saved to a file, not the unaligned pathB
+                out = tempfile.NamedTemporaryFile(delete=False, suffix=".pdb")
+                out_path = out.name; out.close()
+                from Bio.PDB import PDBIO, MMCIFParser, PDBParser
+                from pdb_align.core import _AllAtomsSelect
+                parserB = MMCIFParser(QUIET=True) if pathB.lower().endswith((".cif",".mmcif")) else PDBParser(QUIET=True)
+                mob_struct = parserB.get_structure(os.path.basename(pathB), pathB)
+                io_obj = PDBIO()
+                io_obj.set_structure(mob_struct)
+                io_obj.save(out_path, _AllAtomsSelect(R=seqfree.rotation, t=seqfree.translation))
+
+                st.subheader("Molstar 3D Interactive View")
+                st.markdown("*Model 1 (Blue/Default) is Reference. Model 2 (Green/Default) is Aligned Mobile.*")
+                st_molstar([pathA, out_path], key="molstar_sf", height="600px")
+            except Exception as e:
+                st.warning(f"Molstar visualization failed: {e}")
+
             if seqfree.method == "shape" and seqfree.shift_matrix is not None:
                 with st.expander("Alignment shift diagnostics (Shape Method Matrix)", expanded=False):
                     st.write("Heatmap of matching similarities between residues based on 3D neighborhood context. The alignment follows a path of highest similarity.")
@@ -790,7 +853,7 @@ if st.session_state.last_run_summary:
             )
 
             if sf_show_mode == "Whole Structure (All Chains)":
-                ref_full_infos = _extract_ca_infos(st.session_state.structures[st.session_state.selected_ref_file], chain_filter=None)
+                ref_full_infos = st.session_state.structures[st.session_state.selected_ref_file]
                 mob_full_infos = seqfree.mob_all_infos
 
                 ref_full_coords = np.vstack([ri.coord for ri in ref_full_infos])

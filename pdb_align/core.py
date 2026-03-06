@@ -94,20 +94,6 @@ def _parse_path(path:str) -> _Structure.Structure:
 def _chain_ids(struct:_Structure.Structure) -> List[str]:
     return [ch.id for ch in list(struct)[0]]
 
-def _resolve_selectors(struct:_Structure.Structure, sel: Optional[List[Union[str,int]]]) -> Optional[List[str]]:
-    if sel is None: return None
-    ids = _chain_ids(struct)
-    out=[]
-    for x in sel:
-        if isinstance(x,int):
-            if not (1<=x<=len(ids)): raise ValueError(f"Chain index {x} out of range 1..{len(ids)}")
-            out.append(ids[x-1])
-        else:
-            if x not in ids: raise ValueError(f"Chain '{x}' not in {ids}")
-            out.append(x)
-    seen=set(); uniq=[c for c in out if not (c in seen or seen.add(c))]
-    return uniq
-
 def _parse_chain_selector(selector: str) -> Tuple[str, Optional[int], Optional[int]]:
     if ":" in selector:
         parts = selector.split(":")
@@ -120,16 +106,25 @@ def _parse_chain_selector(selector: str) -> Tuple[str, Optional[int], Optional[i
             return chain_id, int(range_str), int(range_str)
     return selector, None, None
 
-def _extract_ca_infos(struct:_Structure.Structure, chain_filter:Optional[List[str]], atoms: str = "CA")->List[ResidueInfo]:
+def _resolve_selectors(struct:_Structure.Structure, sel: Optional[List[Union[str,int]]]) -> Optional[List[str]]:
+    if sel is None: return None
+    ids = _chain_ids(struct)
+    out=[]
+    for x in sel:
+        if isinstance(x,int):
+            if not (1<=x<=len(ids)): raise ValueError(f"Chain index {x} out of range 1..{len(ids)}")
+            out.append(ids[x-1])
+        else:
+            # x could be "A:10-150". Check if the pure chain is in ids.
+            cid, _, _ = _parse_chain_selector(x)
+            if cid not in ids: raise ValueError(f"Chain '{cid}' (from '{x}') not in {ids}")
+            out.append(x)
+    seen=set(); uniq=[c for c in out if not (c in seen or seen.add(c))]
+    return uniq
+
+def _extract_ca_infos(struct:_Structure.Structure, chain_filter:Optional[List[str]])->List[ResidueInfo]:
     model = list(struct)[0]
     infos=[]; idx=0
-
-    if atoms == "backbone":
-        target_atoms = {"N", "CA", "C", "O"}
-    elif atoms == "all_heavy":
-        target_atoms = None # All non-hydrogen
-    else:
-        target_atoms = {"CA"}
 
     # Parse bounds
     bounds_map = {}
@@ -164,24 +159,15 @@ def _extract_ca_infos(struct:_Structure.Structure, chain_filter:Optional[List[st
                 if not in_bounds:
                     continue
 
-            if atoms == "CA":
-                if "CA" not in res: continue
-                ca: Atom.Atom = res["CA"]
-                coord = ca.get_coord().astype(float)
-                infos.append(ResidueInfo(idx=idx, chain_id=chain.id, resseq=int(resseq),
-                                         icode=(icode or "").strip() if isinstance(icode,str) else "",
-                                         resname=str(res.get_resname()), coord=coord))
-                idx += 1
-            else:
-                for atom in res:
-                    if atom.element == "H": continue
-                    if target_atoms is not None and atom.get_name() not in target_atoms: continue
-                    coord = atom.get_coord().astype(float)
-                    infos.append(ResidueInfo(idx=idx, chain_id=chain.id, resseq=int(resseq),
-                                             icode=(icode or "").strip() if isinstance(icode,str) else "",
-                                             resname=str(res.get_resname()), coord=coord))
-                    idx += 1
-    if not infos: raise ValueError(f"No atoms matching selection '{atoms}' found for selected chains.")
+            if "CA" not in res: continue
+            ca: Atom.Atom = res["CA"]
+            coord = ca.get_coord().astype(float)
+            infos.append(ResidueInfo(idx=idx, chain_id=chain.id, resseq=int(resseq),
+                                     icode=(icode or "").strip() if isinstance(icode,str) else "",
+                                     resname=str(res.get_resname()), coord=coord))
+            idx += 1
+
+    if not infos: raise ValueError(f"No C-alpha atoms found for selected chains.")
     return infos
 
 def _pairwise_dists(coords: np.ndarray) -> np.ndarray:
@@ -353,8 +339,10 @@ def sequence_independent_alignment_joined_v2(
     mob_ids=_resolve_selectors(mob_struct, chains_mob)
     if (ref_ids is None) or (mob_ids is None):
         raise ValueError("Specify chains_ref and chains_mob for sequence-independent alignment.")
-    ref_infos=_extract_ca_infos(ref_struct, ref_ids, atoms=atoms)
-    mob_infos=_extract_ca_infos(mob_struct, mob_ids, atoms=atoms)
+
+    # We must ALWAYS run the structure DP matrix on C-alphas to keep size (N) = number of residues.
+    ref_infos=_extract_ca_infos(ref_struct, ref_ids)
+    mob_infos=_extract_ca_infos(mob_struct, mob_ids)
     ref_subset=np.vstack([ri.coord for ri in ref_infos])
     mob_subset=np.vstack([mi.coord for mi in mob_infos])
     D1=_pairwise_dists(ref_subset); D2=_pairwise_dists(mob_subset)
@@ -415,6 +403,41 @@ def sequence_independent_alignment_joined_v2(
 
     R=candidates[chosen]["R"]; t=candidates[chosen]["t"]
     final_pairs=candidates[chosen]["pairs"]; final_rmsd=float(candidates[chosen]["rmsd"])
+    # If the user requested backbone or all_heavy, we recalculate the final Kabsch superposition on the extended atoms
+    if atoms != "CA":
+        seqfree_res_pairs = [(ref_infos[i], mob_infos[j]) for (i, j) in final_pairs]
+
+        if atoms == "backbone":
+            target_atoms = {"N", "CA", "C", "O"}
+        else:
+            target_atoms = None # All non-hydrogen
+
+        final_ref_atoms = []
+        final_mob_atoms = []
+
+        ref_model = list(ref_struct.get_models())[0]
+        mob_model = list(mob_struct.get_models())[0]
+
+        for (ri, mi) in seqfree_res_pairs:
+            try:
+                r_res = ref_model[ri.chain_id][(' ', ri.resseq, ri.icode if ri.icode else ' ')]
+                m_res = mob_model[mi.chain_id][(' ', mi.resseq, mi.icode if mi.icode else ' ')]
+                for atA in r_res:
+                    if atA.element == "H": continue
+                    if target_atoms is not None and atA.get_name() not in target_atoms: continue
+                    for atB in m_res:
+                        if atB.get_name() == atA.get_name():
+                            final_ref_atoms.append(atA)
+                            final_mob_atoms.append(atB)
+                            break
+            except KeyError:
+                continue
+
+        if final_ref_atoms and final_mob_atoms and len(final_ref_atoms) == len(final_mob_atoms):
+            ref_c = np.array([a.get_coord() for a in final_ref_atoms])
+            mob_c = np.array([a.get_coord() for a in final_mob_atoms])
+            R, t, final_rmsd = _kabsch(ref_c, mob_c)
+
     mob_all_infos=_extract_ca_infos(_parse_path(file_mob), chain_filter=None)
     mob_all_ca=np.vstack([mi.coord for mi in mob_all_infos]); mob_all_ca_aligned=_transform(mob_all_ca, R, t)
 
@@ -468,9 +491,8 @@ def perform_sequence_alignment(seq1:str, seq2:str, gap_open:float, gap_extend:fl
             seqB = seqB_aln
         else:
             # Fallback for Biopython > 1.80
-            fmt = str(a).split('\n')
-            seqA = fmt[0]
-            seqB = fmt[2]
+            seqA = str(a[0])
+            seqB = str(a[1])
 
         class Wrap:
             def __init__(self, seqA, seqB, score):
@@ -594,9 +616,24 @@ def compute_chain_similarity_matrix(seqsA, seqsB)->Tuple[pd.DataFrame,pd.DataFra
             if not alns: continue
             a = alns[0]
 
-            fmt = format(a).split('\n')
-            seqA_aln = fmt[0]
-            seqB_aln = fmt[2]
+            if hasattr(a, "indices"):
+                ref_idx = a.indices[0]
+                mob_idx = a.indices[1]
+                seqA_aln = ""
+                seqB_aln = ""
+                for k in range(len(ref_idx)):
+                    if ref_idx[k] != -1 and mob_idx[k] != -1:
+                        seqA_aln += sA[ref_idx[k]]
+                        seqB_aln += sB[mob_idx[k]]
+                    elif ref_idx[k] != -1:
+                        seqA_aln += sA[ref_idx[k]]
+                        seqB_aln += "-"
+                    elif mob_idx[k] != -1:
+                        seqA_aln += "-"
+                        seqB_aln += sB[mob_idx[k]]
+            else:
+                seqA_aln = str(a[0])
+                seqB_aln = str(a[1])
 
             matches=sum(1 for aa,bb in zip(seqA_aln, seqB_aln) if aa==bb and aa!='-')
             ident=100.0 * matches / max(1, len(seqA_aln)); id_mat[i,j]=ident
