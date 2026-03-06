@@ -1,4 +1,3 @@
-streamlit
 numpy<2.0
 pandas
 scikit-learn
@@ -9,4 +8,5 @@ stmol
 plotly
 ipython_genutils
 matplotlib
+streamlit
 streamlit-molstar
