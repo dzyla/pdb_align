@@ -136,15 +136,12 @@ class AlignmentResult:
         return None
 
     def save_aligned_pdb(self, filename: str, subset_only: bool = False):
-        from Bio.PDB import PDBIO, MMCIFIO
+        from Bio.PDB import PDBIO
         from .core import _AllAtomsSelect
         R = self.rotation_matrix
         t = self.translation_vector
         if R is not None and t is not None:
-            if filename.lower().endswith((".cif", ".mmcif")):
-                io_obj = MMCIFIO()
-            else:
-                io_obj = PDBIO()
+            io_obj = PDBIO()
             io_obj.set_structure(self.mob_struct)
             io_obj.save(filename, _AllAtomsSelect(R=R, t=t))
 
@@ -692,76 +689,6 @@ class PDBAligner:
             print(f"  Reason: {chosen['reason']}")
 
         return result_obj
-
-    def find_binder_target_chain(self, binder_chains: List[str], candidate_chains: List[str]) -> str:
-        """
-        Identifies which candidate chain in the currently loaded mobile structure
-        is physically closest to the specified binder chains.
-        
-        This is useful for multimeric complexes (like AlphaFold predictions) where
-        a binder might stochastically attach to any of the symmetric chains.
-        """
-        if not self.mob_struct or not self.mob_file:
-            raise ValueError("Mobile structure must be loaded before finding the binder target.")
-            
-        import numpy as np
-        from scipy.spatial.distance import cdist
-        from .core import _extract_ca_infos
-        
-        # Get coordinates for the binder chains
-        binder_infos = _extract_ca_infos(self.mob_struct, chain_filter=binder_chains)
-        if not binder_infos:
-            raise ValueError(f"Could not extract CA atoms for binder chains {binder_chains} in {os.path.basename(self.mob_file)}")
-        binder_coords = np.array([info.coord for info in binder_infos])
-        
-        min_dist = float('inf')
-        best_chain = None
-        
-        # Check distance to each candidate chain
-        for candidate in candidate_chains:
-            candidate_infos = _extract_ca_infos(self.mob_struct, chain_filter=[candidate])
-            if not candidate_infos:
-                if self.verbose:
-                    print(f"Warning: Candidate chain {candidate} not found or has no CA atoms.")
-                continue
-                
-            candidate_coords = np.array([info.coord for info in candidate_infos])
-            
-            # Calculate all pairwise distances between binder CA atoms and candidate CA atoms
-            distances = cdist(binder_coords, candidate_coords)
-            
-            # Find the minimum distance
-            current_min = np.min(distances)
-            
-            if self.verbose:
-                print(f"  Minimum distance to chain {candidate}: {current_min:.2f} Å")
-                
-            if current_min < min_dist:
-                min_dist = current_min
-                best_chain = candidate
-                
-        if best_chain is None:
-            raise ValueError(f"Could not find any valid candidate chains from {candidate_chains} in {os.path.basename(self.mob_file)}")
-            
-        if self.verbose:
-            print(f"Selected chain {best_chain} as the target for binder {binder_chains} (distance: {min_dist:.2f} Å)")
-            
-        return best_chain
-
-    def align_with_binder(self, binder_chains: List[str], candidate_chains: List[str], 
-                          mode: str = "auto", seq_gap_open: float = -10, seq_gap_extend: float = -0.5, 
-                          atoms: str = "CA", **kwargs) -> AlignmentResult:
-        """
-        Calculates the target chain that the binder is bound to, sets it as the active mobile chain,
-        and performs the alignment.
-        """
-        if self.verbose:
-            print(f"Looking for target chain among {candidate_chains} bound by {binder_chains}...")
-            
-        best_chain = self.find_binder_target_chain(binder_chains, candidate_chains)
-        self.set_mobile_chains([best_chain])
-        
-        return self.align(mode=mode, seq_gap_open=seq_gap_open, seq_gap_extend=seq_gap_extend, atoms=atoms, **kwargs)
 
     def batch_align_iter(self, mob_dir: str, out_dir: str, mode: str = "auto", workers: int = 1, **kwargs):
         """

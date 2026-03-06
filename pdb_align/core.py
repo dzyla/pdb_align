@@ -607,10 +607,9 @@ def compute_chain_similarity_matrix(seqsA, seqsB)->Tuple[pd.DataFrame,pd.DataFra
 
             aligner = PairwiseAligner()
             aligner.mode = 'global'
-            aligner.match_score = 1
-            aligner.mismatch_score = 0
-            aligner.open_gap_score = 0
-            aligner.extend_gap_score = 0
+            aligner.substitution_matrix = blosum62
+            aligner.open_gap_score = -10.0
+            aligner.extend_gap_score = -0.5
 
             alns = aligner.align(sA, sB)
             if not alns: continue
