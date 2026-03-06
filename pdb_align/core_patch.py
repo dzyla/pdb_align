@@ -1,6 +1,15 @@
 import numpy as np
 from Bio.Align import PairwiseAligner, substitution_matrices
-from numba import jit
+
+try:
+    from numba import jit
+except ImportError:
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        return decorator
 
 # Added numba optimizations to slow loops
 @jit(nopython=True)

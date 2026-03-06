@@ -2,3 +2,6 @@
 *.cif
 *.ipynb
 *.zip
+*.pyc
+__pycache__/
+*.egg-info/

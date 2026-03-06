@@ -22,7 +22,16 @@ from Bio.SeqRecord import SeqRecord
 from Bio.Align import PairwiseAligner
 from Bio.Align import substitution_matrices
 from Bio.PDB import Structure as _Structure
-from numba import jit
+
+try:
+    from numba import jit
+except ImportError:
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        return decorator
 
 VALID_AA_3 = set(standard_aa_names)
 def _aa_dict() -> Dict[str, str]:
