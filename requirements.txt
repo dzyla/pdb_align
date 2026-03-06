@@ -11,3 +11,4 @@ ipython_genutils
 matplotlib
 seaborn
 streamlit-molstar
+numba

@@ -18,6 +18,7 @@ setup(
         "matplotlib",
         "seaborn",
         "streamlit",
-        "streamlit-molstar"
+        "streamlit-molstar",
+        "numba"
     ],
 )

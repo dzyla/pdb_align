@@ -9,28 +9,28 @@ def test_pdb_aligner():
     print("Testing auto mode...")
     try:
         res = aligner.align(mode="auto")
-        print(f"Auto mode successful. RMSD: {aligner.get_rmsd()}, Chosen: {res['chosen']['name']}")
+        print(f"Auto mode successful. RMSD: {res.rmsd}, Chosen: {res._chosen['name']}")
     except Exception as e:
         print(f"Auto mode error: {e}")
 
     print("Testing seq_free_shape mode...")
     try:
         res = aligner.align(mode="seq_free_shape")
-        print(f"Shape mode successful. RMSD: {aligner.get_rmsd()}, Chosen: {res['chosen']['name']}")
+        print(f"Shape mode successful. RMSD: {res.rmsd}, Chosen: {res._chosen['name']}")
     except Exception as e:
         print(f"Shape mode error: {e}")
 
     print("Testing seq_free_window mode...")
     try:
         res = aligner.align(mode="seq_free_window")
-        print(f"Window mode successful. RMSD: {aligner.get_rmsd()}, Chosen: {res['chosen']['name']}")
+        print(f"Window mode successful. RMSD: {res.rmsd}, Chosen: {res._chosen['name']}")
     except Exception as e:
         print(f"Window mode error: {e}")
 
     print("Testing seq_guided mode...")
     try:
         res = aligner.align(mode="seq_guided")
-        print(f"Seq guided mode successful. RMSD: {aligner.get_rmsd()}, Chosen: {res['chosen']['name']}")
+        print(f"Seq guided mode successful. RMSD: {res.rmsd}, Chosen: {res._chosen['name']}")
     except Exception as e:
         print(f"Seq guided mode error: {e}")
 
@@ -49,14 +49,14 @@ def test_pdb_aligner():
 
     print("Testing report_peaks...")
     try:
-        peaks = aligner.report_peaks(on="reference", top_n=3)
+        peaks = res.report_peaks(on="reference", top_n=3)
         print(f"report_peaks successful: {peaks}")
     except Exception as e:
         print(f"report_peaks error: {e}")
 
     print("Testing plot_rmsd...")
     try:
-        aligner.plot_rmsd("test_rmsd_plot.pdf")
+        res.plot_rmsd("test_rmsd_plot.pdf")
         if os.path.exists("test_rmsd_plot.pdf"):
             print("plot_rmsd successful: File created.")
         else:
@@ -67,7 +67,7 @@ def test_pdb_aligner():
     print("Testing get_sequence_alignment_fasta...")
     try:
         aligner.align(mode="seq_guided")
-        fasta = aligner.get_sequence_alignment_fasta()
+        fasta = res.get_sequence_alignment_fasta()
         if ">Reference_1CRN" in fasta and ">Mobile_2CRN" in fasta:
             print("get_sequence_alignment_fasta successful.")
         else:
@@ -78,7 +78,7 @@ def test_pdb_aligner():
 
     print("Testing get_log...")
     try:
-        log = aligner.get_log()
+        log = res.get_log()
         if "PDB Aligner Result Log" in log and "RMSD" in log:
             print("get_log successful.")
         else:
@@ -97,7 +97,7 @@ def test_pdb_aligner():
 
     print("Testing save_rmsd_csv...")
     try:
-        aligner.save_rmsd_csv("test_rmsd.csv")
+        res.save_rmsd_csv("test_rmsd.csv")
         if os.path.exists("test_rmsd.csv"):
             print("save_rmsd_csv successful.")
             os.remove("test_rmsd.csv")

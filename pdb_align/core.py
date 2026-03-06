@@ -19,9 +19,10 @@ from Bio.PDB import (
 from Bio.PDB.Polypeptide import protein_letters_3to1, standard_aa_names, is_aa
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
-from Bio import pairwise2
+from Bio.Align import PairwiseAligner
 from Bio.Align import substitution_matrices
 from Bio.PDB import Structure as _Structure
+from numba import jit
 
 VALID_AA_3 = set(standard_aa_names)
 def _aa_dict() -> Dict[str, str]:
@@ -107,22 +108,80 @@ def _resolve_selectors(struct:_Structure.Structure, sel: Optional[List[Union[str
     seen=set(); uniq=[c for c in out if not (c in seen or seen.add(c))]
     return uniq
 
-def _extract_ca_infos(struct:_Structure.Structure, chain_filter:Optional[List[str]])->List[ResidueInfo]:
+def _parse_chain_selector(selector: str) -> Tuple[str, Optional[int], Optional[int]]:
+    if ":" in selector:
+        parts = selector.split(":")
+        chain_id = parts[0]
+        range_str = parts[1]
+        if "-" in range_str:
+            bounds = range_str.split("-")
+            return chain_id, int(bounds[0]) if bounds[0] else None, int(bounds[1]) if bounds[1] else None
+        else:
+            return chain_id, int(range_str), int(range_str)
+    return selector, None, None
+
+def _extract_ca_infos(struct:_Structure.Structure, chain_filter:Optional[List[str]], atoms: str = "CA")->List[ResidueInfo]:
     model = list(struct)[0]
     infos=[]; idx=0
+
+    if atoms == "backbone":
+        target_atoms = {"N", "CA", "C", "O"}
+    elif atoms == "all_heavy":
+        target_atoms = None # All non-hydrogen
+    else:
+        target_atoms = {"CA"}
+
+    # Parse bounds
+    bounds_map = {}
+    valid_chain_ids = set()
+    if chain_filter is not None:
+        for c in chain_filter:
+            cid, start, end = _parse_chain_selector(c)
+            valid_chain_ids.add(cid)
+            if cid not in bounds_map:
+                bounds_map[cid] = []
+            if start is not None or end is not None:
+                bounds_map[cid].append((start, end))
+
     for chain in model:
-        if chain_filter is not None and chain.id not in chain_filter: continue
+        if chain_filter is not None and chain.id not in valid_chain_ids: continue
+
+        c_bounds = bounds_map.get(chain.id, [])
+
         for res in chain:
             if not is_aa(res, standard=True): continue
-            if "CA" not in res: continue
-            ca: Atom.Atom = res["CA"]
-            coord = ca.get_coord().astype(float)
+
             hetflag, resseq, icode = res.get_id()
-            infos.append(ResidueInfo(idx=idx, chain_id=chain.id, resseq=int(resseq),
-                                     icode=(icode or "").strip() if isinstance(icode,str) else "",
-                                     resname=str(res.get_resname()), coord=coord))
-            idx += 1
-    if not infos: raise ValueError("No Cα atoms found for selected chains.")
+            resseq = int(resseq)
+
+            # Sub-domain filtering
+            if c_bounds:
+                in_bounds = False
+                for (start, end) in c_bounds:
+                    if (start is None or resseq >= start) and (end is None or resseq <= end):
+                        in_bounds = True
+                        break
+                if not in_bounds:
+                    continue
+
+            if atoms == "CA":
+                if "CA" not in res: continue
+                ca: Atom.Atom = res["CA"]
+                coord = ca.get_coord().astype(float)
+                infos.append(ResidueInfo(idx=idx, chain_id=chain.id, resseq=int(resseq),
+                                         icode=(icode or "").strip() if isinstance(icode,str) else "",
+                                         resname=str(res.get_resname()), coord=coord))
+                idx += 1
+            else:
+                for atom in res:
+                    if atom.element == "H": continue
+                    if target_atoms is not None and atom.get_name() not in target_atoms: continue
+                    coord = atom.get_coord().astype(float)
+                    infos.append(ResidueInfo(idx=idx, chain_id=chain.id, resseq=int(resseq),
+                                             icode=(icode or "").strip() if isinstance(icode,str) else "",
+                                             resname=str(res.get_resname()), coord=coord))
+                    idx += 1
+    if not infos: raise ValueError(f"No atoms matching selection '{atoms}' found for selected chains.")
     return infos
 
 def _pairwise_dists(coords: np.ndarray) -> np.ndarray:
@@ -152,18 +211,26 @@ def _robust_inlier_mask(d:np.ndarray, hard_cut:float, q_keep:float)->np.ndarray:
     if d.size==0: return np.zeros(0, dtype=bool)
     qthr=float(np.quantile(d, q_keep)); return (d <= max(hard_cut, qthr))
 
+@jit(nopython=True)
+def _window_pairs_jit(A: np.ndarray, B: np.ndarray, aN: int, bN: int) -> Tuple[float, int, np.ndarray]:
+    best_score = -np.inf
+    best_offset = -1
+    scores = np.zeros(bN-aN+1)
+    for offset in range(bN-aN+1):
+        subB = B[offset:offset+aN, offset:offset+aN]
+        score = -np.sum(np.abs(A - subB))
+        scores[offset] = score
+        if score > best_score:
+            best_score = score
+            best_offset = offset
+    return best_score, best_offset, scores
+
 def _window_pairs(D1:np.ndarray, D2:np.ndarray)->Tuple[List[Tuple[int,int]], np.ndarray]:
     n1,n2=D1.shape[0], D2.shape[0]
     if n1==0 or n2==0: return [], np.array([])
     swapped=False; A,B,aN,bN=D1,D2,n1,n2
     if aN>bN: A,B,aN,bN=D2,D1,n2,n1; swapped=True
-    best_score, best_offset = -np.inf, -1
-    scores = np.zeros(bN-aN+1)
-    for offset in range(bN-aN+1):
-        subB=B[offset:offset+aN, offset:offset+aN]
-        score=-np.sum(np.abs(A - subB))
-        scores[offset] = score
-        if score>best_score: best_score, best_offset = score, offset
+    best_score, best_offset, scores = _window_pairs_jit(A, B, aN, bN)
     if best_offset<0: return [], scores
     if swapped: return [(best_offset+i, i) for i in range(aN)], scores
     else: return [(i, best_offset+i) for i in range(aN)], scores
@@ -184,35 +251,69 @@ def _radial_histograms(D:np.ndarray, nbins:int=24, rmax_mode:str="p98"):
         H[i,:]=hist/s if s>0 else hist
     return H,edges
 
+@jit(nopython=True)
+def _chi2_distance_jit(X: np.ndarray, Y: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    N = X.shape[0]
+    M = Y.shape[0]
+    K = X.shape[1]
+    res = np.zeros((N, M))
+    for i in range(N):
+        for j in range(M):
+            s = 0.0
+            for k in range(K):
+                num = (X[i, k] - Y[j, k])**2
+                den = X[i, k] + Y[j, k] + eps
+                s += num / den
+            res[i, j] = 0.5 * s
+    return res
+
 def _chi2_distance(X:np.ndarray, Y:np.ndarray, eps:float=1e-12)->np.ndarray:
-    Xe=X[:,None,:]; Ye=Y[None,:,:]; num=(Xe-Ye)**2; den=(Xe+Ye)+eps
-    return 0.5*np.sum(num/den, axis=2)
+    return _chi2_distance_jit(X, Y, eps)
+
+@jit(nopython=True)
+def _banded_dp_maxscore_jit(S: np.ndarray, gap: float, band: int) -> Tuple[np.ndarray, float]:
+    N, M = S.shape
+    neg = -1e18
+    dp = np.full((N+1, M+1), neg)
+    bt = np.zeros((N+1, M+1), dtype=np.int8)
+    dp[0, 0] = 0.0
+    for i in range(0, N+1):
+        jmin = max(0, i-band)
+        jmax = min(M, i+band)
+        if i > 0:
+            j0 = max(0, i-band)
+            if dp[i-1, j0] > neg:
+                val = dp[i-1, j0] - gap
+                if val > dp[i, j0]:
+                    dp[i, j0] = val
+                    bt[i, j0] = 2
+        for j in range(jmin, jmax+1):
+            if i == 0 and j == 0: continue
+            best = neg
+            move = 0
+            if i > 0 and j > 0:
+                cand = dp[i-1, j-1] + S[i-1, j-1]
+                if cand > best:
+                    best = cand
+                    move = 1
+            if i > 0:
+                cand = dp[i-1, j] - gap
+                if cand > best:
+                    best = cand
+                    move = 2
+            if j > 0:
+                cand = dp[i, j-1] - gap
+                if cand > best:
+                    best = cand
+                    move = 3
+            dp[i, j] = best
+            bt[i, j] = move
+    return bt, dp[N, M]
 
 def _banded_dp_maxscore(S:np.ndarray, gap:float, band:int):
     N,M=S.shape
     if N==0 or M==0: return [], 0.0
-    neg=-1e18
-    dp=np.full((N+1,M+1), neg); bt=np.zeros((N+1,M+1), dtype=np.int8)
-    dp[0,0]=0.0
-    for i in range(0,N+1):
-        jmin=max(0, i-band); jmax=min(M, i+band)
-        if i>0:
-            j0=max(0, i-band)
-            if dp[i-1,j0]>neg:
-                dp[i,j0]=max(dp[i,j0], dp[i-1,j0]-gap); bt[i,j0]=2
-        for j in range(jmin, jmax+1):
-            if i==0 and j==0: continue
-            best,move=neg,0
-            if i>0 and j>0:
-                cand=dp[i-1,j-1]+S[i-1,j-1]
-                if cand>best: best,move=cand,1
-            if i>0:
-                cand=dp[i-1,j]-gap
-                if cand>best: best,move=cand,2
-            if j>0:
-                cand=dp[i,j-1]-gap
-                if cand>best: best,move=cand,3
-            dp[i,j]=best; bt[i,j]=move
+    bt, max_score = _banded_dp_maxscore_jit(S, gap, band)
     i,j=N,M; pairs=[]
     while i>0 or j>0:
         move=bt[i,j]
@@ -220,8 +321,8 @@ def _banded_dp_maxscore(S:np.ndarray, gap:float, band:int):
         elif move==2: i-=1
         elif move==3: j-=1
         else: break
-    pairs.reverse(); total=float(dp[N,M])
-    return pairs,total
+    pairs.reverse()
+    return pairs, float(max_score)
 
 def _shape_pairs(coords1:np.ndarray, coords2:np.ndarray, nbins:int=24, gap_penalty:float=2.0, band_frac:float=0.20)->Tuple[List[Tuple[int,int]], np.ndarray, np.ndarray]:
     D1=_pairwise_dists(coords1); D2=_pairwise_dists(coords2)
@@ -244,15 +345,16 @@ def sequence_independent_alignment_joined_v2(
     chains_mob: Optional[List[Union[str,int]]]=None,
     method:str="auto",
     shape_nbins:int=24, shape_gap_penalty:float=2.0, shape_band_frac:float=0.20,
-    inlier_rmsd_cut:float=3.0, inlier_quantile:float=0.85, refinement_iters:int=2
+    inlier_rmsd_cut:float=3.0, inlier_quantile:float=0.85, refinement_iters:int=2,
+    atoms: str = "CA"
 )->AlignmentResultSF:
     ref_struct=_parse_path(file_ref); mob_struct=_parse_path(file_mob)
     ref_ids=_resolve_selectors(ref_struct, chains_ref)
     mob_ids=_resolve_selectors(mob_struct, chains_mob)
     if (ref_ids is None) or (mob_ids is None):
         raise ValueError("Specify chains_ref and chains_mob for sequence-independent alignment.")
-    ref_infos=_extract_ca_infos(ref_struct, ref_ids)
-    mob_infos=_extract_ca_infos(mob_struct, mob_ids)
+    ref_infos=_extract_ca_infos(ref_struct, ref_ids, atoms=atoms)
+    mob_infos=_extract_ca_infos(mob_struct, mob_ids, atoms=atoms)
     ref_subset=np.vstack([ri.coord for ri in ref_infos])
     mob_subset=np.vstack([mi.coord for mi in mob_infos])
     D1=_pairwise_dists(ref_subset); D2=_pairwise_dists(mob_subset)
@@ -332,46 +434,123 @@ def perform_sequence_alignment(seq1:str, seq2:str, gap_open:float, gap_extend:fl
     if not seq1 or not seq2: return None
     try:
         blosum62=substitution_matrices.load("BLOSUM62")
-        alns=pairwise2.align.globalds(seq1, seq2, blosum62, gap_open, gap_extend, one_alignment_only=True)
+        aligner = PairwiseAligner()
+        aligner.substitution_matrix = blosum62
+        aligner.open_gap_score = gap_open
+        aligner.extend_gap_score = gap_extend
+        aligner.mode = 'global'
+        alns = aligner.align(seq1, seq2)
         if not alns: return None
-        a=alns[0]
+        a = alns[0]
+
+        # For PairwiseAligner, formatting can vary based on exact match vs mismatch
+        # It's safer to extract it from the alignment path indices
+        seqA_aln = ""
+        seqB_aln = ""
+        # The coordinates are provided as lists of start/end indices
+        # a.coordinates gives the path
+        if hasattr(a, "indices"):
+            ref_idx = a.indices[0]
+            mob_idx = a.indices[1]
+
+            p1, p2 = 0, 0
+            for i in range(len(ref_idx)):
+                if ref_idx[i] != -1 and mob_idx[i] != -1:
+                    seqA_aln += seq1[ref_idx[i]]
+                    seqB_aln += seq2[mob_idx[i]]
+                elif ref_idx[i] != -1:
+                    seqA_aln += seq1[ref_idx[i]]
+                    seqB_aln += "-"
+                elif mob_idx[i] != -1:
+                    seqA_aln += "-"
+                    seqB_aln += seq2[mob_idx[i]]
+            seqA = seqA_aln
+            seqB = seqB_aln
+        else:
+            # Fallback for Biopython > 1.80
+            fmt = str(a).split('\n')
+            seqA = fmt[0]
+            seqB = fmt[2]
+
         class Wrap:
-            def __init__(self, tup): self.seqA, self.seqB, self.score = tup[0], tup[1], tup[2]
-        return Wrap(a)
+            def __init__(self, seqA, seqB, score):
+                self.seqA = seqA
+                self.seqB = seqB
+                self.score = score
+        return Wrap(seqA, seqB, a.score)
     except Exception as e:
         # Avoid print here, log handles it in script
         return None
 
-def get_aligned_atoms_by_alignment(ref_struct, ref_chains, mob_struct, mob_chains, alignment):
+def get_aligned_atoms_by_alignment(ref_struct, ref_chains, mob_struct, mob_chains, alignment, atoms: str = "CA"):
     if not alignment: return [], []
     seqA, seqB = alignment.seqA, alignment.seqB
+
+    if atoms == "backbone":
+        target_atoms = {"N", "CA", "C", "O"}
+    elif atoms == "all_heavy":
+        target_atoms = None # All non-hydrogen
+    else:
+        target_atoms = {"CA"}
+
     def get_res_list(struct, chains):
         residues=[]
         model=list(struct.get_models())[0]
+        bounds_map = {}
+        for c in chains:
+            cid, start, end = _parse_chain_selector(c)
+            if cid not in bounds_map: bounds_map[cid] = []
+            if start is not None or end is not None: bounds_map[cid].append((start, end))
+
         for ch in chains:
-            if ch in model:
-                for res in model[ch]:
-                    if res.id[0]==' ' and res.get_resname() in AA_DICT and 'CA' in res:
+            cid, _, _ = _parse_chain_selector(ch)
+            if cid in model:
+                c_bounds = bounds_map.get(cid, [])
+                for res in model[cid]:
+                    if res.id[0]==' ' and res.get_resname() in AA_DICT:
+                        resseq = int(res.id[1])
+
+                        if c_bounds:
+                            in_bounds = False
+                            for (start, end) in c_bounds:
+                                if (start is None or resseq >= start) and (end is None or resseq <= end):
+                                    in_bounds = True
+                                    break
+                            if not in_bounds:
+                                continue
+
+                        if atoms == "CA" and 'CA' not in res:
+                            continue
                         residues.append(res)
         return residues
+
     ref_res=get_res_list(ref_struct, ref_chains); mob_res=get_res_list(mob_struct, mob_chains)
     ref_idx=0; mob_idx=0; ref_atoms=[]; mob_atoms=[]
     for a,b in zip(seqA, seqB):
-        ref_atom=None; mob_atom=None
+        r_match=None; m_match=None
         if a!='-':
             while ref_idx<len(ref_res):
                 r=ref_res[ref_idx]
-                if AA_DICT.get(r.get_resname())==a and 'CA' in r:
-                    ref_atom=r['CA']; ref_idx+=1; break
+                if AA_DICT.get(r.get_resname())==a:
+                    r_match=r; ref_idx+=1; break
                 ref_idx+=1
         if b!='-':
             while mob_idx<len(mob_res):
                 m=mob_res[mob_idx]
-                if AA_DICT.get(m.get_resname())==b and 'CA' in m:
-                    mob_atom=m['CA']; mob_idx+=1; break
+                if AA_DICT.get(m.get_resname())==b:
+                    m_match=m; mob_idx+=1; break
                 mob_idx+=1
-        if ref_atom is not None and mob_atom is not None:
-            ref_atoms.append(ref_atom); mob_atoms.append(mob_atom)
+
+        if r_match is not None and m_match is not None:
+            for atA in r_match:
+                if atA.element == "H": continue
+                if target_atoms is not None and atA.get_name() not in target_atoms: continue
+                for atB in m_match:
+                    if atB.get_name() == atA.get_name():
+                        ref_atoms.append(atA)
+                        mob_atoms.append(atB)
+                        break
+
     return ref_atoms, mob_atoms
 
 def superimpose_atoms(ref_atoms, mob_atoms):
@@ -403,13 +582,26 @@ def compute_chain_similarity_matrix(seqsA, seqsB)->Tuple[pd.DataFrame,pd.DataFra
         for j,chB in enumerate(chainsB):
             sB=str(seqsB[chB].seq)
             if not sA or not sB: continue
-            aln=pairwise2.align.globalxx(sA, sB, one_alignment_only=True)
-            if not aln: continue
-            a=aln[0]
-            matches=sum(1 for aa,bb in zip(a.seqA, a.seqB) if aa==bb and aa!='-')
-            ident=100.0 * matches / max(1, len(a.seqA)); id_mat[i,j]=ident
+
+            aligner = PairwiseAligner()
+            aligner.mode = 'global'
+            aligner.match_score = 1
+            aligner.mismatch_score = 0
+            aligner.open_gap_score = 0
+            aligner.extend_gap_score = 0
+
+            alns = aligner.align(sA, sB)
+            if not alns: continue
+            a = alns[0]
+
+            fmt = format(a).split('\n')
+            seqA_aln = fmt[0]
+            seqB_aln = fmt[2]
+
+            matches=sum(1 for aa,bb in zip(seqA_aln, seqB_aln) if aa==bb and aa!='-')
+            ident=100.0 * matches / max(1, len(seqA_aln)); id_mat[i,j]=ident
             sc=0.0; L=0
-            for aa,bb in zip(a.seqA,a.seqB):
+            for aa,bb in zip(seqA_aln,seqB_aln):
                 if aa!='-' and bb!='-':
                     sc += blosum62.get((aa,bb), blosum62.get((bb,aa),0.0)); L+=1
             sc_mat[i,j]= sc / max(1,L)
