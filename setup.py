@@ -11,14 +11,19 @@ setup(
         "scikit-learn",
         "scipy",
         "biopython",
-        "py3Dmol",
-        "stmol",
-        "plotly",
-        "ipython_genutils",
-        "matplotlib",
-        "seaborn",
-        "streamlit",
-        "streamlit-molstar",
-        "numba"
+        "numba",
+        "requests"
     ],
+    extras_require={
+        "app": [
+            "streamlit",
+            "py3Dmol",
+            "stmol",
+            "plotly",
+            "matplotlib",
+            "seaborn",
+            "streamlit-molstar"
+        ],
+        "dev": ["pytest"]
+    }
 )

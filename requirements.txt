@@ -1,14 +1,16 @@
-streamlit
 numpy<2.0
 pandas
 scikit-learn
 scipy
 biopython
+numba
+requests
+
+# App and Visualization Extras
+streamlit
 py3Dmol
 stmol
 plotly
-ipython_genutils
 matplotlib
 seaborn
 streamlit-molstar
-numba

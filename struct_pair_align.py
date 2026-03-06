@@ -166,7 +166,23 @@ def plot_superposition_3d(ref_coords: np.ndarray,
                           labels: Optional[List[str]] = None,
                           pairs: Optional[List[Tuple[int,int]]] = None,
                           default_top_k: int = 10,
-                          key_prefix: Optional[str] = None):
+                          key_prefix: Optional[str] = None,
+                          pdb_str: Optional[str] = None):
+
+    if pdb_str:
+        import py3Dmol
+        from stmol import showmol
+        st.subheader(title)
+        st.markdown("*Note: Rendering uses Py3Dmol cartoon representations. Mobile chain colored by B-factor (RMSD gradient).*")
+        view = py3Dmol.view(width=800, height=600)
+        view.addModel(pdb_str, "pdb")
+        # Color first model (reference) blue, second model (mobile) by b-factor
+        view.setStyle({'model': 0}, {"cartoon": {'color': 'blue'}})
+        view.setStyle({'model': 1}, {"cartoon": {'colorscheme': {'prop': 'b', 'gradient': 'rwb', 'min': 0, 'max': 10}}})
+        view.zoomTo()
+        showmol(view, height=600, width=800)
+        return
+
     kp = _san_key(key_prefix if key_prefix else f"k_{title}_{id(ref_coords)}_{id(mob_coords)}")
 
     # Build arrays and labels consistent with "pairs" indexing (for distances/peaks)

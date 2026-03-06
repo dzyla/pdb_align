@@ -44,25 +44,53 @@ class AlignmentResult:
 
     @property
     def tm_score(self) -> Optional[float]:
+        """Wrapper for get_tm_score('reference') to maintain backwards compatibility."""
+        return self.get_tm_score(normalize_by='reference')
+
+    def get_tm_score(self, normalize_by: str = 'reference') -> Optional[float]:
+        """
+        Calculates the TM-score.
+
+        normalize_by: 'reference', 'mobile', or 'min'
+        """
         import numpy as np
 
         # Calculate TM-score dynamically
         if self._chosen["seqguided"]:
             ref_atoms = self._chosen["seqguided"]["ref_atoms"]
+            mob_atoms = self._chosen["seqguided"]["mob_atoms"]
             per_res_rmsd = self._chosen["seqguided"]["si"]["per_residue_rmsd"]
-            L = len(ref_atoms)
+
+            L_ref = len(ref_atoms)
+            L_mob = len(mob_atoms)
+
+            if normalize_by == 'reference': L = L_ref
+            elif normalize_by == 'mobile': L = L_mob
+            elif normalize_by == 'min': L = min(L_ref, L_mob)
+            else: raise ValueError("normalize_by must be 'reference', 'mobile', or 'min'")
+
             if L <= 15:
                 return None
             d0 = 1.24 * (L - 15)**(1.0/3.0) - 1.8
             d0_sq = d0**2
             tm = np.sum(1.0 / (1.0 + (per_res_rmsd**2) / d0_sq)) / L
             return float(tm)
+
         elif self._chosen["seqfree"]:
             ref_subset = self._chosen["seqfree"].ref_subset_infos
             mob_subset = self._chosen["seqfree"].mob_subset_infos
             pairs = self._chosen["seqfree"].pairs
 
-            L = len(ref_subset) # By standard definition TM-score is normalized by reference length
+            # For sequence-free, the length of the subsets dictates the alignment length.
+            # To get the full length of the chain, we could parse it, but for subsets we use subset length.
+            L_ref = len(ref_subset)
+            L_mob = len(mob_subset)
+
+            if normalize_by == 'reference': L = L_ref
+            elif normalize_by == 'mobile': L = L_mob
+            elif normalize_by == 'min': L = min(L_ref, L_mob)
+            else: raise ValueError("normalize_by must be 'reference', 'mobile', or 'min'")
+
             if L <= 15:
                 return None
             d0 = 1.24 * (L - 15)**(1.0/3.0) - 1.8
@@ -306,6 +334,68 @@ class AlignmentResult:
             plt.savefig(filename, bbox_inches='tight')
             plt.close()
 
+    def save_pymol_script(self, filename: str, aligned_mobile_filename: str = "aligned_mobile.pdb"):
+        """
+        Generates a .pml script for PyMOL to easily visualize the alignment.
+        This assumes you have saved the aligned mobile structure using `save_aligned_pdb`.
+        """
+        ref_basename = os.path.basename(self.ref_file)
+        mob_basename = os.path.basename(self.mob_file)
+
+        script = f"""# PyMOL Script for visualizing alignment
+# Load structures
+load {self.ref_file}, reference
+load {aligned_mobile_filename}, mobile
+
+# Hide defaults, show cartoons
+hide everything
+show cartoon, reference
+show cartoon, mobile
+
+# Color structures
+color white, reference
+color cyan, mobile
+
+# Extract RMSD data and inject it into B-factors
+# We map RMSD to the mobile structure for visualization
+"""
+
+        # Add B-factor injection logic
+        df = self.get_rmsd_df(on="mobile")
+        if not df.empty:
+            script += "\n# Update B-factors with RMSD values for heatmapping\nalter mobile, b=0.0\n"
+            for _, row in df.iterrows():
+                try:
+                    res_parts = row["Residue"].split(":")
+                    if len(res_parts) == 2:
+                        chain = res_parts[0]
+                        res_id = res_parts[1]
+
+                        # Handle insertion codes
+                        import re
+                        match = re.match(r"(\d+)([a-zA-Z]*)", res_id)
+                        if match:
+                            res_num = match.group(1)
+                            # PyMOL alter syntax for specific residues
+                            script += f"alter mobile and chain {chain} and resi {res_num}, b={row['RMSD']:.3f}\n"
+                except Exception:
+                    pass
+
+            script += """
+# Color by B-factor (RMSD)
+spectrum b, blue_white_red, mobile, minimum=0, maximum=10
+"""
+
+        script += """
+# Center and orient
+zoom
+center
+"""
+        with open(filename, "w") as f:
+            f.write(script)
+        if self.verbose:
+            print(f"Saved PyMOL script to {filename}")
+
     def __repr__(self):
         return f"<AlignmentResult RMSD: {self.rmsd:.3f}Å, Method: {self._chosen['name']}>"
 
@@ -343,8 +433,35 @@ class PDBAligner:
         """Sets the reference structure. Alias for set_reference."""
         self.set_reference(ref_file, chains)
 
+    def _fetch_structure(self, file_or_id: str) -> str:
+        """Fetches a structure from PDB or AF-DB if a prefix is detected."""
+        if file_or_id.lower().startswith("pdb:"):
+            pdb_id = file_or_id[4:].strip()
+            dest = f"{pdb_id}.cif"
+            if not os.path.exists(dest):
+                if self.verbose: print(f"Fetching {pdb_id} from RCSB PDB...")
+                import requests
+                r = requests.get(f"https://files.rcsb.org/download/{pdb_id}.cif")
+                if r.status_code == 200:
+                    with open(dest, 'w') as f: f.write(r.text)
+                else: raise ValueError(f"Could not fetch PDB {pdb_id}")
+            return dest
+        elif file_or_id.lower().startswith("af:"):
+            af_id = file_or_id[3:].strip()
+            dest = f"{af_id}.pdb"
+            if not os.path.exists(dest):
+                if self.verbose: print(f"Fetching {af_id} from AlphaFold DB...")
+                import requests
+                r = requests.get(f"https://alphafold.ebi.ac.uk/files/AF-{af_id}-F1-model_v4.pdb")
+                if r.status_code == 200:
+                    with open(dest, 'w') as f: f.write(r.text)
+                else: raise ValueError(f"Could not fetch AlphaFold model {af_id}")
+            return dest
+        return file_or_id
+
     def set_reference(self, ref_file: str, chains: Optional[List[Union[str, int]]] = None):
-        """Sets the reference structure."""
+        """Sets the reference structure. Supports pdb:XXXX and af:XXXX fetching."""
+        ref_file = self._fetch_structure(ref_file)
         if not os.path.exists(ref_file):
             raise FileNotFoundError(f"Reference file not found: {ref_file}")
         self.ref_file = ref_file
@@ -357,7 +474,8 @@ class PDBAligner:
                 print(f"  Chain {ch}: {self.ref_lens.get(ch, 0)} aa")
 
     def add_mobile(self, mob_file: str, chains: Optional[List[Union[str, int]]] = None):
-        """Sets the mobile structure to align."""
+        """Sets the mobile structure to align. Supports pdb:XXXX and af:XXXX fetching."""
+        mob_file = self._fetch_structure(mob_file)
         if not os.path.exists(mob_file):
             raise FileNotFoundError(f"Mobile file not found: {mob_file}")
         self.mob_file = mob_file
@@ -497,10 +615,9 @@ class PDBAligner:
         except Exception as e:
             return fname, {"status": "error", "message": str(e)}
 
-    def batch_align(self, mob_dir: str, out_dir: str, mode: str = "auto", workers: int = 1, **kwargs):
+    def batch_align_iter(self, mob_dir: str, out_dir: str, mode: str = "auto", workers: int = 1, **kwargs):
         """
-        Aligns a directory of PDBs against the current reference structure.
-        Supports multi-processing using `workers`.
+        Generator that aligns a directory of PDBs and yields results sequentially or via multiprocessing.
         """
         import os
         from concurrent.futures import ProcessPoolExecutor
@@ -509,7 +626,6 @@ class PDBAligner:
             raise ValueError("Reference structure must be set for batch alignment.")
 
         os.makedirs(out_dir, exist_ok=True)
-        results = {}
         tasks = []
 
         for fname in os.listdir(mob_dir):
@@ -522,25 +638,35 @@ class PDBAligner:
                 futures = [executor.submit(self._align_single_file, fpath, fname, mode, out_dir, **kwargs) for fpath, fname in tasks]
                 for future in futures:
                     fname, r = future.result()
-                    results[fname] = r
                     if self.verbose:
                         status = r.get("status")
                         if status == "success":
                             print(f"Batch processed: {fname} (RMSD: {r.get('rmsd')})")
                         else:
                             print(f"Failed to process {fname}: {r.get('message')}")
+                    yield fname, r
         else:
             for fpath, fname in tasks:
                 fname, r = self._align_single_file(fpath, fname, mode, out_dir, **kwargs)
-                results[fname] = r
                 if self.verbose:
                     status = r.get("status")
                     if status == "success":
                         print(f"Batch processed: {fname} (RMSD: {r.get('rmsd')})")
                     else:
                         print(f"Failed to process {fname}: {r.get('message')}")
+                yield fname, r
 
-        return results
+    def batch_align(self, mob_dir: str, out_dir: str, mode: str = "auto", workers: int = 1, **kwargs):
+        """
+        Aligns a directory of PDBs against the current reference structure.
+        Returns a Pandas DataFrame.
+        """
+        import pandas as pd
+        results = []
+        for fname, r in self.batch_align_iter(mob_dir, out_dir, mode, workers, **kwargs):
+            r["filename"] = fname
+            results.append(r)
+        return pd.DataFrame(results)
 
     def get_general_sequence_alignment(self, ref_chain: str, mob_chain: str, gap_open: float = -10.0, gap_extend: float = -0.5) -> Optional[tuple]:
         """

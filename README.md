@@ -1,17 +1,40 @@
 # pdb_align
-Align two PDB structures and explore local differences
+Align two PDB structures and explore local differences.
 
-## Python Library Usage
+This package provides a robust Python library for scripting high-throughput structural bioinformatics tasks, as well as an interactive Streamlit frontend application.
 
-You can use the alignment core logic programmatically as a python library.
+## Installation
 
-### Installation
-
-Install the package via `pip` locally:
+Install the package via `pip` locally. For the core Python API only:
 
 ```bash
 pip install -e .
 ```
+
+To install with full App and Visualization extras (required for Streamlit and Py3Dmol plotting):
+
+```bash
+pip install -e .[app]
+```
+
+## Streamlit App
+
+We provide an interactive web application built with Streamlit and Py3Dmol to visualize the alignment.
+
+To launch the app locally:
+```bash
+streamlit run struct_pair_align.py
+```
+
+**Features of the Streamlit App:**
+- File uploads for reference and mobile structures
+- Interactive Py3Dmol rendering (cartoon views colored by B-factor/RMSD)
+- Sequence-guided and Sequence-free (shape/window) alignment modes
+- Downloadable alignment data (CSVs, Fasta, ZIPs)
+
+## Python Library Usage
+
+You can use the alignment core logic programmatically as a Python library.
 
 ### Usage
 
@@ -31,9 +54,9 @@ aligner = PDBAligner(verbose=True)
 
 # 2. Loading Structures and Chains
 # ================================
-# You can also supply residue ranges to restrict the alignment domain
-aligner.add_reference("8UUP.pdb", chains=["A:10-150", "B"])
-aligner.add_mobile("9DRQ.pdb", chains=["A"])
+# The API automatically handles remote fetching from the RCSB PDB or AlphaFold DB
+aligner.add_reference("pdb:8UUP", chains=["A:10-150", "B"]) # Subdomain selection supported
+aligner.add_mobile("af:P00533", chains=["A"])
 
 # Need to update selected chains later? No problem:
 aligner.set_reference_chains(["A"])
@@ -88,11 +111,15 @@ result.plot_rmsd("rmsd_plot.pdf", style="scientific", on="reference")
 result.save_aligned_pdb("aligned_mobile.pdb")
 result.save_log("alignment_log.txt") # Save formatted summary of run
 
+# Generate a PyMOL script that automatically loads both structures,
+# applies the transformation, and visualizes the mobile chain colored by local RMSD.
+result.save_pymol_script("visualization.pml", aligned_mobile_filename="aligned_mobile.pdb")
+
 # Batch process a whole directory across multiple cores natively
-batch_results = aligner.batch_align(
-    mob_dir="path/to/mobiles",
-    out_dir="path/to/output",
-    mode="auto",
-    workers=4 # Multi-processing
-)
+# Using the iterative generator allows tracking progress natively
+for fname, res in aligner.batch_align_iter(mob_dir="path/", out_dir="out/", mode="auto", workers=4):
+    print(f"Processed {fname} with TM-Score: {res.get('tm_score')}")
+
+# Or get a pandas DataFrame immediately
+df_batch = aligner.batch_align(mob_dir="path/", out_dir="out/", mode="auto", workers=4)
 ```
