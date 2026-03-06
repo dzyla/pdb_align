@@ -1,18 +1,19 @@
 Metadata-Version: 2.4
 Name: pdb_align
 Version: 0.1.0
-Summary: Object-oriented protein structure alignment package.
+Summary: High-performance protein structure alignment package.
 Requires-Dist: numpy<2.0
 Requires-Dist: pandas
-Requires-Dist: scikit-learn
 Requires-Dist: scipy
+Requires-Dist: scikit-learn
 Requires-Dist: biopython
-Requires-Dist: py3Dmol
-Requires-Dist: stmol
-Requires-Dist: plotly
-Requires-Dist: ipython_genutils
-Requires-Dist: matplotlib
-Requires-Dist: streamlit
-Requires-Dist: streamlit-molstar
-Dynamic: requires-dist
-Dynamic: summary
+Requires-Dist: numba
+Requires-Dist: requests
+Provides-Extra: app
+Requires-Dist: streamlit; extra == "app"
+Requires-Dist: py3Dmol; extra == "app"
+Requires-Dist: stmol; extra == "app"
+Requires-Dist: plotly; extra == "app"
+Requires-Dist: matplotlib; extra == "app"
+Requires-Dist: seaborn; extra == "app"
+Requires-Dist: streamlit-molstar; extra == "app"
