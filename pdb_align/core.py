@@ -1,4 +1,5 @@
 import os
+import gemmi
 import io
 import math
 import json
@@ -40,24 +41,34 @@ def _aa_dict() -> Dict[str, str]:
     return d
 AA_DICT = _aa_dict()
 
-def extract_sequences_and_lengths(struct: Structure.Structure, fname: str):
+def extract_sequences_and_lengths(struct: gemmi.Structure, fname: str):
     seqs: Dict[str, SeqRecord] = {}
     lens: Dict[str, int] = {}
     try:
-        model = list(struct.get_models())[0]
+        model = struct[0]
     except Exception:
         return {}, {}
     for chain in model:
         seq = []
         ca_count = 0
         for res in chain:
-            if res.id[0] == ' ' and res.get_resname() in AA_DICT:
-                seq.append(AA_DICT[res.get_resname()])
-                if 'CA' in res:
+            resname = res.name
+            if resname in AA_DICT:
+                seq.append(AA_DICT[resname])
+                has_ca = False
+                for atom in res:
+                    if atom.name == "CA":
+                        has_ca = True
+                        break
+                if has_ca:
                     ca_count += 1
         if seq:
-            seqs[chain.id] = SeqRecord(Seq("".join(seq)), id=f"{fname}_{chain.id}", description=f"Chain {chain.id}")
-            lens[chain.id] = int(ca_count)
+            seqs[chain.name] = SeqRecord(
+                Seq("".join(seq)),
+                id=f"{fname}_{chain.name}",
+                description=f"Chain {chain.name}",
+            )
+            lens[chain.name] = int(ca_count)
     return seqs, lens
 
 @dataclass
@@ -96,12 +107,11 @@ class AlignmentResultSF:
     shift_matrix: Optional[np.ndarray] = None
     shift_scores: Optional[np.ndarray] = None
 
-def _parse_path(path:str) -> _Structure.Structure:
-    parser = MMCIFParser(QUIET=True) if path.lower().endswith((".cif",".mmcif")) else PDBParser(QUIET=True)
-    return parser.get_structure(os.path.basename(path), path)
+def _parse_path(path: str) -> gemmi.Structure:
+    return gemmi.read_structure(path)
 
-def _chain_ids(struct:_Structure.Structure) -> List[str]:
-    return [ch.id for ch in list(struct)[0]]
+def _chain_ids(struct: gemmi.Structure) -> List[str]:
+    return [ch.name for ch in struct[0]]
 
 def _parse_chain_selector(selector: str) -> Tuple[str, Optional[int], Optional[int]]:
     if ":" in selector:
@@ -131,9 +141,12 @@ def _resolve_selectors(struct:_Structure.Structure, sel: Optional[List[Union[str
     seen=set(); uniq=[c for c in out if not (c in seen or seen.add(c))]
     return uniq
 
-def _extract_ca_infos(struct:_Structure.Structure, chain_filter:Optional[List[str]])->List[ResidueInfo]:
-    model = list(struct)[0]
-    infos=[]; idx=0
+def _extract_ca_infos(
+    struct: gemmi.Structure, chain_filter: Optional[List[str]], min_b_factor: float = 0.0
+) -> List[ResidueInfo]:
+    model = struct[0]
+    infos = []
+    idx = 0
 
     # Parse bounds
     bounds_map = {}
@@ -148,37 +161,60 @@ def _extract_ca_infos(struct:_Structure.Structure, chain_filter:Optional[List[st
                 bounds_map[cid].append((start, end))
 
     for chain in model:
-        if chain_filter is not None and chain.id not in valid_chain_ids: continue
+        if chain_filter is not None and chain.name not in valid_chain_ids:
+            continue
 
-        c_bounds = bounds_map.get(chain.id, [])
+        c_bounds = bounds_map.get(chain.name, [])
 
         for res in chain:
-            if not is_aa(res, standard=True): continue
+            if res.name not in AA_DICT:
+                continue
 
-            hetflag, resseq, icode = res.get_id()
-            resseq = int(resseq)
+            resseq = res.seqid.num
+            icode = res.seqid.icode if hasattr(res.seqid, 'has_icode') and res.seqid.has_icode() else ""
+            if not icode and hasattr(res.seqid, 'icode') and res.seqid.icode != ' ':
+                icode = res.seqid.icode
 
             # Sub-domain filtering
             if c_bounds:
                 in_bounds = False
-                for (start, end) in c_bounds:
-                    if (start is None or resseq >= start) and (end is None or resseq <= end):
+                for start, end in c_bounds:
+                    if (start is None or resseq >= start) and (
+                        end is None or resseq <= end
+                    ):
                         in_bounds = True
                         break
                 if not in_bounds:
                     continue
 
-            if "CA" not in res: continue
-            ca: Atom.Atom = res["CA"]
-            coord = ca.get_coord().astype(float)
-            infos.append(ResidueInfo(idx=idx, chain_id=chain.id, resseq=int(resseq),
-                                     icode=(icode or "").strip() if isinstance(icode,str) else "",
-                                     resname=str(res.get_resname()), coord=coord))
+            ca = None
+            for atom in res:
+                if atom.name == "CA":
+                    ca = atom
+                    break
+
+            if ca is None:
+                continue
+
+            if min_b_factor > 0.0 and ca.b_iso < min_b_factor:
+                continue
+
+            coord = np.array(ca.pos.tolist(), dtype=float)
+            infos.append(
+                ResidueInfo(
+                    idx=idx,
+                    chain_id=chain.name,
+                    resseq=int(resseq),
+                    icode=icode.strip() if hasattr(icode, 'strip') else "",
+                    resname=res.name,
+                    coord=coord,
+                )
+            )
             idx += 1
 
-    if not infos: raise ValueError(f"No C-alpha atoms found for selected chains.")
+    if not infos:
+        raise ValueError(f"No C-alpha atoms found for selected chains.")
     return infos
-
 def _pairwise_dists(coords: np.ndarray) -> np.ndarray:
     x=coords; x2=np.sum(x*x, axis=1, keepdims=True)
     d2=x2+x2.T-2.0*np.dot(x,x.T); np.maximum(d2,0.0,out=d2)
@@ -341,7 +377,7 @@ def sequence_independent_alignment_joined_v2(
     method:str="auto",
     shape_nbins:int=24, shape_gap_penalty:float=2.0, shape_band_frac:float=0.20,
     inlier_rmsd_cut:float=3.0, inlier_quantile:float=0.85, refinement_iters:int=2,
-    atoms: str = "CA"
+    atoms: str = "CA", min_b_factor: float = 0.0
 )->AlignmentResultSF:
     ref_struct=_parse_path(file_ref); mob_struct=_parse_path(file_mob)
     ref_ids=_resolve_selectors(ref_struct, chains_ref)
@@ -350,8 +386,8 @@ def sequence_independent_alignment_joined_v2(
         raise ValueError("Specify chains_ref and chains_mob for sequence-independent alignment.")
 
     # We must ALWAYS run the structure DP matrix on C-alphas to keep size (N) = number of residues.
-    ref_infos=_extract_ca_infos(ref_struct, ref_ids)
-    mob_infos=_extract_ca_infos(mob_struct, mob_ids)
+    ref_infos=_extract_ca_infos(ref_struct, ref_ids, min_b_factor)
+    mob_infos=_extract_ca_infos(mob_struct, mob_ids, min_b_factor)
     ref_subset=np.vstack([ri.coord for ri in ref_infos])
     mob_subset=np.vstack([mi.coord for mi in mob_infos])
     D1=_pairwise_dists(ref_subset); D2=_pairwise_dists(mob_subset)
@@ -424,8 +460,8 @@ def sequence_independent_alignment_joined_v2(
         final_ref_atoms = []
         final_mob_atoms = []
 
-        ref_model = list(ref_struct.get_models())[0]
-        mob_model = list(mob_struct.get_models())[0]
+        ref_model = ref_struct[0]
+        mob_model = mob_struct[0]
 
         for (ri, mi) in seqfree_res_pairs:
             try:
@@ -447,7 +483,7 @@ def sequence_independent_alignment_joined_v2(
             mob_c = np.array([a.get_coord() for a in final_mob_atoms])
             R, t, final_rmsd = _kabsch(ref_c, mob_c)
 
-    mob_all_infos=_extract_ca_infos(_parse_path(file_mob), chain_filter=None)
+    mob_all_infos=_extract_ca_infos(_parse_path(file_mob), chain_filter=None, min_b_factor=min_b_factor)
     mob_all_ca=np.vstack([mi.coord for mi in mob_all_infos]); mob_all_ca_aligned=_transform(mob_all_ca, R, t)
 
     return AlignmentResultSF(
@@ -513,7 +549,7 @@ def perform_sequence_alignment(seq1:str, seq2:str, gap_open:float, gap_extend:fl
         # Avoid print here, log handles it in script
         return None
 
-def get_aligned_atoms_by_alignment(ref_struct, ref_chains, mob_struct, mob_chains, alignment, atoms: str = "CA"):
+def get_aligned_atoms_by_alignment(ref_struct: gemmi.Structure, ref_chains, mob_struct: gemmi.Structure, mob_chains, alignment, atoms: str = "CA", min_b_factor: float = 0.0):
     if not alignment: return [], []
     seqA, seqB = alignment.seqA, alignment.seqB
 
@@ -526,7 +562,7 @@ def get_aligned_atoms_by_alignment(ref_struct, ref_chains, mob_struct, mob_chain
 
     def get_res_list(struct, chains):
         residues=[]
-        model=list(struct.get_models())[0]
+        model=struct[0]
         bounds_map = {}
         for c in chains:
             cid, start, end = _parse_chain_selector(c)
@@ -535,11 +571,12 @@ def get_aligned_atoms_by_alignment(ref_struct, ref_chains, mob_struct, mob_chain
 
         for ch in chains:
             cid, _, _ = _parse_chain_selector(ch)
-            if cid in model:
+            chain = model.find_chain(cid)
+            if chain:
                 c_bounds = bounds_map.get(cid, [])
-                for res in model[cid]:
-                    if res.id[0]==' ' and res.get_resname() in AA_DICT:
-                        resseq = int(res.id[1])
+                for res in chain:
+                    if res.name in AA_DICT:
+                        resseq = res.seqid.num
 
                         if c_bounds:
                             in_bounds = False
@@ -550,36 +587,67 @@ def get_aligned_atoms_by_alignment(ref_struct, ref_chains, mob_struct, mob_chain
                             if not in_bounds:
                                 continue
 
-                        if atoms == "CA" and 'CA' not in res:
+                        has_ca = False
+                        for atom in res:
+                            if atom.name == "CA":
+                                has_ca = True
+                                break
+                        if atoms == "CA" and not has_ca:
                             continue
+
+                        # Filter by B-factor for CA atoms if requested
+                        if min_b_factor > 0.0:
+                            b_factor_ok = False
+                            for atom in res:
+                                if atom.name == "CA" and atom.b_iso >= min_b_factor:
+                                    b_factor_ok = True
+                                    break
+                            if not b_factor_ok:
+                                continue
+
                         residues.append(res)
         return residues
 
     ref_res=get_res_list(ref_struct, ref_chains); mob_res=get_res_list(mob_struct, mob_chains)
     ref_idx=0; mob_idx=0; ref_atoms=[]; mob_atoms=[]
+
+    class PseudoAtom:
+        def __init__(self, coord, name, chain_name, res_seq, res_icode):
+            self.coord = coord
+            self.name = name
+            self.chain_name = chain_name
+            self.res_seq = res_seq
+            self.res_icode = res_icode
+        def get_coord(self):
+            return self.coord
+        def get_name(self):
+            return self.name
+
     for a,b in zip(seqA, seqB):
         r_match=None; m_match=None
         if a!='-':
             while ref_idx<len(ref_res):
                 r=ref_res[ref_idx]
-                if AA_DICT.get(r.get_resname())==a:
+                if AA_DICT.get(r.name)==a:
                     r_match=r; ref_idx+=1; break
                 ref_idx+=1
         if b!='-':
             while mob_idx<len(mob_res):
                 m=mob_res[mob_idx]
-                if AA_DICT.get(m.get_resname())==b:
+                if AA_DICT.get(m.name)==b:
                     m_match=m; mob_idx+=1; break
                 mob_idx+=1
 
         if r_match is not None and m_match is not None:
+            r_parent_chain = r_match.last_chain_name if hasattr(r_match, 'last_chain_name') else "A"
+            m_parent_chain = m_match.last_chain_name if hasattr(m_match, 'last_chain_name') else "A"
             for atA in r_match:
-                if atA.element == "H": continue
-                if target_atoms is not None and atA.get_name() not in target_atoms: continue
+                if atA.element.name == "H": continue
+                if target_atoms is not None and atA.name not in target_atoms: continue
                 for atB in m_match:
-                    if atB.get_name() == atA.get_name():
-                        ref_atoms.append(atA)
-                        mob_atoms.append(atB)
+                    if atB.name == atA.name:
+                        ref_atoms.append(PseudoAtom(np.array(atA.pos.tolist(), dtype=float), atA.name, r_parent_chain, r_match.seqid.num, r_match.seqid.icode if hasattr(r_match.seqid, 'has_icode') and r_match.seqid.has_icode() else ""))
+                        mob_atoms.append(PseudoAtom(np.array(atB.pos.tolist(), dtype=float), atB.name, m_parent_chain, m_match.seqid.num, m_match.seqid.icode if hasattr(m_match.seqid, 'has_icode') and m_match.seqid.has_icode() else ""))
                         break
 
     return ref_atoms, mob_atoms
@@ -593,10 +661,10 @@ def superimpose_atoms(ref_atoms, mob_atoms):
     per_res=np.sqrt(np.sum((ref_coords - mob_aligned)**2, axis=1))
     res_labels=[]
     for a in ref_atoms:
-        p = a.get_parent()
-        chain = p.get_parent().id
-        rid = p.get_id()
-        lbl = f"{chain}:{rid[1]}{rid[2].strip()}" if str(rid[2]).strip() else f"{chain}:{rid[1]}"
+
+        chain = a.chain_name
+
+        lbl = f"{chain}:{a.res_seq}{a.res_icode.strip()}" if str(a.res_icode).strip() else f"{chain}:{a.res_seq}"
         res_labels.append(lbl)
     return dict(rmsd=float(SI.rms), rotation=R, translation=t,
                 ref_coords=ref_coords, mob_coords_transformed=mob_aligned,

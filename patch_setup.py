@@ -1,4 +1,8 @@
-from setuptools import setup, find_packages
+with open("setup.py", "r") as f:
+    text = f.read()
+
+# Replace the two setups with a single one that merges everything
+merged_setup = """from setuptools import setup, find_packages
 
 setup(
     name="pdb_align",
@@ -31,4 +35,7 @@ setup(
             "streamlit-molstar"
         ]
     }
-)
+)"""
+
+with open("setup.py", "w") as f:
+    f.write(merged_setup)
