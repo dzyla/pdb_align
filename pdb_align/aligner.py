@@ -53,7 +53,11 @@ class AlignmentResult:
         """
         Calculates the TM-score.
 
-        normalize_by: 'reference', 'mobile', or 'min'
+        normalize_by: 'reference', 'mobile', or 'min'.
+
+        Warning: Standard TM-align always normalizes by the length of the *reference*
+        protein. Changing the normalization length breaks TM-score comparability
+        across different targets.
         """
         import numpy as np
 
@@ -112,6 +116,19 @@ class AlignmentResult:
         return None
 
     @property
+    def tm_pvalue(self) -> Optional[float]:
+        """
+        Returns the p-value of the TM-score for the aligned structures.
+        """
+        tm = self.tm_score
+        if tm is None:
+            return None
+
+        import pdb_align.metrics as metrics
+        L = sum(self.ref_lens.values())
+        return metrics.calculate_tm_pvalue(tm, L)
+
+    @property
     def rotation_matrix(self) -> Optional[npt.NDArray]:
         if self._chosen["seqguided"]: return self._chosen["seqguided"]["si"]["rotation"]
         elif self._chosen["seqfree"]: return self._chosen["seqfree"].rotation
@@ -136,17 +153,101 @@ class AlignmentResult:
         return None
 
     def save_aligned_pdb(self, filename: str, subset_only: bool = False):
-        from Bio.PDB import PDBIO, MMCIFIO
-        from .core import _AllAtomsSelect
-        R = self.rotation_matrix
-        t = self.translation_vector
+        """Saves the aligned mobile structure to a PDB file. Maps alignment distance into B-factor."""
+        if not self.last_result:
+            raise ValueError("No alignment results available. Run align() first.")
+
+        chosen = self.last_result["chosen"]
+        R = None
+        t = None
+        per_res_rmsd = None
+        ref_atoms = []
+        mob_atoms = []
+
+        if chosen["seqguided"]:
+            R = chosen["seqguided"]["si"]["rotation"]
+            t = chosen["seqguided"]["si"]["translation"]
+            per_res_rmsd = chosen["seqguided"]["si"]["per_residue_rmsd"]
+            ref_atoms = chosen["seqguided"]["ref_atoms"]
+            mob_atoms = chosen["seqguided"]["mob_atoms"]
+        elif chosen["seqfree"]:
+            R = chosen["seqfree"].rotation
+            t = chosen["seqfree"].translation
+            # Sequence-free aligns CA only usually
+            ref_subset = chosen["seqfree"].ref_subset_ca_coords
+            mob_subset = chosen["seqfree"].mob_subset_ca_coords_aligned
+            pairs = chosen["seqfree"].pairs
+            ref_infos = chosen["seqfree"].ref_subset_infos
+            mob_infos = chosen["seqfree"].mob_subset_infos
+
+            import numpy as np
+            per_res_rmsd = []
+            for (i, j) in pairs:
+                dist = np.linalg.norm(ref_subset[i] - mob_subset[j])
+                per_res_rmsd.append(dist)
+
+            class PseudoAtom:
+                def __init__(self, c_name, r_seq, r_ico):
+                    self.chain_name = c_name
+                    self.res_seq = r_seq
+                    self.res_icode = r_ico
+
+            # Since pairs are (i,j) indexes into ref_infos and mob_infos
+            ref_atoms = []
+            mob_atoms = []
+            for (i, j) in pairs:
+                ref_atoms.append(PseudoAtom(ref_infos[i].chain_id, ref_infos[i].resseq, ref_infos[i].icode))
+                mob_atoms.append(PseudoAtom(mob_infos[j].chain_id, mob_infos[j].resseq, mob_infos[j].icode))
+
         if R is not None and t is not None:
-            if filename.lower().endswith((".cif", ".mmcif")):
-                io_obj = MMCIFIO()
+            # We use gemmi to save the transformed structure
+            import numpy as np
+            out_struct = self.mob_struct.clone() if hasattr(self.mob_struct, 'clone') else self.mob_struct.copy()
+
+            # Create a lookup mapping for distances
+            dist_map = {}
+            if mob_atoms and per_res_rmsd is not None:
+                for k in range(min(len(mob_atoms), len(per_res_rmsd))):
+                    ma = mob_atoms[k]
+                    # Handle pseudo atoms and normal atoms uniformly
+                    c_name = getattr(ma, 'chain_name', getattr(ma, 'last_chain_name', 'A'))
+                    # Usually get_id() for normal atoms
+                    if hasattr(ma, 'get_id'):
+                        het, r_seq, r_ico = ma.get_parent().get_id()
+                    else:
+                        r_seq = ma.res_seq
+                        r_ico = ma.res_icode
+
+                    key = (c_name, r_seq, r_ico.strip() if hasattr(r_ico, 'strip') else "")
+                    dist_map[key] = float(per_res_rmsd[k])
+
+            for model in out_struct:
+                for chain in model:
+                    for residue in chain:
+                        resseq = residue.seqid.num
+                        icode = residue.seqid.icode if hasattr(residue.seqid, 'has_icode') and residue.seqid.has_icode() else ""
+                        if not icode and hasattr(residue.seqid, 'icode') and residue.seqid.icode != ' ':
+                            icode = residue.seqid.icode
+
+                        key = (chain.name, resseq, icode.strip() if hasattr(icode, 'strip') else "")
+                        mapped_bfactor = dist_map.get(key, 0.0)
+
+                        for atom in residue:
+                            coord = np.array(atom.pos.tolist(), dtype=float)
+                            new_coord = (R @ coord) + t
+                            atom.pos.x = float(new_coord[0])
+                            atom.pos.y = float(new_coord[1])
+                            atom.pos.z = float(new_coord[2])
+
+                            # Overwrite B-factor with local deviation distance
+                            atom.b_iso = mapped_bfactor
+
+            if filename.lower().endswith(".pdb"):
+                out_struct.write_pdb(filename)
+            elif filename.lower().endswith(".cif") or filename.lower().endswith(".mmcif"):
+                out_struct.write_minimal_cif(filename)
             else:
-                io_obj = PDBIO()
-            io_obj.set_structure(self.mob_struct)
-            io_obj.save(filename, _AllAtomsSelect(R=R, t=t))
+                out_struct.write_pdb(filename)
 
     def get_log(self) -> str:
         lines = []
@@ -464,7 +565,7 @@ view
 def _process_single_alignment(task_payload: dict):
     """
     Stateless module-level function for multiprocessing batch jobs.
-    Avoids pickling the heavy Biopython objects in PDBAligner.
+    Avoids pickling heavy objects and drops references to prevent memory leaks.
     """
     try:
         aligner = PDBAligner(
@@ -473,13 +574,26 @@ def _process_single_alignment(task_payload: dict):
             verbose=False
         )
         aligner.add_mobile(task_payload["fpath"], chains=task_payload["chains_mob"])
-        res = aligner.align(mode=task_payload["mode"], **task_payload["kwargs"])
+
+        kwargs = task_payload.get("kwargs", {})
+        res = aligner.align(mode=task_payload["mode"], **kwargs)
 
         import os
         out_pdb = os.path.join(task_payload["out_dir"], f"aligned_{task_payload['fname']}")
         res.save_aligned_pdb(out_pdb)
-        return task_payload["fname"], {"rmsd": res.rmsd, "tm_score": res.tm_score, "status": "success"}
+
+        # Explicitly extract scalar metrics to avoid retaining heavy AlignmentResult/Structure references
+        r = {"rmsd": float(res.rmsd) if res.rmsd is not None else None,
+             "tm_score": float(res.tm_score) if res.tm_score is not None else None,
+             "tm_pvalue": float(res.tm_pvalue) if hasattr(res, 'tm_pvalue') and res.tm_pvalue is not None else None,
+             "status": "success"}
+
+        del res
+        del aligner
+        return task_payload["fname"], r
     except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Batch alignment failed for {task_payload.get('fname', 'Unknown')}", exc_info=True)
         return task_payload["fname"], {"status": "error", "message": str(e)}
 
 class PDBAligner:
@@ -596,7 +710,8 @@ class PDBAligner:
         if self.verbose:
             print(f"Mobile chains updated to: {chains}")
 
-    def align(self, mode: str = "auto", seq_gap_open: float = -10, seq_gap_extend: float = -0.5, atoms: str = "CA", **kwargs):
+    def align(self, mode: str = "auto", seq_gap_open: float = -10, seq_gap_extend: float = -0.5, atoms: str = "CA", min_plddt: float = 0.0, min_b_factor: float = 0.0, **kwargs):
+        min_b_val = max(min_plddt, min_b_factor)
         """
         Runs the alignment process.
 
@@ -629,7 +744,7 @@ class PDBAligner:
             seqB = "".join(str(self.mob_seqs[c].seq) for c in mob_chs if c in self.mob_seqs)
             aln = perform_sequence_alignment(seqA, seqB, seq_gap_open, seq_gap_extend)
             if aln:
-                ref_atoms, mob_atoms = get_aligned_atoms_by_alignment(self.ref_struct, ref_chs, self.mob_struct, mob_chs, aln, atoms=atoms)
+                ref_atoms, mob_atoms = get_aligned_atoms_by_alignment(self.ref_struct, ref_chs, self.mob_struct, mob_chs, aln, atoms=atoms, min_b_factor=min_b_val)
                 if ref_atoms and mob_atoms:
                     si = superimpose_atoms(ref_atoms, mob_atoms)
                     if si:
@@ -648,11 +763,12 @@ class PDBAligner:
                 res = sequence_independent_alignment_joined_v2(
                     file_ref=self.ref_file, file_mob=self.mob_file,
                     chains_ref=ref_chs, chains_mob=mob_chs,
-                    method=sf_method, atoms=atoms, **kwargs
+                    method=sf_method, atoms=atoms, min_b_factor=min_b_val, **kwargs
                 )
                 seqfree = res
             except Exception as e:
-                pass
+                import traceback
+                traceback.print_exc()
 
         if mode in ("auto", "Auto (best RMSD)"):
             best, reason = pick_best_overall(seqguided, seqfree, min_pairs=3)
@@ -939,38 +1055,112 @@ class PDBAligner:
         return compute_chain_similarity_matrix(self.ref_seqs, self.mob_seqs)
 
     def save_aligned_pdb(self, filename: str, subset_only: bool = False):
-        """Saves the aligned mobile structure to a PDB file."""
+        """Saves the aligned mobile structure to a PDB file. Maps alignment distance into B-factor."""
         if not self.last_result:
             raise ValueError("No alignment results available. Run align() first.")
-
-        from Bio.PDB import PDBIO
-        from .core import _AllAtomsSelect
 
         chosen = self.last_result["chosen"]
         R = None
         t = None
+        per_res_rmsd = None
+        ref_atoms = []
+        mob_atoms = []
+
         if chosen["seqguided"]:
             R = chosen["seqguided"]["si"]["rotation"]
             t = chosen["seqguided"]["si"]["translation"]
+            per_res_rmsd = chosen["seqguided"]["si"]["per_residue_rmsd"]
+            ref_atoms = chosen["seqguided"]["ref_atoms"]
+            mob_atoms = chosen["seqguided"]["mob_atoms"]
         elif chosen["seqfree"]:
             R = chosen["seqfree"].rotation
             t = chosen["seqfree"].translation
+            # Sequence-free aligns CA only usually
+            ref_subset = chosen["seqfree"].ref_subset_ca_coords
+            mob_subset = chosen["seqfree"].mob_subset_ca_coords_aligned
+            pairs = chosen["seqfree"].pairs
+            ref_infos = chosen["seqfree"].ref_subset_infos
+            mob_infos = chosen["seqfree"].mob_subset_infos
+
+            import numpy as np
+            per_res_rmsd = []
+            for (i, j) in pairs:
+                dist = np.linalg.norm(ref_subset[i] - mob_subset[j])
+                per_res_rmsd.append(dist)
+
+            class PseudoAtom:
+                def __init__(self, c_name, r_seq, r_ico):
+                    self.chain_name = c_name
+                    self.res_seq = r_seq
+                    self.res_icode = r_ico
+
+            # Since pairs are (i,j) indexes into ref_infos and mob_infos
+            ref_atoms = []
+            mob_atoms = []
+            for (i, j) in pairs:
+                ref_atoms.append(PseudoAtom(ref_infos[i].chain_id, ref_infos[i].resseq, ref_infos[i].icode))
+                mob_atoms.append(PseudoAtom(mob_infos[j].chain_id, mob_infos[j].resseq, mob_infos[j].icode))
 
         if R is not None and t is not None:
-            io_obj = PDBIO()
-            io_obj.set_structure(self.mob_struct)
-            io_obj.save(filename, _AllAtomsSelect(R=R, t=t))
+            # We use gemmi to save the transformed structure
+            import numpy as np
+            out_struct = self.mob_struct.clone() if hasattr(self.mob_struct, 'clone') else self.mob_struct.copy()
+
+            # Create a lookup mapping for distances
+            dist_map = {}
+            if mob_atoms and per_res_rmsd is not None:
+                for k in range(min(len(mob_atoms), len(per_res_rmsd))):
+                    ma = mob_atoms[k]
+                    # Handle pseudo atoms and normal atoms uniformly
+                    c_name = getattr(ma, 'chain_name', getattr(ma, 'last_chain_name', 'A'))
+                    # Usually get_id() for normal atoms
+                    if hasattr(ma, 'get_id'):
+                        het, r_seq, r_ico = ma.get_parent().get_id()
+                    else:
+                        r_seq = ma.res_seq
+                        r_ico = ma.res_icode
+
+                    key = (c_name, r_seq, r_ico.strip() if hasattr(r_ico, 'strip') else "")
+                    dist_map[key] = float(per_res_rmsd[k])
+
+            for model in out_struct:
+                for chain in model:
+                    for residue in chain:
+                        resseq = residue.seqid.num
+                        icode = residue.seqid.icode if hasattr(residue.seqid, 'has_icode') and residue.seqid.has_icode() else ""
+                        if not icode and hasattr(residue.seqid, 'icode') and residue.seqid.icode != ' ':
+                            icode = residue.seqid.icode
+
+                        key = (chain.name, resseq, icode.strip() if hasattr(icode, 'strip') else "")
+                        mapped_bfactor = dist_map.get(key, 0.0)
+
+                        for atom in residue:
+                            coord = np.array(atom.pos.tolist(), dtype=float)
+                            new_coord = (R @ coord) + t
+                            atom.pos.x = float(new_coord[0])
+                            atom.pos.y = float(new_coord[1])
+                            atom.pos.z = float(new_coord[2])
+
+                            # Overwrite B-factor with local deviation distance
+                            atom.b_iso = mapped_bfactor
+
+            if filename.lower().endswith(".pdb"):
+                out_struct.write_pdb(filename)
+            elif filename.lower().endswith(".cif") or filename.lower().endswith(".mmcif"):
+                out_struct.write_minimal_cif(filename)
+            else:
+                out_struct.write_pdb(filename)
 
     def get_log(self) -> str:
         """Returns the alignment log summary as a string."""
-        if not self.last_result:
+        if not self._chosen:
             raise ValueError("No alignment results available. Run align() first.")
         lines = []
         lines.append("PDB Aligner Result Log")
         lines.append("="*20)
         lines.append(f"Reference: {self.ref_file}")
         lines.append(f"Mobile: {self.mob_file}")
-        chosen = self.last_result["chosen"]
+        chosen = self._chosen
         lines.append(f"Chosen method: {chosen['name']}")
         lines.append(f"RMSD: {self.get_rmsd():.3f} Å" if self.get_rmsd() is not None else "RMSD: None")
         lines.append(f"Reason: {chosen['reason']}")
