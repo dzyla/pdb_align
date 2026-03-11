@@ -10,3 +10,4 @@ plotly
 ipython_genutils
 matplotlib
 streamlit-molstar
+gemmi
