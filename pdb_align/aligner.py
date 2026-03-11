@@ -154,10 +154,10 @@ class AlignmentResult:
 
     def save_aligned_pdb(self, filename: str, subset_only: bool = False):
         """Saves the aligned mobile structure to a PDB file. Maps alignment distance into B-factor."""
-        if not self.last_result:
+        if not self._chosen:
             raise ValueError("No alignment results available. Run align() first.")
 
-        chosen = self.last_result["chosen"]
+        chosen = self._chosen
         R = None
         t = None
         per_res_rmsd = None
@@ -245,7 +245,7 @@ class AlignmentResult:
             if filename.lower().endswith(".pdb"):
                 out_struct.write_pdb(filename)
             elif filename.lower().endswith(".cif") or filename.lower().endswith(".mmcif"):
-                out_struct.write_minimal_cif(filename)
+                out_struct.make_mmcif_document().write_file(filename)
             else:
                 out_struct.write_pdb(filename)
 
@@ -371,10 +371,16 @@ class AlignmentResult:
             atoms = self._chosen["seqguided"]["ref_atoms"] if on == 'reference' else self._chosen["seqguided"]["mob_atoms"]
             per_res_rmsd = self._chosen["seqguided"]["si"]["per_residue_rmsd"]
             for idx, a in enumerate(atoms):
-                p = a.get_parent()
-                chain = p.get_parent().id
-                rid = p.get_id()
-                lbl = f"{chain}:{rid[1]}{rid[2].strip()}" if str(rid[2]).strip() else f"{chain}:{rid[1]}"
+                if hasattr(a, 'chain_name'):
+                    chain = getattr(a, 'chain_name', 'A')
+                    r_seq = getattr(a, 'res_seq', '1')
+                    r_ico = getattr(a, 'res_icode', '')
+                    lbl = f"{chain}:{r_seq}{r_ico.strip()}" if str(r_ico).strip() else f"{chain}:{r_seq}"
+                else:
+                    p = a.get_parent()
+                    chain = p.get_parent().id
+                    rid = p.get_id()
+                    lbl = f"{chain}:{rid[1]}{rid[2].strip()}" if str(rid[2]).strip() else f"{chain}:{rid[1]}"
                 labels.append(lbl); chains.append(chain); distances.append(per_res_rmsd[idx])
         elif self._chosen["seqfree"]:
             ref_subset = self._chosen["seqfree"].ref_subset_infos
@@ -1147,7 +1153,7 @@ class PDBAligner:
             if filename.lower().endswith(".pdb"):
                 out_struct.write_pdb(filename)
             elif filename.lower().endswith(".cif") or filename.lower().endswith(".mmcif"):
-                out_struct.write_minimal_cif(filename)
+                out_struct.make_mmcif_document().write_file(filename)
             else:
                 out_struct.write_pdb(filename)
 

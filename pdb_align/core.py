@@ -106,6 +106,7 @@ class AlignmentResultSF:
     summaries: Dict[str, AlignSummary]
     shift_matrix: Optional[np.ndarray] = None
     shift_scores: Optional[np.ndarray] = None
+    active_mask: Optional[np.ndarray] = None
 
 def _parse_path(path: str) -> gemmi.Structure:
     return gemmi.read_structure(path)
@@ -234,6 +235,47 @@ def _kabsch(P:np.ndarray, Q:np.ndarray)->Tuple[np.ndarray,np.ndarray,float]:
     Q_aln=(R@Q.T).T + t
     rmsd=float(np.sqrt(np.mean(np.sum((P-Q_aln)**2, axis=1))))
     return R,t,rmsd
+
+def _iterative_kabsch(P: np.ndarray, Q: np.ndarray, recycles: int, keep_fraction: float) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    R, t, rmsd = _kabsch(P, Q)
+    N = P.shape[0]
+    min_keep = max(3, int(round(N * keep_fraction)))
+    mask = np.ones(N, dtype=bool)
+
+    for _ in range(recycles):
+        Q_aln = (R @ Q.T).T + t
+        d = np.linalg.norm(P - Q_aln, axis=1)
+
+        # Only consider currently active pairs
+        active_d = d[mask]
+        current_rmsd = float(np.sqrt(np.mean(active_d**2))) if len(active_d) > 0 else 0.0
+
+        cut = max(2.0, 1.5 * current_rmsd)
+        
+        # Determine which pairs are good enough to keep
+        new_mask = (d <= cut) & mask
+
+        # If we dropped below min_keep, forcibly keep the best min_keep distances (respecting previous mask)
+        if new_mask.sum() < min_keep:
+            # Sort the distances of the *previously active* set
+            active_indices = np.where(mask)[0]
+            if len(active_indices) <= min_keep:
+                new_mask = mask # Can't drop anything
+            else:
+                sorted_by_dist = active_indices[np.argsort(d[active_indices])]
+                new_mask = np.zeros(N, dtype=bool)
+                new_mask[sorted_by_dist[:min_keep]] = True
+
+        if np.array_equal(mask, new_mask):
+            break
+
+        mask = new_mask
+        if mask.sum() < 3:
+            break
+        
+        R, t, rmsd = _kabsch(P[mask], Q[mask])
+
+    return R, t, rmsd, mask
 
 def _transform(coords:np.ndarray, R:np.ndarray, t:np.ndarray)->np.ndarray:
     return (R@coords.T).T + t
@@ -376,7 +418,8 @@ def sequence_independent_alignment_joined_v2(
     chains_mob: Optional[List[Union[str,int]]]=None,
     method:str="auto",
     shape_nbins:int=24, shape_gap_penalty:float=2.0, shape_band_frac:float=0.20,
-    inlier_rmsd_cut:float=3.0, inlier_quantile:float=0.85, refinement_iters:int=2,
+    inlier_rmsd_cut:float=3.0, inlier_quantile:float=0.85, 
+    recycles: int = 0, keep_fraction: float = 1.0,
     atoms: str = "CA", min_b_factor: float = 0.0
 )->AlignmentResultSF:
     ref_struct=_parse_path(file_ref); mob_struct=_parse_path(file_mob)
@@ -400,43 +443,27 @@ def sequence_independent_alignment_joined_v2(
     if method in ("shape","auto"):
         pairs_s, S, C = _shape_pairs(ref_subset, mob_subset, nbins=shape_nbins, gap_penalty=shape_gap_penalty, band_frac=shape_band_frac)
         shift_matrix = S
-        R_s,t_s,rmsd_s=np.eye(3), np.zeros(3), float("inf")
-        mob_aln_s=mob_subset.copy()
+        R_s,t_s,rmsd_s = np.eye(3), np.zeros(3), float("inf")
+        mask_s = np.ones(len(pairs_s), dtype=bool)
         if len(pairs_s)>=3:
             P=np.vstack([ref_subset[i] for (i,j) in pairs_s]); Q=np.vstack([mob_subset[j] for (i,j) in pairs_s])
-            R_s,t_s,rmsd_s=_kabsch(P,Q); mob_aln_s=_transform(mob_subset, R_s, t_s)
-        pairs_ref=pairs_s; rmsd_ref=rmsd_s
-        for _ in range(refinement_iters):
-            if len(pairs_ref)<3: break
-            d=np.array([np.linalg.norm(ref_subset[i]-mob_aln_s[j]) for (i,j) in pairs_ref])
-            mask=_robust_inlier_mask(d, hard_cut=inlier_rmsd_cut, q_keep=inlier_quantile)
-            pairs_ref=[p for k,p in enumerate(pairs_ref) if mask[k]]
-            if len(pairs_ref)<3: break
-            P=np.vstack([ref_subset[i] for (i,j) in pairs_ref]); Q=np.vstack([mob_subset[j] for (i,j) in pairs_ref])
-            R_s,t_s,rmsd_ref=_kabsch(P,Q); mob_aln_s=_transform(mob_subset, R_s, t_s)
-        summaries["shape"]=AlignSummary("shape", float(rmsd_ref), len(pairs_ref), len(pairs_ref), 1)
-        candidates["shape"]=dict(pairs=pairs_ref, rmsd=rmsd_ref, R=R_s, t=t_s)
+            R_s, t_s, rmsd_s, mask_s = _iterative_kabsch(P, Q, recycles, keep_fraction)
+        active_len_s = int(np.sum(mask_s))
+        summaries["shape"]=AlignSummary("shape", float(rmsd_s), active_len_s, len(pairs_s), 1+recycles)
+        candidates["shape"]=dict(pairs=pairs_s, rmsd=rmsd_s, R=R_s, t=t_s, mask=mask_s)
 
     # window
     if method in ("window","auto"):
         pairs_w, scores = _window_pairs(D1,D2)
         shift_scores = scores
-        R_w,t_w,rmsd_w=np.eye(3), np.zeros(3), float("inf")
-        mob_aln_w=mob_subset.copy()
+        R_w,t_w,rmsd_w = np.eye(3), np.zeros(3), float("inf")
+        mask_w = np.ones(len(pairs_w), dtype=bool)
         if len(pairs_w)>=3:
             P=np.vstack([ref_subset[i] for (i,j) in pairs_w]); Q=np.vstack([mob_subset[j] for (i,j) in pairs_w])
-            R_w,t_w,rmsd_w=_kabsch(P,Q); mob_aln_w=_transform(mob_subset, R_w, t_w)
-        pairs_ref=pairs_w; rmsd_ref=rmsd_w
-        for _ in range(refinement_iters):
-            if len(pairs_ref)<3: break
-            d=np.array([np.linalg.norm(ref_subset[i]-mob_aln_w[j]) for (i,j) in pairs_ref])
-            mask=_robust_inlier_mask(d, hard_cut=inlier_rmsd_cut, q_keep=inlier_quantile)
-            pairs_ref=[p for k,p in enumerate(pairs_ref) if mask[k]]
-            if len(pairs_ref)<3: break
-            P=np.vstack([ref_subset[i] for (i,j) in pairs_ref]); Q=np.vstack([mob_subset[j] for (i,j) in pairs_ref])
-            R_w,t_w,rmsd_ref=_kabsch(P,Q); mob_aln_w=_transform(mob_subset, R_w, t_w)
-        summaries["window"]=AlignSummary("window", float(rmsd_ref), len(pairs_ref), len(pairs_ref), 1)
-        candidates["window"]=dict(pairs=pairs_ref, rmsd=rmsd_ref, R=R_w, t=t_w)
+            R_w, t_w, rmsd_w, mask_w = _iterative_kabsch(P, Q, recycles, keep_fraction)
+        active_len_w = int(np.sum(mask_w))
+        summaries["window"]=AlignSummary("window", float(rmsd_w), active_len_w, len(pairs_w), 1+recycles)
+        candidates["window"]=dict(pairs=pairs_w, rmsd=rmsd_w, R=R_w, t=t_w, mask=mask_w)
 
     # choose by lowest RMSD; pairs only tie-break
     if method=="shape": chosen="shape"
@@ -448,9 +475,12 @@ def sequence_independent_alignment_joined_v2(
 
     R=candidates[chosen]["R"]; t=candidates[chosen]["t"]
     final_pairs=candidates[chosen]["pairs"]; final_rmsd=float(candidates[chosen]["rmsd"])
+    final_mask = candidates[chosen]["mask"]
+
     # If the user requested backbone or all_heavy, we recalculate the final Kabsch superposition on the extended atoms
     if atoms != "CA":
-        seqfree_res_pairs = [(ref_infos[i], mob_infos[j]) for (i, j) in final_pairs]
+        # We only use active pairs to compute the Kabsch alignment if extended atoms are requested
+        seqfree_res_pairs = [(ref_infos[i], mob_infos[j]) for idx, (i, j) in enumerate(final_pairs) if final_mask[idx]]
 
         if atoms == "backbone":
             target_atoms = {"N", "CA", "C", "O"}
@@ -464,19 +494,48 @@ def sequence_independent_alignment_joined_v2(
         mob_model = mob_struct[0]
 
         for (ri, mi) in seqfree_res_pairs:
+            r_res = None
+            m_res = None
+
+            # Find matching residue in reference
             try:
-                r_res = ref_model[ri.chain_id][(' ', ri.resseq, ri.icode if ri.icode else ' ')]
-                m_res = mob_model[mi.chain_id][(' ', mi.resseq, mi.icode if mi.icode else ' ')]
-                for atA in r_res:
-                    if atA.element == "H": continue
-                    if target_atoms is not None and atA.get_name() not in target_atoms: continue
-                    for atB in m_res:
-                        if atB.get_name() == atA.get_name():
-                            final_ref_atoms.append(atA)
-                            final_mob_atoms.append(atB)
-                            break
-            except KeyError:
+                r_chain = ref_model[ri.chain_id]
+                for res in r_chain:
+                    if res.seqid.num == ri.resseq and (res.seqid.icode == ri.icode or (not res.seqid.icode and not ri.icode)):
+                        r_res = res
+                        break
+            except Exception:
+                pass
+
+            # Find matching residue in mobile
+            try:
+                m_chain = mob_model[mi.chain_id]
+                for res in m_chain:
+                    if res.seqid.num == mi.resseq and (res.seqid.icode == mi.icode or (not res.seqid.icode and not mi.icode)):
+                        m_res = res
+                        break
+            except Exception:
+                pass
+
+            if not r_res or not m_res:
                 continue
+
+            for atA in r_res:
+                if atA.element.name == "H": continue
+                if target_atoms is not None and atA.name not in target_atoms: continue
+                for atB in m_res:
+                    if atB.name == atA.name:
+                        # Construct a light pseudo-atom with coordinate interface
+                        # Since _kabsch just needs a numpy array, we append PseudoAtom here
+                        class PseudoAtom:
+                            def __init__(self, pos):
+                                self.pos = pos
+                            def get_coord(self):
+                                return np.array(self.pos.tolist(), dtype=float)
+                        
+                        final_ref_atoms.append(PseudoAtom(atA.pos))
+                        final_mob_atoms.append(PseudoAtom(atB.pos))
+                        break
 
         if final_ref_atoms and final_mob_atoms and len(final_ref_atoms) == len(final_mob_atoms):
             ref_c = np.array([a.get_coord() for a in final_ref_atoms])
@@ -488,14 +547,15 @@ def sequence_independent_alignment_joined_v2(
 
     return AlignmentResultSF(
         rotation=R, translation=t, rmsd=final_rmsd, iterations=1,
-        kept_pairs=len(final_pairs), method=chosen, pairs=final_pairs,
+        kept_pairs=int(np.sum(final_mask)), method=chosen, pairs=final_pairs,
         ref_subset_infos=ref_infos, mob_subset_infos=mob_infos,
         ref_subset_ca_coords=ref_subset,
         mob_subset_ca_coords_aligned=_transform(mob_subset, R, t),
         mob_all_infos=mob_all_infos, mob_all_ca_coords_aligned=mob_all_ca_aligned,
         summaries=summaries,
         shift_matrix=shift_matrix if chosen == "shape" else None,
-        shift_scores=shift_scores if chosen == "window" else None
+        shift_scores=shift_scores if chosen == "window" else None,
+        active_mask=final_mask
     )
 
 def perform_sequence_alignment(seq1:str, seq2:str, gap_open:float, gap_extend:float):
@@ -507,6 +567,12 @@ def perform_sequence_alignment(seq1:str, seq2:str, gap_open:float, gap_extend:fl
         aligner.open_gap_score = gap_open
         aligner.extend_gap_score = gap_extend
         aligner.mode = 'global'
+        # Semi-global alignment to allow individual chains to map to multi-chain references freely
+        try:
+            aligner.target_end_gap_score = 0.0
+            aligner.query_end_gap_score = 0.0
+        except Exception:
+            pass
         alns = aligner.align(seq1, seq2)
         if not alns: return None
         a = alns[0]
@@ -560,6 +626,17 @@ def get_aligned_atoms_by_alignment(ref_struct: gemmi.Structure, ref_chains, mob_
     else:
         target_atoms = {"CA"}
 
+    class ResidueWrapper:
+        def __init__(self, res, cid):
+            self.res = res
+            self._chain_id = cid
+        
+        def __iter__(self):
+            return iter(self.res)
+            
+        def __getattr__(self, attr):
+            return getattr(self.res, attr)
+
     def get_res_list(struct, chains):
         residues=[]
         model=struct[0]
@@ -604,24 +681,34 @@ def get_aligned_atoms_by_alignment(ref_struct: gemmi.Structure, ref_chains, mob_
                                     break
                             if not b_factor_ok:
                                 continue
-
-                        residues.append(res)
+                        # Wrap the immutable C++ object to attach the chain ID dynamically
+                        residues.append(ResidueWrapper(res, cid))
         return residues
 
     ref_res=get_res_list(ref_struct, ref_chains); mob_res=get_res_list(mob_struct, mob_chains)
     ref_idx=0; mob_idx=0; ref_atoms=[]; mob_atoms=[]
 
+    class PseudoResidue:
+        def __init__(self, resname, res_seq, res_icode=' '):
+            self.resname = resname
+            self._id = (' ', res_seq, res_icode)
+        def get_resname(self): return self.resname
+        def get_id(self): return self._id
+
     class PseudoAtom:
-        def __init__(self, coord, name, chain_name, res_seq, res_icode):
+        def __init__(self, coord, name, chain_name, res_seq, res_icode, resname="UNK"):
             self.coord = coord
             self.name = name
             self.chain_name = chain_name
             self.res_seq = res_seq
             self.res_icode = res_icode
+            self.parent = PseudoResidue(resname, res_seq, res_icode)
         def get_coord(self):
             return self.coord
         def get_name(self):
             return self.name
+        def get_parent(self):
+            return self.parent
 
     for a,b in zip(seqA, seqB):
         r_match=None; m_match=None
@@ -639,36 +726,47 @@ def get_aligned_atoms_by_alignment(ref_struct: gemmi.Structure, ref_chains, mob_
                 mob_idx+=1
 
         if r_match is not None and m_match is not None:
-            r_parent_chain = r_match.last_chain_name if hasattr(r_match, 'last_chain_name') else "A"
-            m_parent_chain = m_match.last_chain_name if hasattr(m_match, 'last_chain_name') else "A"
+            r_parent_chain = r_match._chain_id if hasattr(r_match, '_chain_id') else "A"
+            m_parent_chain = m_match._chain_id if hasattr(m_match, '_chain_id') else "A"
             for atA in r_match:
                 if atA.element.name == "H": continue
                 if target_atoms is not None and atA.name not in target_atoms: continue
                 for atB in m_match:
                     if atB.name == atA.name:
-                        ref_atoms.append(PseudoAtom(np.array(atA.pos.tolist(), dtype=float), atA.name, r_parent_chain, r_match.seqid.num, r_match.seqid.icode if hasattr(r_match.seqid, 'has_icode') and r_match.seqid.has_icode() else ""))
-                        mob_atoms.append(PseudoAtom(np.array(atB.pos.tolist(), dtype=float), atB.name, m_parent_chain, m_match.seqid.num, m_match.seqid.icode if hasattr(m_match.seqid, 'has_icode') and m_match.seqid.has_icode() else ""))
+                        ref_atoms.append(PseudoAtom(np.array(atA.pos.tolist(), dtype=float), atA.name, r_parent_chain, r_match.seqid.num, r_match.seqid.icode if hasattr(r_match.seqid, 'has_icode') and r_match.seqid.has_icode() else "", r_match.name))
+                        mob_atoms.append(PseudoAtom(np.array(atB.pos.tolist(), dtype=float), atB.name, m_parent_chain, m_match.seqid.num, m_match.seqid.icode if hasattr(m_match.seqid, 'has_icode') and m_match.seqid.has_icode() else "", m_match.name))
                         break
 
     return ref_atoms, mob_atoms
 
-def superimpose_atoms(ref_atoms, mob_atoms):
+def superimpose_atoms(ref_atoms, mob_atoms, recycles: int = 0, keep_fraction: float = 1.0):
     if not ref_atoms or not mob_atoms or len(ref_atoms)!=len(mob_atoms): return None
-    SI=Superimposer(); SI.set_atoms(ref_atoms, mob_atoms); R,t=SI.rotran
     ref_coords=np.array([a.get_coord() for a in ref_atoms])
     mob_coords=np.array([a.get_coord() for a in mob_atoms])
-    mob_aligned=(mob_coords@R) + t
+
+    R, t, rmsd, mask = _iterative_kabsch(ref_coords, mob_coords, recycles, keep_fraction)
+    
+    mob_aligned=_transform(mob_coords, R, t)
     per_res=np.sqrt(np.sum((ref_coords - mob_aligned)**2, axis=1))
+
+    # We return the active mask as well
     res_labels=[]
-    for a in ref_atoms:
-
+    active_ref_atoms = []
+    active_mob_atoms = []
+    
+    for i, a in enumerate(ref_atoms):
         chain = a.chain_name
-
         lbl = f"{chain}:{a.res_seq}{a.res_icode.strip()}" if str(a.res_icode).strip() else f"{chain}:{a.res_seq}"
         res_labels.append(lbl)
-    return dict(rmsd=float(SI.rms), rotation=R, translation=t,
+        if mask[i]:
+            active_ref_atoms.append(a)
+            active_mob_atoms.append(mob_atoms[i])
+
+    return dict(rmsd=float(rmsd), rotation=R, translation=t,
                 ref_coords=ref_coords, mob_coords_transformed=mob_aligned,
-                per_residue_rmsd=per_res, residue_labels=res_labels)
+                per_residue_rmsd=per_res, residue_labels=res_labels,
+                active_ref_atoms=active_ref_atoms, active_mob_atoms=active_mob_atoms,
+                mask=mask)
 
 def compute_chain_similarity_matrix(seqsA, seqsB)->Tuple[pd.DataFrame,pd.DataFrame]:
     chainsA=list(seqsA.keys()); chainsB=list(seqsB.keys())
