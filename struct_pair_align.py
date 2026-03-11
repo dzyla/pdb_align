@@ -1024,13 +1024,21 @@ if st.session_state.last_run_summary:
                         r_res = ref_atom.get_parent()
                         m_res = mob_atom.get_parent()
         
-                        # Biopython get_id() returns (het, resseq, icode)
-                        # `res_labels` in `superimpose_atoms` gives us chain information via `get_parent().get_parent().id`
-                        r_chain = r_res.get_parent().id
-                        r_key = f"{r_chain}{r_res.get_id()[1]}{(r_res.get_id()[2] or '').strip()}"
+                        if hasattr(ref_atom, 'chain_name'):
+                            r_chain = ref_atom.chain_name
+                            r_key = f"{r_chain}{ref_atom.res_seq}{(ref_atom.res_icode or '').strip()}"
+                        else:
+                            # Biopython get_id() returns (het, resseq, icode)
+                            # `res_labels` in `superimpose_atoms` gives us chain information via `get_parent().get_parent().id`
+                            r_chain = r_res.get_parent().id
+                            r_key = f"{r_chain}{r_res.get_id()[1]}{(r_res.get_id()[2] or '').strip()}"
         
-                        m_chain = m_res.get_parent().id
-                        m_key = f"{m_chain}{m_res.get_id()[1]}{(m_res.get_id()[2] or '').strip()}"
+                        if hasattr(mob_atom, 'chain_name'):
+                            m_chain = mob_atom.chain_name
+                            m_key = f"{m_chain}{mob_atom.res_seq}{(mob_atom.res_icode or '').strip()}"
+                        else:
+                            m_chain = m_res.get_parent().id
+                            m_key = f"{m_chain}{m_res.get_id()[1]}{(m_res.get_id()[2] or '').strip()}"
         
                         if r_key in ref_res_to_full_idx and m_key in mob_res_to_full_idx:
                             idx_ref = ref_res_to_full_idx[r_key]
