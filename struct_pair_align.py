@@ -1,6 +1,6 @@
 # app.py
 # =========================================================
-# Structure Alignment Workhorse
+# Structure Alignment Suite
 # - Auto logic picks lowest RMSD (pairs as tie-breaker)
 # - Sequence-guided alignment (pairwise seq + Kabsch)
 # - Sequence-independent alignment: "shape", "window", "auto"
@@ -55,7 +55,7 @@ from pdb_align.core import (
 
 
 # Page config
-st.set_page_config(page_title="Structure Alignment Workhorse", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="Structure Alignment Suite", page_icon="🧬", layout="wide")
 st.markdown("""
 <style>
 .block-container { padding-top: 1rem; }
