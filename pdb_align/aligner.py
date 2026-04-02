@@ -717,21 +717,28 @@ class PDBAligner:
             print(f"Mobile chains updated to: {chains}")
 
     def align(self, mode: str = "auto", seq_gap_open: float = -10, seq_gap_extend: float = -0.5, atoms: str = "CA", min_plddt: float = 0.0, min_b_factor: float = 0.0, **kwargs):
-        min_b_val = max(min_plddt, min_b_factor)
         """
         Runs the alignment process.
 
-        mode:
-            "auto" (or "Auto (best RMSD)"): best RMSD among seq-guided and seq-free
-            "seq_guided" (or "Sequence-guided"): sequence-guided
-            "seq_free_auto" (or "Sequence-free (auto)"): sequence-free auto
-            "seq_free_shape" (or "Sequence-free (shape)"): sequence-free shape
-            "seq_free_window" (or "Sequence-free (window)"): sequence-free window
-
-        atoms:
-            "CA" (default): C-alpha atoms only
-            "backbone": N, CA, C, O atoms
-            "all_heavy": All non-hydrogen atoms
+        :param mode: Alignment mode to use. Options include:
+            - "auto" (or "Auto (best RMSD)"): Automatically picks the best between seq-guided and seq-free.
+            - "seq_guided" (or "Sequence-guided"): Forces sequence-guided alignment.
+            - "seq_free_auto" (or "Sequence-free (auto)"): Sequence-free auto-selection between shape/window.
+            - "seq_free_shape" (or "Sequence-free (shape)"): Sequence-free using shape matching.
+            - "seq_free_window" (or "Sequence-free (window)"): Sequence-free using sliding windows.
+        :type mode: str
+        :param seq_gap_open: Gap open penalty for sequence alignment (default: -10).
+        :type seq_gap_open: float
+        :param seq_gap_extend: Gap extension penalty for sequence alignment (default: -0.5).
+        :type seq_gap_extend: float
+        :param atoms: Atoms to consider during superposition ("CA", "backbone", "all_heavy").
+        :type atoms: str
+        :param min_plddt: Minimum pLDDT (confidence) threshold to retain an atom (default: 0.0). Filter AF models.
+        :type min_plddt: float
+        :param min_b_factor: Minimum B-factor to retain an atom (default: 0.0).
+        :type min_b_factor: float
+        :returns: An AlignmentResult object containing transformation matrices, matched pairs, and metrics.
+        :rtype: AlignmentResult
         """
         if not self.ref_file or not self.mob_file:
             raise ValueError("Both reference and mobile structures must be set before alignment.")
@@ -750,7 +757,7 @@ class PDBAligner:
             seqB = "".join(str(self.mob_seqs[c].seq) for c in mob_chs if c in self.mob_seqs)
             aln = perform_sequence_alignment(seqA, seqB, seq_gap_open, seq_gap_extend)
             if aln:
-                ref_atoms, mob_atoms = get_aligned_atoms_by_alignment(self.ref_struct, ref_chs, self.mob_struct, mob_chs, aln, atoms=atoms, min_b_factor=min_b_val)
+                ref_atoms, mob_atoms = get_aligned_atoms_by_alignment(self.ref_struct, ref_chs, self.mob_struct, mob_chs, aln, atoms=atoms, min_b_factor=min_b_factor, min_plddt=min_plddt)
                 if ref_atoms and mob_atoms:
                     si = superimpose_atoms(ref_atoms, mob_atoms)
                     if si:
@@ -769,7 +776,7 @@ class PDBAligner:
                 res = sequence_independent_alignment_joined_v2(
                     file_ref=self.ref_file, file_mob=self.mob_file,
                     chains_ref=ref_chs, chains_mob=mob_chs,
-                    method=sf_method, atoms=atoms, min_b_factor=min_b_val, **kwargs
+                    method=sf_method, atoms=atoms, min_b_factor=min_b_factor, min_plddt=min_plddt, **kwargs
                 )
                 seqfree = res
             except Exception as e:

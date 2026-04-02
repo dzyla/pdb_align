@@ -243,11 +243,11 @@ def plot_superposition_3d(ref_coords: np.ndarray,
                              min_value=5.0, max_value=60.0, value=12.0, step=1.0,
                              key=f"{kp}_radius")
 
-    # For drawing, we allow passing either the subset or the full arrays
     ref_draw = np.array(ref_coords, dtype=float)
     mob_draw = np.array(mob_coords, dtype=float)
 
-    # Build 3D figure
+    # Build 3D figure (Plotly overview)
+    st.write("### Analytical Distance Plotly Overview")
     fig = go.Figure()
     fig.add_trace(go.Scatter3d(
         x=ref_draw[:,0], y=ref_draw[:,1], z=ref_draw[:,2],
@@ -437,6 +437,26 @@ def _generate_4_pdbs(ref_file: str, mob_file: str, ref_chains: list, mob_chains:
 
     return ref_full, ref_sel, mob_full, mob_sel
 
+def _generate_pymol_script(ref_name, mob_name, rmsd_df):
+    script = f"# PyMOL alignment visualization\\n"
+    script += f"load {ref_name}\\n"
+    script += f"load {mob_name}\\n"
+    script += "hide everything\\nshow cartoon\\n"
+    script += "color white, ref_full\\ncolor cyan, mob_full\\n"
+    if rmsd_df is not None and not rmsd_df.empty:
+        script += "alter all, b=0.0\\n"
+        # B-factor injection
+        for _, row in rmsd_df.iterrows():
+            lbl = row['Residue Label']
+            val = row['RMSD']
+            if ':' in lbl:
+                ch, res = lbl.split(':')
+                resseq = "".join([c for c in res if c.isdigit() or c == '-'])
+                script += f"alter (mob_full and chain {ch} and resi {resseq}), b={val:.3f}\\n"
+        script += "spectrum b, blue_white_red, mob_full, minimum=0, maximum=10\\n"
+    script += "zoom\\n"
+    return script.encode()
+
 def export_zip_batch(results: list, summary_df: pd.DataFrame, ref_file: str, ref_chains: list, mob_chs_dict: dict) -> Tuple[io.BytesIO, str]:
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, "w") as z:
@@ -460,6 +480,7 @@ def export_zip_batch(results: list, summary_df: pd.DataFrame, ref_file: str, ref
                 z.writestr(f"{mob}/{r_base}_aligned_ref_selected.pdb", rs)
                 z.writestr(f"{mob}/{m_base}_aligned_mobile_full.pdb", mf)
                 z.writestr(f"{mob}/{m_base}_aligned_mobile_selected.pdb", ms)
+                z.writestr(f"{mob}/visualize.pml", _generate_pymol_script(f"{r_base}_aligned_ref_full.pdb", f"{m_base}_aligned_mobile_full.pdb", rmsd_df))
                 
             elif "Sequence-free" in chsn["name"] and r.get("seqfree") is not None:
                 sf = r["seqfree"]
@@ -477,6 +498,7 @@ def export_zip_batch(results: list, summary_df: pd.DataFrame, ref_file: str, ref
                 z.writestr(f"{mob}/{r_base}_aligned_ref_selected.pdb", rs)
                 z.writestr(f"{mob}/{m_base}_aligned_mobile_full.pdb", mf)
                 z.writestr(f"{mob}/{m_base}_aligned_mobile_selected.pdb", ms)
+                z.writestr(f"{mob}/visualize.pml", _generate_pymol_script(f"{r_base}_aligned_ref_full.pdb", f"{m_base}_aligned_mobile_full.pdb", sf_rmsd_df))
 
     zbuf.seek(0)
     name = f"batch_alignment_export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
@@ -561,13 +583,22 @@ with st.sidebar:
 
     if fetch_btn and fetch_id:
         targets = [t.strip() for t in fetch_id.split(",") if t.strip()]
-        for t in targets:
-            with st.spinner(f"Fetching {t}..."):
-                blob, err = fetch_structure_to_blob(t)
-                if blob:
-                    st.session_state.fetched_blobs[blob.name] = blob
-                else:
-                    st.error(err)
+        if targets:
+            with st.spinner(f"Fetching {len(targets)} structures concurrently..."):
+                from concurrent.futures import ThreadPoolExecutor
+                def _fetch(t): return (t, fetch_structure_to_blob(t))
+                
+                try:
+                    with ThreadPoolExecutor(max_workers=5) as executor:
+                        results = list(executor.map(_fetch, targets))
+                    
+                    for t, (blob, err) in results:
+                        if blob:
+                            st.session_state.fetched_blobs[blob.name] = blob
+                        else:
+                            st.error(f"{err} for {t}")
+                except Exception as e:
+                    st.error(f"Concurrent fetch error: {e}")
 
     if st.session_state.fetched_blobs:
         st.write("Fetched structures:")
@@ -586,6 +617,7 @@ with st.sidebar:
         old_names = sorted(list(st.session_state.structures.keys()))
         if new_names != old_names:
             st.session_state.structures.clear(); st.session_state.sequences.clear(); st.session_state.chain_lengths.clear()
+            st.session_state.last_run_summary = [r for r in st.session_state.last_run_summary if r["mob_file"] in new_names and st.session_state.get("selected_ref_file") in new_names]
             with st.spinner("Parsing structures..."):
                 for f in current_blobs:
                     s, err = parse_structure(f)
@@ -978,6 +1010,38 @@ if st.session_state.last_run_summary:
             with cols[2]:
                 st.metric("Mode selected", chosen["name"])
         
+            st.divider()
+            
+            st.write("### Mol* Interactive Structure Alignment")
+            import tempfile
+            from streamlit_molstar import st_molstar
+            
+            rot = seqguided["si"]["rotation"] if "Sequence-guided" in chosen["name"] and seqguided else (seqfree.rotation if seqfree else None)
+            trans = seqguided["si"]["translation"] if "Sequence-guided" in chosen["name"] and seqguided else (seqfree.translation if seqfree else None)
+            if rot is not None and trans is not None:
+                with st.spinner("Generating full structures for Mol*..."):
+                    rf, rs, mf, ms = _generate_4_pdbs(
+                        st.session_state.selected_ref_file, mob_file,
+                        st.session_state.selected_ref_chains,
+                        st.session_state.get("selected_mobile_chains_dict", {}).get(mob_file, []),
+                        rot, trans
+                    )
+                    tdir = tempfile.mkdtemp()
+                    merged_path = os.path.join(tdir, "merged_aligned.pdb")
+                    
+                    # Clean out any stray 'END' strings from individual saves before merging into models
+                    rf_clean = rf.replace(b"END   \\n", b"").replace(b"END\\n", b"")
+                    mf_clean = mf.replace(b"END   \\n", b"").replace(b"END\\n", b"")
+                    
+                    merged_pdb = b"MODEL        1\\n" + rf_clean + b"ENDMDL\\nMODEL        2\\n" + mf_clean + b"ENDMDL\\nEND   \\n"
+                    
+                    with open(merged_path, "wb") as f:
+                        f.write(merged_pdb)
+                    
+                    st_molstar(merged_path, key=f"molstar_{mob_file}", height=600)
+            else:
+                st.warning("Cannot render Mol* because no valid transformation was found.")
+                
             st.divider()
         
             # ===== A) Sequence-guided =====

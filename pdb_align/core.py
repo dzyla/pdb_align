@@ -7,10 +7,13 @@ import tempfile
 import datetime
 import zipfile
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Union, Dict
+from typing import List, Tuple, Optional, Union, Dict, Any
 
 import numpy as np
 import pandas as pd
+import logging
+
+logger = logging.getLogger(__name__)
 
 # BioPython
 from Bio.PDB import (
@@ -107,6 +110,34 @@ class AlignmentResultSF:
     shift_matrix: Optional[np.ndarray] = None
     shift_scores: Optional[np.ndarray] = None
     active_mask: Optional[np.ndarray] = None
+    gdt_ts: Optional[float] = None
+    cad_score: Optional[float] = None
+
+def compute_gdt_ts(dists: np.ndarray, cutoffs: List[float] = [1.0, 2.0, 4.0, 8.0]) -> float:
+    if len(dists) == 0: return 0.0
+    fractions = [np.mean(dists <= c) for c in cutoffs]
+    return float(np.mean(fractions)) * 100.0
+
+def compute_cad_score_approx(ref_coords: np.ndarray, mob_coords: np.ndarray, contact_dist: float = 8.0) -> float:
+    # Pseudo-CAD using purely C-alpha contact maps (O(N^2) naive). Real CAD requires Voronoi, but this captures local environment change.
+    if len(ref_coords) == 0: return 0.0
+    d_ref = _pairwise_dists(ref_coords)
+    d_mob = _pairwise_dists(mob_coords)
+    # Mask out self-contacts and adjacent residues
+    N = len(ref_coords)
+    mask = np.ones((N, N), dtype=bool)
+    np.fill_diagonal(mask, False)
+    for i in range(N-1):
+        mask[i, i+1] = False
+        mask[i+1, i] = False
+
+    c_ref = (d_ref <= contact_dist) & mask
+    c_mob = (d_mob <= contact_dist) & mask
+    
+    # Jaccard index of contacts
+    intersection = np.sum(c_ref & c_mob)
+    union = np.sum(c_ref | c_mob)
+    return float(intersection / union) if union > 0 else 0.0
 
 def _parse_path(path: str) -> gemmi.Structure:
     return gemmi.read_structure(path)
@@ -143,7 +174,7 @@ def _resolve_selectors(struct:_Structure.Structure, sel: Optional[List[Union[str
     return uniq
 
 def _extract_ca_infos(
-    struct: gemmi.Structure, chain_filter: Optional[List[str]], min_b_factor: float = 0.0
+    struct: gemmi.Structure, chain_filter: Optional[List[str]], min_b_factor: float = 0.0, min_plddt: float = 0.0
 ) -> List[ResidueInfo]:
     model = struct[0]
     infos = []
@@ -198,6 +229,10 @@ def _extract_ca_infos(
                 continue
 
             if min_b_factor > 0.0 and ca.b_iso < min_b_factor:
+                continue
+            
+            # Since AF models store pLDDT in B-factor column
+            if min_plddt > 0.0 and ca.b_iso < min_plddt:
                 continue
 
             coord = np.array(ca.pos.tolist(), dtype=float)
@@ -407,8 +442,12 @@ def _shape_pairs(coords1:np.ndarray, coords2:np.ndarray, nbins:int=24, gap_penal
     return pairs, S, C
 
 class _AllAtomsSelect(Select):
-    def __init__(self, R:np.ndarray, t:np.ndarray):
-        super().__init__(); self.R=R; self.t=t
+    def __init__(self, R:np.ndarray, t:np.ndarray, keep_heteroatoms:bool=True):
+        super().__init__(); self.R=R; self.t=t; self.keep_heteroatoms=keep_heteroatoms
+    def accept_residue(self, residue)->bool:
+        if not self.keep_heteroatoms and residue.id[0] != ' ':
+            return False
+        return True
     def accept_atom(self, atom:Atom.Atom)->bool:
         coord=atom.get_coord().astype(float); atom.set_coord((self.R@coord)+self.t); return True
 
@@ -420,8 +459,9 @@ def sequence_independent_alignment_joined_v2(
     shape_nbins:int=24, shape_gap_penalty:float=2.0, shape_band_frac:float=0.20,
     inlier_rmsd_cut:float=3.0, inlier_quantile:float=0.85, 
     recycles: int = 0, keep_fraction: float = 1.0,
-    atoms: str = "CA", min_b_factor: float = 0.0
+    atoms: str = "CA", min_b_factor: float = 0.0, min_plddt: float = 0.0
 )->AlignmentResultSF:
+    logger.info(f"Running sequence_independent_alignment_joined_v2: ref={file_ref}, mob={file_mob}, method={method}")
     ref_struct=_parse_path(file_ref); mob_struct=_parse_path(file_mob)
     ref_ids=_resolve_selectors(ref_struct, chains_ref)
     mob_ids=_resolve_selectors(mob_struct, chains_mob)
@@ -429,8 +469,8 @@ def sequence_independent_alignment_joined_v2(
         raise ValueError("Specify chains_ref and chains_mob for sequence-independent alignment.")
 
     # We must ALWAYS run the structure DP matrix on C-alphas to keep size (N) = number of residues.
-    ref_infos=_extract_ca_infos(ref_struct, ref_ids, min_b_factor)
-    mob_infos=_extract_ca_infos(mob_struct, mob_ids, min_b_factor)
+    ref_infos=_extract_ca_infos(ref_struct, ref_ids, min_b_factor, min_plddt)
+    mob_infos=_extract_ca_infos(mob_struct, mob_ids, min_b_factor, min_plddt)
     ref_subset=np.vstack([ri.coord for ri in ref_infos])
     mob_subset=np.vstack([mi.coord for mi in mob_infos])
     D1=_pairwise_dists(ref_subset); D2=_pairwise_dists(mob_subset)
@@ -542,20 +582,33 @@ def sequence_independent_alignment_joined_v2(
             mob_c = np.array([a.get_coord() for a in final_mob_atoms])
             R, t, final_rmsd = _kabsch(ref_c, mob_c)
 
-    mob_all_infos=_extract_ca_infos(_parse_path(file_mob), chain_filter=None, min_b_factor=min_b_factor)
+    mob_all_infos=_extract_ca_infos(_parse_path(file_mob), chain_filter=None, min_b_factor=min_b_factor, min_plddt=min_plddt)
     mob_all_ca=np.vstack([mi.coord for mi in mob_all_infos]); mob_all_ca_aligned=_transform(mob_all_ca, R, t)
+    
+    mob_subset_aligned = _transform(mob_subset, R, t)
+    # Calculate GDT_TS and pseudo-CAD for the active fraction
+    active_ref_idx = [i for idx, (i,j) in enumerate(final_pairs) if final_mask[idx]]
+    active_mob_idx = [j for idx, (i,j) in enumerate(final_pairs) if final_mask[idx]]
+    
+    gdt_ts, cad_score = 0.0, 0.0
+    if len(active_ref_idx) > 0:
+        dists = np.linalg.norm(ref_subset[active_ref_idx] - mob_subset_aligned[active_mob_idx], axis=1)
+        gdt_ts = compute_gdt_ts(dists)
+        cad_score = compute_cad_score_approx(ref_subset[active_ref_idx], mob_subset_aligned[active_mob_idx])
+
+    logger.info(f"Seq-free alignment ({chosen}) finished. RMSD = {final_rmsd:.3f}, GDT_TS = {gdt_ts:.2f}")
 
     return AlignmentResultSF(
         rotation=R, translation=t, rmsd=final_rmsd, iterations=1,
         kept_pairs=int(np.sum(final_mask)), method=chosen, pairs=final_pairs,
         ref_subset_infos=ref_infos, mob_subset_infos=mob_infos,
         ref_subset_ca_coords=ref_subset,
-        mob_subset_ca_coords_aligned=_transform(mob_subset, R, t),
+        mob_subset_ca_coords_aligned=mob_subset_aligned,
         mob_all_infos=mob_all_infos, mob_all_ca_coords_aligned=mob_all_ca_aligned,
         summaries=summaries,
         shift_matrix=shift_matrix if chosen == "shape" else None,
         shift_scores=shift_scores if chosen == "window" else None,
-        active_mask=final_mask
+        active_mask=final_mask, gdt_ts=gdt_ts, cad_score=cad_score
     )
 
 def perform_sequence_alignment(seq1:str, seq2:str, gap_open:float, gap_extend:float):
@@ -615,7 +668,7 @@ def perform_sequence_alignment(seq1:str, seq2:str, gap_open:float, gap_extend:fl
         # Avoid print here, log handles it in script
         return None
 
-def get_aligned_atoms_by_alignment(ref_struct: gemmi.Structure, ref_chains, mob_struct: gemmi.Structure, mob_chains, alignment, atoms: str = "CA", min_b_factor: float = 0.0):
+def get_aligned_atoms_by_alignment(ref_struct: gemmi.Structure, ref_chains, mob_struct: gemmi.Structure, mob_chains, alignment, atoms: str = "CA", min_b_factor: float = 0.0, min_plddt: float = 0.0):
     if not alignment: return [], []
     seqA, seqB = alignment.seqA, alignment.seqB
 
@@ -681,6 +734,17 @@ def get_aligned_atoms_by_alignment(ref_struct: gemmi.Structure, ref_chains, mob_
                                     break
                             if not b_factor_ok:
                                 continue
+                        
+                        # Filter by pLDDT
+                        if min_plddt > 0.0:
+                            plddt_ok = False
+                            for atom in res:
+                                if atom.name == "CA" and atom.b_iso >= min_plddt:
+                                    plddt_ok = True
+                                    break
+                            if not plddt_ok:
+                                continue
+
                         # Wrap the immutable C++ object to attach the chain ID dynamically
                         residues.append(ResidueWrapper(res, cid))
         return residues
@@ -762,11 +826,22 @@ def superimpose_atoms(ref_atoms, mob_atoms, recycles: int = 0, keep_fraction: fl
             active_ref_atoms.append(a)
             active_mob_atoms.append(mob_atoms[i])
 
+    gdt_ts, cad_score = 0.0, 0.0
+    if len(active_ref_atoms) > 0:
+        active_ref_c = np.array([a.get_coord() for a in active_ref_atoms])
+        active_mob_c = np.array([a.get_coord() for a in active_mob_atoms])
+        
+        # Calculate active distances
+        dists = np.linalg.norm(active_ref_c - _transform(active_mob_c, R, t), axis=1)
+        gdt_ts = compute_gdt_ts(dists)
+        cad_score = compute_cad_score_approx(active_ref_c, _transform(active_mob_c, R, t))
+        logger.info(f"Superimpose resulted in RMSD = {rmsd:.3f}, GDT_TS = {gdt_ts:.2f}")
+
     return dict(rmsd=float(rmsd), rotation=R, translation=t,
                 ref_coords=ref_coords, mob_coords_transformed=mob_aligned,
                 per_residue_rmsd=per_res, residue_labels=res_labels,
                 active_ref_atoms=active_ref_atoms, active_mob_atoms=active_mob_atoms,
-                mask=mask)
+                mask=mask, gdt_ts=gdt_ts, cad_score=cad_score)
 
 def compute_chain_similarity_matrix(seqsA, seqsB)->Tuple[pd.DataFrame,pd.DataFrame]:
     chainsA=list(seqsA.keys()); chainsB=list(seqsB.keys())
@@ -864,3 +939,76 @@ def pick_best_overall(seqguided, seqfree, min_pairs:int=3):
     else:
         reason="Single valid candidate."
     return best, reason
+
+def progressive_align_ensemble(
+    files: List[str], 
+    chains_list: Optional[List[Optional[List[Union[str,int]]]]] = None,
+    method: str = "shape", 
+    recycles: int = 0, keep_fraction: float = 1.0, min_plddt: float = 0.0
+) -> Dict[str, Any]:
+    """
+    Computes a progressive ensemble alignment by picking a central "medoid" structure 
+    and aligning all others to it to achieve a Multiple Structure Alignment (MSA).
+    Returns mapping parameters and overall RMSD metrics.
+    """
+    if len(files) < 2:
+        return {"error": "Need at least 2 structures for ensemble alignment"}
+    
+    if chains_list is None:
+        chains_list = [None] * len(files)
+        
+    logger.info(f"Starting progressive ensemble alignment for {len(files)} structures")
+    
+    # 1. Pairwise shape/window alignments to target the Medoid
+    N = len(files)
+    pairwise_rmsds = np.zeros((N, N))
+    
+    # For a full medoid we need N*(N-1)/2, but for speed we can approximate.
+    # To be robust, if N<=10 we do all pairs. If larger, we pick the first file as reference.
+    if N <= 10:
+        for i in range(N):
+            for j in range(i+1, N):
+                res = sequence_independent_alignment_joined_v2(
+                    files[i], files[j], chains_ref=chains_list[i], chains_mob=chains_list[j],
+                    method=method, recycles=recycles, keep_fraction=keep_fraction, min_plddt=min_plddt
+                )
+                pairwise_rmsds[i, j] = res.rmsd
+                pairwise_rmsds[j, i] = res.rmsd
+        
+        avg_rmsds = np.sum(pairwise_rmsds, axis=1) / (N - 1)
+        medoid_idx = int(np.argmin(avg_rmsds))
+    else:
+        medoid_idx = 0
+        
+    logger.info(f"Selected structure {medoid_idx} ({files[medoid_idx]}) as the Medoid.")
+    
+    aligned_results = []
+    medoid_file = files[medoid_idx]
+    
+    for i in range(N):
+        if i == medoid_idx:
+            # Identity matrix for medoid
+            aligned_results.append({
+                "mob_index": i, "file": files[i], 
+                "R": np.eye(3), "t": np.zeros(3), "rmsd": 0.0, "is_medoid": True
+            })
+            continue
+            
+        res = sequence_independent_alignment_joined_v2(
+            medoid_file, files[i], chains_ref=chains_list[medoid_idx], chains_mob=chains_list[i],
+            method=method, recycles=recycles, keep_fraction=keep_fraction, min_plddt=min_plddt
+        )
+        logger.info(f"Aligned {files[i]} to Medoid, RMSD: {res.rmsd:.3f}")
+        
+        aligned_results.append({
+            "mob_index": i, "file": files[i], 
+            "R": res.rotation, "t": res.translation, "rmsd": res.rmsd, "gdt_ts": res.gdt_ts, "is_medoid": False
+        })
+        
+    return {
+        "medoid_idx": medoid_idx,
+        "medoid_file": medoid_file,
+        "results": aligned_results,
+        "avg_ensemble_rmsd": float(np.mean([r["rmsd"] for r in aligned_results if r["rmsd"] > 0]))
+    }
+
