@@ -206,7 +206,7 @@ def plot_superposition_3d(ref_coords: np.ndarray,
         st.warning("Cannot compute per-pair 3D distances: shapes do not match.")
         ref_draw = np.array(ref_coords, dtype=float)
         mob_draw = np.array(mob_coords, dtype=float)
-        _plot_basic_3d(ref_draw, mob_draw, title)
+        _plot_basic_3d(ref_draw, mob_draw, title, key_suffix=kp)
         return
 
     d = np.linalg.norm(ref_pts_for_peaks - mob_pts_for_peaks, axis=1)
@@ -318,9 +318,9 @@ def plot_superposition_3d(ref_coords: np.ndarray,
         height=600, margin=dict(l=0,r=0,t=50,b=0),
         legend=dict(x=0.01, y=0.99)
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"{kp}_main_plot")
 
-def _plot_basic_3d(ref_coords, mob_coords, title):
+def _plot_basic_3d(ref_coords, mob_coords, title, key_suffix=""):
     fig=go.Figure()
     fig.add_trace(go.Scatter3d(x=ref_coords[:,0], y=ref_coords[:,1], z=ref_coords[:,2],
                                mode='lines+markers', name='Reference Cα',
@@ -330,7 +330,7 @@ def _plot_basic_3d(ref_coords, mob_coords, title):
                                marker=dict(size=2), line=dict(width=2)))
     fig.update_layout(title=title, scene=dict(aspectmode='data', xaxis_title='X (Å)', yaxis_title='Y (Å)', zaxis_title='Z (Å)'),
                       height=560, margin=dict(l=0,r=0,t=40,b=0))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"basic3d_{key_suffix}")
 
 # ===========================================
 # Distance/cost plots
@@ -381,12 +381,12 @@ def plot_distance_matrices(D1: np.ndarray, D2: np.ndarray, name1: str, name2: st
     # Display the plot in the Streamlit app
     st.pyplot(fig)
 
-def plot_pair_distance_hist(dists: np.ndarray, title: str):
+def plot_pair_distance_hist(dists: np.ndarray, title: str, key_suffix=""):
     if dists is None or len(dists)==0: st.info("No pairs to plot."); return
     fig = go.Figure(); fig.add_trace(go.Histogram(x=dists, nbinsx=30))
     fig.update_layout(title=title, xaxis_title="Per-pair distance after superposition (Å)",
                       yaxis_title="Count", height=300, margin=dict(l=10,r=10,t=40,b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"hist_{key_suffix}")
 
 # ===========================================
 # Exports
@@ -901,7 +901,7 @@ if st.session_state.last_run_summary:
                 
                 fig_combined.update_traces(mode='lines+markers', marker=dict(size=2), line=dict(width=1.5), connectgaps=False)
                 fig_combined.update_layout(xaxis_title="Reference Residue (Chain:ResSeq)", height=500)
-                st.plotly_chart(fig_combined, use_container_width=True)
+                st.plotly_chart(fig_combined, use_container_width=True, key="fig_combined_batch_rmsd")
                 
                 # CSV Export (Clean NaNs for valid structural data only)
                 df_export = df_combined.dropna(subset=["RMSD (Å)"])
@@ -974,7 +974,7 @@ if st.session_state.last_run_summary:
                         height=600,
                         margin=dict(l=0, r=0, t=30, b=0)
                     )
-                    st.plotly_chart(fig_3d, use_container_width=True)
+                    st.plotly_chart(fig_3d, use_container_width=True, key="fig_3d_avg_rmsd")
             else:
                 st.info("Not enough mapped data for a combined plot.")
     
@@ -1138,7 +1138,7 @@ if st.session_state.last_run_summary:
                     marker_color=colors
                 )])
                 rmsd_fig.update_layout(xaxis_title="Reference Residue (Chain:ResSeq)", yaxis_title="RMSD (Å)", height=400)
-                st.plotly_chart(rmsd_fig, use_container_width=True)
+                st.plotly_chart(rmsd_fig, use_container_width=True, key=f"sg_rmsd_fig_{_san_key(mob_file)}")
         
                 excluded = [lbl for lbl, m in zip(seqguided["si"]["residue_labels"], seqguided["si"]["mask"]) if not m]
                 if excluded:
@@ -1172,7 +1172,7 @@ if st.session_state.last_run_summary:
                     mob_sub_aln = seqfree.mob_subset_ca_coords_aligned
                     dists = np.array([np.linalg.norm(seqfree.ref_subset_ca_coords[i] - mob_sub_aln[j])
                                       for (i,j) in seqfree.pairs])
-                    plot_pair_distance_hist(dists, "Per-pair distances after superposition")
+                    plot_pair_distance_hist(dists, "Per-pair distances after superposition", key_suffix=_san_key(mob_file))
 
                 if len(seqfree.pairs) >= 1:
                     if seqfree.method == "shape" and seqfree.shift_matrix is not None:
@@ -1192,7 +1192,7 @@ if st.session_state.last_run_summary:
                             st.write("Score plot of alignment across multiple sliding window offsets. The peak score indicates the best matching structural regions.")
                             fig = go.Figure(data=go.Scatter(x=np.arange(len(seqfree.shift_scores)), y=seqfree.shift_scores, mode='lines+markers'))
                             fig.update_layout(xaxis_title="Shift offset", yaxis_title="Correlation Score", height=400)
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, use_container_width=True, key=f"sf_window_scores_{_san_key(mob_file)}")
 
                     # NEW: toggle full chains vs matched subset
                     sf_show_mode = st.radio(
@@ -1266,7 +1266,7 @@ if st.session_state.last_run_summary:
                         colors = ['#1f77b4' if m else '#d62728' for m in seqfree.active_mask]
                         rmsd_fig = go.Figure(data=[go.Bar(x=labels, y=dists, marker_color=colors)])
                         rmsd_fig.update_layout(xaxis_title="Reference Residue (Chain:ResSeq)", yaxis_title="Distance (Å)", height=400)
-                        st.plotly_chart(rmsd_fig, use_container_width=True)
+                        st.plotly_chart(rmsd_fig, use_container_width=True, key=f"sf_mapped_rmsd_{_san_key(mob_file)}")
 
                         excluded = [lbl for i, lbl in enumerate(labels) if not seqfree.active_mask[i]]
                         if excluded:
@@ -1291,7 +1291,7 @@ if st.session_state.last_run_summary:
 
                     sf_rmsd_fig = go.Figure(data=[go.Bar(x=sf_rmsd_labels, y=sf_per_res_rmsd)])
                     sf_rmsd_fig.update_layout(xaxis_title="Reference Residue (Chain:ResSeq)", yaxis_title="RMSD (Å)", height=400)
-                    st.plotly_chart(sf_rmsd_fig, use_container_width=True)
+                    st.plotly_chart(sf_rmsd_fig, use_container_width=True, key=f"sf_matched_rmsd_{_san_key(mob_file)}")
 
                     sf_rmsd_df = pd.DataFrame({
                         "Residue Label": sf_rmsd_labels,
