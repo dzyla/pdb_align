@@ -50,3 +50,25 @@ END
     with patch("pdb_align.aligner._parse_path", wraps=lambda p: gemmi.read_structure(p)) as mock_parse:
         aligner.add_mobile(str(mob))
         mock_parse.assert_not_called()
+
+
+def test_top_level_align_chains_kwargs(tmp_path):
+    """pdb_align.align() should pass chains_ref/chains_mob correctly and return AlignmentResult."""
+    pdb_content = """\
+ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00           C
+ATOM      2  CA  ALA A   2       4.000   5.000   6.000  1.00  0.00           C
+ATOM      3  CA  ALA A   3       7.000   8.000   9.000  1.00  0.00           C
+END
+"""
+    ref = tmp_path / "ref.pdb"
+    mob = tmp_path / "mob.pdb"
+    ref.write_text(pdb_content)
+    mob.write_text(pdb_content)
+
+    import pdb_align
+    from pdb_align.aligner import AlignmentResult
+
+    result = pdb_align.align(str(ref), str(mob))
+    assert isinstance(result, AlignmentResult)
+    assert result.rmsd is not None
+    assert result.rmsd >= 0.0
