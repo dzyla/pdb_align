@@ -8,7 +8,8 @@ from pdb_align.core import (
     progressive_align_ensemble,
     _extract_ca_infos,
     _parse_path,
-    _kabsch
+    _kabsch,
+    _detect_hinges
 )
 
 def test_compute_gdt_ts():
@@ -63,3 +64,37 @@ def test_kabsch():
 def test_progressive_align_error():
     res = progressive_align_ensemble(["file.pdb"])
     assert "error" in res
+
+
+def test_detect_hinges_flat_no_hinges():
+    """Uniform low RMSD → no hinge detected."""
+    rmsd = np.ones(120) * 0.5
+    result = _detect_hinges(rmsd, window=15, threshold=3.0, min_segment=30)
+    assert result == []
+
+
+def test_detect_hinges_single_spike_middle():
+    """Single high-RMSD spike in the middle → one split near residue 60."""
+    rmsd = np.ones(120) * 0.5
+    rmsd[55:65] = 8.0
+    result = _detect_hinges(rmsd, window=15, threshold=3.0, min_segment=30)
+    assert len(result) == 1
+    assert 45 <= result[0] <= 75
+
+
+def test_detect_hinges_too_short_for_min_segment():
+    """Spike at position 15 in a 40-residue array would leave <30-residue segment → no split."""
+    rmsd = np.ones(40) * 0.5
+    rmsd[13:18] = 8.0
+    result = _detect_hinges(rmsd, window=5, threshold=3.0, min_segment=30)
+    assert result == []
+
+
+def test_detect_hinges_two_spikes():
+    """Two spikes well-separated → two splits."""
+    rmsd = np.ones(200) * 0.5
+    rmsd[60:70] = 8.0
+    rmsd[130:140] = 8.0
+    result = _detect_hinges(rmsd, window=15, threshold=3.0, min_segment=30)
+    assert len(result) == 2
+    assert result[0] < result[1]

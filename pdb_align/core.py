@@ -256,6 +256,71 @@ def _pairwise_dists(coords: np.ndarray) -> np.ndarray:
     d2=x2+x2.T-2.0*np.dot(x,x.T); np.maximum(d2,0.0,out=d2)
     return np.sqrt(d2, out=d2)
 
+@jit(nopython=True, cache=True)
+def _sliding_window_mean(arr: np.ndarray, window: int) -> np.ndarray:
+    """Compute per-element sliding-window mean. JIT-compiled for speed."""
+    N = len(arr)
+    half = window // 2
+    out = np.zeros(N)
+    for i in range(N):
+        start = max(0, i - half)
+        end = min(N, i + half + 1)
+        s = 0.0
+        count = 0
+        for j in range(start, end):
+            s += arr[j]
+            count += 1
+        out[i] = s / count
+    return out
+
+
+def _detect_hinges(
+    per_residue_rmsd: np.ndarray,
+    window: int = 15,
+    threshold: float = 3.0,
+    min_segment: int = 30,
+) -> List[int]:
+    """
+    Return 0-based split indices for a per-residue RMSD array.
+
+    A "split at index s" means the first segment is [0..s-1] and the next
+    begins at [s..]. Consecutive above-threshold positions are merged into one
+    hinge; the split is placed at the midpoint of the hinge region.
+    Splits that would produce segments shorter than *min_segment* are dropped.
+    """
+    N = len(per_residue_rmsd)
+    if N < 2 * min_segment:
+        return []
+
+    smoothed = _sliding_window_mean(per_residue_rmsd.astype(float), window)
+    hinge_mask = smoothed > threshold
+
+    # Identify contiguous hinge regions, pick midpoint of each as the split
+    splits: List[int] = []
+    in_hinge = False
+    hinge_start = 0
+    for i in range(N):
+        if hinge_mask[i] and not in_hinge:
+            in_hinge = True
+            hinge_start = i
+        elif not hinge_mask[i] and in_hinge:
+            in_hinge = False
+            splits.append((hinge_start + i) // 2)
+    if in_hinge:
+        splits.append((hinge_start + N) // 2)
+
+    # Drop splits that leave segments shorter than min_segment
+    filtered: List[int] = []
+    prev = 0
+    for s in splits:
+        if s - prev >= min_segment:
+            filtered.append(s)
+            prev = s
+    if filtered and (N - filtered[-1]) < min_segment:
+        filtered.pop()
+
+    return filtered
+
 def _kabsch(P:np.ndarray, Q:np.ndarray)->Tuple[np.ndarray,np.ndarray,float]:
     if P.shape != Q.shape or P.shape[1]!=3: raise ValueError("Kabsch expects matched (K,3)")
     K=P.shape[0]
