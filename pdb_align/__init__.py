@@ -18,6 +18,7 @@ def align(
     mob: str,
     chains_ref=None,
     chains_mob=None,
+    verbose: bool = False,
     **kwargs,
 ) -> "AlignmentResult":
     """
@@ -33,6 +34,9 @@ def align(
         Chains to use from the reference (e.g. ``["A"]``). ``None`` uses all chains.
     chains_mob : list[str] | None
         Chains to use from the mobile structure. ``None`` uses all chains.
+    verbose : bool
+        If ``True``, enable verbose logging in the underlying :class:`PDBAligner`.
+        Default is ``False``.
     **kwargs
         Forwarded to :meth:`PDBAligner.align` (e.g. ``mode``, ``atoms``,
         ``seq_gap_open``, ``min_plddt``).
@@ -41,7 +45,7 @@ def align(
     -------
     AlignmentResult
     """
-    aligner = PDBAligner()
+    aligner = PDBAligner(verbose=verbose)
     aligner.add_reference(ref, chains=chains_ref)
     aligner.add_mobile(mob, chains=chains_mob)
     return aligner.align(**kwargs)
