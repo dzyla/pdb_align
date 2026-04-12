@@ -1,9 +1,11 @@
 import os
 import tempfile
+import warnings
 from typing import Optional, List, Union
 from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
+import pandas as pd
 
 from Bio.PDB import PDBParser, MMCIFParser
 
@@ -588,6 +590,187 @@ view
 
     def __repr__(self):
         return f"<AlignmentResult RMSD: {self.rmsd:.3f}Å, Method: {self._chosen['name']}>"
+
+
+class EnsembleResult:
+    """
+    Holds multiple AlignmentResult objects from an ensemble run against a common
+    reference. Provides PCA, clustering, and summary analysis.
+    """
+
+    def __init__(self, results: List["AlignmentResult"], labels: List[str]):
+        if len(results) != len(labels):
+            raise ValueError("results and labels must have the same length.")
+        self.results = results
+        self.labels = labels
+        self._cluster_labels: Optional[np.ndarray] = None
+        self._feature_matrix: Optional[np.ndarray] = None
+
+    def _get_feature_matrix(self) -> np.ndarray:
+        """N_models x N_common_residues matrix of per-residue RMSD (cached)."""
+        if self._feature_matrix is not None:
+            return self._feature_matrix
+
+        dfs = [r.get_rmsd_df(on="reference") for r in self.results]
+        common = set(dfs[0]["Residue"].tolist())
+        for df in dfs[1:]:
+            common &= set(df["Residue"].tolist())
+        common_sorted = sorted(common)
+
+        matrix = []
+        for df in dfs:
+            indexed = df.set_index("Residue")["RMSD"]
+            row = [float(indexed[res]) if res in indexed.index else 0.0
+                   for res in common_sorted]
+            matrix.append(row)
+
+        self._feature_matrix = np.array(matrix, dtype=float)
+        return self._feature_matrix
+
+    def summary(self) -> pd.DataFrame:
+        """DataFrame with columns: model, rmsd, tm_score, gdt_ts, n_aligned."""
+        rows = []
+        for label, result in zip(self.labels, self.results):
+            gdt_ts = None
+            sg = result._chosen.get("seqguided")
+            sf = result._chosen.get("seqfree")
+            if sg and sg.get("si"):
+                gdt_ts = sg["si"].get("gdt_ts")
+            elif sf:
+                gdt_ts = getattr(sf, "gdt_ts", None)
+
+            try:
+                n_aligned = len(result.get_rmsd_df())
+            except Exception:
+                n_aligned = None
+
+            rows.append({
+                "model": label,
+                "rmsd": result.rmsd,
+                "tm_score": result.tm_score,
+                "gdt_ts": gdt_ts,
+                "n_aligned": n_aligned,
+            })
+        return pd.DataFrame(rows)
+
+    def rmsd_matrix(self) -> pd.DataFrame:
+        """NxN DataFrame of pairwise per-residue RMSD-vector distances between models."""
+        N = len(self.labels)
+        mat = self._get_feature_matrix()
+        pairwise = np.zeros((N, N), dtype=float)
+        for i in range(N):
+            for j in range(i + 1, N):
+                diff = mat[i] - mat[j]
+                d = float(np.sqrt(np.mean(diff ** 2)))
+                pairwise[i, j] = d
+                pairwise[j, i] = d
+        return pd.DataFrame(pairwise, index=self.labels, columns=self.labels)
+
+    def cluster(self, n_clusters: int = None) -> np.ndarray:
+        """
+        K-means clustering on per-residue RMSD vectors.
+
+        If n_clusters is None, auto-selects via elbow method (k=2..8).
+        Stores labels internally for plot_pca(color_by='cluster').
+        Returns integer label array of length N.
+        """
+        from sklearn.cluster import KMeans
+
+        mat = self._get_feature_matrix()
+        N = len(self.results)
+
+        if n_clusters is None:
+            max_k = min(8, N - 1)
+            if max_k < 2:
+                self._cluster_labels = np.zeros(N, dtype=int)
+                return self._cluster_labels
+            ks = list(range(2, max_k + 1))
+            inertias = []
+            for k in ks:
+                km = KMeans(n_clusters=k, random_state=42, n_init=10)
+                km.fit(mat)
+                inertias.append(km.inertia_)
+            if len(inertias) >= 2:
+                diffs = np.diff(inertias)
+                n_clusters = ks[int(np.argmax(np.abs(np.diff(diffs)))) + 1] if len(diffs) >= 2 else 2
+            else:
+                n_clusters = 2
+
+        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        self._cluster_labels = km.fit_predict(mat)
+        return self._cluster_labels
+
+    def plot_pca(self, color_by: str = "cluster", save_path: str = None):
+        """
+        2D PCA of per-residue RMSD vectors, one point per model.
+
+        color_by: 'cluster' | 'rmsd' | 'tm_score'
+        If color_by='cluster' but cluster() not called, falls back to 'rmsd' with a warning.
+        """
+        import matplotlib.pyplot as plt
+        from sklearn.decomposition import PCA
+
+        mat = self._get_feature_matrix()
+        n_components = min(2, mat.shape[0], mat.shape[1])
+        pca = PCA(n_components=n_components)
+        coords = pca.fit_transform(mat)
+        if coords.shape[1] < 2:
+            coords = np.hstack([coords, np.zeros((len(coords), 2 - coords.shape[1]))])
+
+        if color_by == "cluster" and self._cluster_labels is None:
+            warnings.warn(
+                "plot_pca(color_by='cluster') called before cluster() — "
+                "falling back to color_by='rmsd'.",
+                UserWarning,
+                stacklevel=2,
+            )
+            color_by = "rmsd"
+
+        if color_by == "cluster":
+            colors, cmap, clabel = self._cluster_labels, "tab10", "Cluster"
+        elif color_by == "rmsd":
+            colors, cmap, clabel = [r.rmsd or 0.0 for r in self.results], "viridis", "RMSD (Å)"
+        elif color_by == "tm_score":
+            colors, cmap, clabel = [r.tm_score or 0.0 for r in self.results], "plasma", "TM-score"
+        else:
+            raise ValueError(f"color_by must be 'cluster', 'rmsd', or 'tm_score', got {color_by!r}")
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sc = ax.scatter(coords[:, 0], coords[:, 1], c=colors, cmap=cmap, s=60, alpha=0.85)
+        plt.colorbar(sc, ax=ax, label=clabel)
+        var = pca.explained_variance_ratio_
+        ax.set_xlabel(f"PC1 ({var[0]*100:.1f}%)" if len(var) > 0 else "PC1")
+        ax.set_ylabel(f"PC2 ({var[1]*100:.1f}%)" if len(var) > 1 else "PC2")
+        ax.set_title("Structural Ensemble PCA")
+        for i, lbl in enumerate(self.labels):
+            ax.annotate(lbl, (coords[i, 0], coords[i, 1]), fontsize=6, alpha=0.6,
+                        ha="center", va="bottom")
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        return fig
+
+    def plot_dendrogram(self, save_path: str = None):
+        """Hierarchical clustering dendrogram using Ward linkage on per-residue RMSD vectors."""
+        import matplotlib.pyplot as plt
+        from scipy.cluster.hierarchy import dendrogram, linkage
+
+        mat = self._get_feature_matrix()
+        Z = linkage(mat, method="ward")
+        fig, ax = plt.subplots(figsize=(max(8, len(self.labels) * 0.4), 5))
+        dendrogram(Z, labels=self.labels, ax=ax, leaf_rotation=90, leaf_font_size=8)
+        ax.set_title("Structural Ensemble Dendrogram (Ward)")
+        ax.set_ylabel("Distance")
+        fig.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        return fig
+
+    def __repr__(self) -> str:
+        n = len(self.results)
+        preview = self.labels[:3]
+        suffix = "..." if n > 3 else ""
+        return f"<EnsembleResult n_models={n} labels={preview}{suffix}>"
+
 
 def _process_single_alignment(task_payload: dict):
     """

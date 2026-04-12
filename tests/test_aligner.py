@@ -188,3 +188,111 @@ def test_flexible_alignment_produces_domains(tmp_path):
         assert dr.n_residues > 0
     assert result.rmsd is not None
     assert result.rmsd >= 0.0
+
+def _make_mock_result(rmsd_vals, tm_score=0.8):
+    """Build a minimal AlignmentResult-like mock for EnsembleResult testing."""
+    class MockResult(AlignmentResult):
+        def __init__(self, per_res_rmsd, rmsd_val, tm):
+            self._per_res = per_res_rmsd
+            self._rmsd_val = rmsd_val
+            self._tm = tm
+            self.domains = None
+            self.ref_lens = {"A": len(per_res_rmsd)}
+            self.mob_lens = {"A": len(per_res_rmsd)}
+            self._chosen = {"seqguided": None, "seqfree": None, "name": "mock", "reason": ""}
+            self.verbose = False
+
+        @property
+        def rmsd(self):
+            return self._rmsd_val
+
+        @property
+        def tm_score(self):
+            return self._tm
+
+        def get_rmsd_df(self, on="reference"):
+            import pandas as pd
+            import numpy as np
+            n = len(self._per_res)
+            return pd.DataFrame({
+                "Residue": [f"A:{i+1}" for i in range(n)],
+                "Chain": ["A"] * n,
+                "RMSD": np.array(self._per_res, dtype=float),
+            })
+
+    return MockResult(rmsd_vals, rmsd_val=float(sum(rmsd_vals)/len(rmsd_vals)), tm=tm_score)
+
+
+def test_ensemble_result_summary():
+    from pdb_align.aligner import EnsembleResult
+    r1 = _make_mock_result([0.5, 1.0, 0.8])
+    r2 = _make_mock_result([2.0, 1.5, 1.8])
+    ens = EnsembleResult(results=[r1, r2], labels=["model_1", "model_2"])
+    df = ens.summary()
+    assert list(df.columns) == ["model", "rmsd", "tm_score", "gdt_ts", "n_aligned"]
+    assert len(df) == 2
+    assert df.loc[0, "model"] == "model_1"
+
+
+def test_ensemble_result_rmsd_matrix():
+    from pdb_align.aligner import EnsembleResult
+    r1 = _make_mock_result([0.0, 0.0, 0.0])
+    r2 = _make_mock_result([0.0, 0.0, 0.0])
+    ens = EnsembleResult(results=[r1, r2], labels=["m1", "m2"])
+    mat = ens.rmsd_matrix()
+    assert mat.shape == (2, 2)
+    assert mat.loc["m1", "m2"] == pytest.approx(0.0)
+    assert mat.loc["m1", "m1"] == pytest.approx(0.0)
+
+
+def test_ensemble_result_cluster_returns_labels():
+    from pdb_align.aligner import EnsembleResult
+    results = [_make_mock_result([float(i)] * 10) for i in range(6)]
+    labels = [f"m{i}" for i in range(6)]
+    ens = EnsembleResult(results=results, labels=labels)
+    cluster_labels = ens.cluster(n_clusters=2)
+    assert len(cluster_labels) == 6
+    assert set(cluster_labels).issubset({0, 1})
+
+
+def test_ensemble_result_plot_pca_returns_figure():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from pdb_align.aligner import EnsembleResult
+    results = [_make_mock_result([float(i)] * 10) for i in range(6)]
+    labels = [f"m{i}" for i in range(6)]
+    ens = EnsembleResult(results=results, labels=labels)
+    ens.cluster(n_clusters=2)
+    fig = ens.plot_pca(color_by="cluster")
+    assert isinstance(fig, plt.Figure)
+    plt.close("all")
+
+
+def test_ensemble_result_plot_pca_fallback_without_cluster():
+    """plot_pca with color_by='cluster' but no prior cluster() → warns and falls back to rmsd."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import warnings
+    from pdb_align.aligner import EnsembleResult
+    results = [_make_mock_result([float(i)] * 10) for i in range(4)]
+    ens = EnsembleResult(results=results, labels=[f"m{i}" for i in range(4)])
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        fig = ens.plot_pca(color_by="cluster")
+        assert any("cluster" in str(warning.message).lower() for warning in w)
+    plt.close("all")
+
+
+def test_ensemble_result_plot_dendrogram_returns_figure():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from pdb_align.aligner import EnsembleResult
+    results = [_make_mock_result([float(i)] * 10) for i in range(4)]
+    labels = [f"m{i}" for i in range(4)]
+    ens = EnsembleResult(results=results, labels=labels)
+    fig = ens.plot_dendrogram()
+    assert isinstance(fig, plt.Figure)
+    plt.close("all")
