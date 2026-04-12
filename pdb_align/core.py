@@ -316,10 +316,11 @@ def _detect_hinges(
         if s - prev >= min_segment:
             filtered.append(s)
             prev = s
-    if filtered and (N - filtered[-1]) < min_segment:
+    while filtered and (N - filtered[-1]) < min_segment:
         filtered.pop()
 
     return filtered
+
 
 def _kabsch(P:np.ndarray, Q:np.ndarray)->Tuple[np.ndarray,np.ndarray,float]:
     if P.shape != Q.shape or P.shape[1]!=3: raise ValueError("Kabsch expects matched (K,3)")
