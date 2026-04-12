@@ -628,6 +628,7 @@ class PDBAligner:
         self.chains_mob = None
 
         self.last_result = None
+        self._struct_cache: dict = {}  # path -> gemmi.Structure
 
         if ref_file:
             self.set_reference(ref_file, chains_ref)
@@ -669,7 +670,9 @@ class PDBAligner:
             raise FileNotFoundError(f"Reference file not found: {ref_file}")
         self.ref_file = ref_file
         self.chains_ref = chains
-        self.ref_struct = _parse_path(ref_file)
+        if ref_file not in self._struct_cache:
+            self._struct_cache[ref_file] = _parse_path(ref_file)
+        self.ref_struct = self._struct_cache[ref_file]
         self.ref_seqs, self.ref_lens = extract_sequences_and_lengths(self.ref_struct, os.path.basename(ref_file))
         if self.verbose:
             print(f"Reference set to: {self.ref_file}")
@@ -683,7 +686,9 @@ class PDBAligner:
             raise FileNotFoundError(f"Mobile file not found: {mob_file}")
         self.mob_file = mob_file
         self.chains_mob = chains
-        self.mob_struct = _parse_path(mob_file)
+        if mob_file not in self._struct_cache:
+            self._struct_cache[mob_file] = _parse_path(mob_file)
+        self.mob_struct = self._struct_cache[mob_file]
         self.mob_seqs, self.mob_lens = extract_sequences_and_lengths(self.mob_struct, os.path.basename(mob_file))
         if self.verbose:
             print(f"Mobile set to: {self.mob_file}")
