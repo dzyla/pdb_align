@@ -72,3 +72,65 @@ END
     assert isinstance(result, AlignmentResult)
     assert result.rmsd is not None
     assert result.rmsd >= 0.0
+
+
+from pdb_align.aligner import DomainResult
+
+
+def test_domain_result_creation():
+    """DomainResult should hold all expected fields."""
+    import numpy as np
+    dr = DomainResult(
+        domain_id=0,
+        chain_id="A",
+        residue_start=1,
+        residue_end=80,
+        n_residues=80,
+        rmsd=1.5,
+        rotation=np.eye(3),
+        translation=np.zeros(3),
+    )
+    assert dr.domain_id == 0
+    assert dr.chain_id == "A"
+    assert dr.n_residues == 80
+    assert dr.rmsd == 1.5
+
+
+def test_alignment_result_domains_none_by_default(tmp_path):
+    """AlignmentResult.domains should be None when mode is not flexible."""
+    pdb_content = """\
+ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00           C
+ATOM      2  CA  ALA A   2       4.000   5.000   6.000  1.00  0.00           C
+ATOM      3  CA  ALA A   3       7.000   8.000   9.000  1.00  0.00           C
+END
+"""
+    ref = tmp_path / "ref.pdb"
+    mob = tmp_path / "mob.pdb"
+    ref.write_text(pdb_content)
+    mob.write_text(pdb_content)
+
+    aligner = PDBAligner()
+    aligner.add_reference(str(ref))
+    aligner.add_mobile(str(mob))
+    result = aligner.align(mode="auto")
+    assert result.domains is None
+
+
+def test_alignment_result_flexible_rmsd_weighted_average():
+    """AlignmentResult.rmsd returns weighted average when domains are set."""
+    import numpy as np
+    from pdb_align.aligner import AlignmentResult, DomainResult
+
+    chosen = {"seqguided": None, "seqfree": None, "name": "flexible", "reason": "test"}
+
+    dr1 = DomainResult(0, "A", 1, 50, 50, rmsd=1.0, rotation=np.eye(3), translation=np.zeros(3))
+    dr2 = DomainResult(1, "A", 51, 100, 50, rmsd=3.0, rotation=np.eye(3), translation=np.zeros(3))
+
+    result = AlignmentResult(
+        chosen=chosen, seqguided=None, seqfree=None,
+        ref_file="ref.pdb", mob_file="mob.pdb", mob_struct=None,
+        ref_lens={"A": 100}, mob_lens={"A": 100},
+        domains=[dr1, dr2],
+    )
+    # Weighted average: (1.0*50 + 3.0*50) / 100 = 2.0
+    assert result.rmsd == pytest.approx(2.0)

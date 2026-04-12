@@ -1,6 +1,8 @@
 import os
 import tempfile
 from typing import Optional, List, Union
+from dataclasses import dataclass
+import numpy as np
 import numpy.typing as npt
 
 from Bio.PDB import PDBParser, MMCIFParser
@@ -20,12 +22,26 @@ class ChainNotFoundError(Exception):
     """Raised when a requested chain is not found in the structure."""
     pass
 
+@dataclass
+class DomainResult:
+    """Per-domain alignment result produced by mode='flexible'."""
+    domain_id: int
+    chain_id: str
+    residue_start: int
+    residue_end: int
+    n_residues: int
+    rmsd: float
+    rotation: "np.ndarray"   # (3, 3)
+    translation: "np.ndarray"  # (3,)
+
 class AlignmentResult:
     """
     Encapsulates the result of a structural alignment, providing a clean, stateless
     interface to properties like RMSD, matrices, and plotting tools.
     """
-    def __init__(self, chosen: dict, seqguided: dict, seqfree: dict, ref_file: str, mob_file: str, mob_struct, ref_lens: dict, mob_lens: dict, verbose: bool = False):
+    def __init__(self, chosen: dict, seqguided: dict, seqfree: dict, ref_file: str,
+                 mob_file: str, mob_struct, ref_lens: dict, mob_lens: dict,
+                 verbose: bool = False, domains=None):
         self._chosen = chosen
         self._seqguided = seqguided
         self._seqfree = seqfree
@@ -35,9 +51,16 @@ class AlignmentResult:
         self.ref_lens = ref_lens
         self.mob_lens = mob_lens
         self.verbose = verbose
+        self.domains = domains  # List[DomainResult] or None
 
     @property
     def rmsd(self) -> Optional[float]:
+        # flexible mode: weighted average of domain RMSDs by residue count
+        if self.domains is not None:
+            total = sum(d.n_residues for d in self.domains)
+            if total == 0:
+                return None
+            return sum(d.rmsd * d.n_residues for d in self.domains) / total
         if self._chosen["seqguided"]:
             return self._chosen["seqguided"]["si"]["rmsd"]
         elif self._chosen["seqfree"]:
