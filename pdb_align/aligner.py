@@ -13,13 +13,10 @@ from .core import (
     perform_sequence_alignment, get_aligned_atoms_by_alignment,
     superimpose_atoms, pick_best_overall, compute_chain_similarity_matrix
 )
+from .exceptions import ParsingError, ChainNotFoundError
 
 class AlignmentFailedError(Exception):
     """Raised when the alignment fails to produce a viable result."""
-    pass
-
-class ChainNotFoundError(Exception):
-    """Raised when a requested chain is not found in the structure."""
     pass
 
 @dataclass
@@ -41,7 +38,7 @@ class AlignmentResult:
     """
     def __init__(self, chosen: dict, seqguided: dict, seqfree: dict, ref_file: str,
                  mob_file: str, mob_struct, ref_lens: dict, mob_lens: dict,
-                 verbose: bool = False, domains=None):
+                 verbose: bool = False, domains: Optional[List["DomainResult"]] = None):
         self._chosen = chosen
         self._seqguided = seqguided
         self._seqfree = seqfree

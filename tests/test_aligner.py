@@ -4,7 +4,8 @@ import pytest
 from unittest.mock import patch
 import gemmi
 
-from pdb_align.aligner import PDBAligner
+import pdb_align
+from pdb_align.aligner import PDBAligner, AlignmentResult, DomainResult
 
 
 def test_structure_cache_set_reference(tmp_path):
@@ -65,16 +66,15 @@ END
     ref.write_text(pdb_content)
     mob.write_text(pdb_content)
 
-    import pdb_align
-    from pdb_align.aligner import AlignmentResult
-
     result = pdb_align.align(str(ref), str(mob))
     assert isinstance(result, AlignmentResult)
     assert result.rmsd is not None
     assert result.rmsd >= 0.0
 
-
-from pdb_align.aligner import DomainResult
+    # verify chain filtering is forwarded correctly
+    result_chain = pdb_align.align(str(ref), str(mob), chains_ref=["A"], chains_mob=["A"])
+    assert isinstance(result_chain, AlignmentResult)
+    assert result_chain.rmsd is not None
 
 
 def test_domain_result_creation():
@@ -119,7 +119,6 @@ END
 def test_alignment_result_flexible_rmsd_weighted_average():
     """AlignmentResult.rmsd returns weighted average when domains are set."""
     import numpy as np
-    from pdb_align.aligner import AlignmentResult, DomainResult
 
     chosen = {"seqguided": None, "seqfree": None, "name": "flexible", "reason": "test"}
 
