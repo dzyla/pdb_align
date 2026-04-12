@@ -11,7 +11,8 @@ from .core import (
     extract_sequences_and_lengths, _parse_path,
     sequence_independent_alignment_joined_v2,
     perform_sequence_alignment, get_aligned_atoms_by_alignment,
-    superimpose_atoms, pick_best_overall, compute_chain_similarity_matrix
+    superimpose_atoms, pick_best_overall, compute_chain_similarity_matrix,
+    _detect_hinges, _kabsch,
 )
 from .exceptions import ParsingError, ChainNotFoundError
 
@@ -743,7 +744,11 @@ class PDBAligner:
         if self.verbose:
             print(f"Mobile chains updated to: {chains}")
 
-    def align(self, mode: str = "auto", seq_gap_open: float = -10, seq_gap_extend: float = -0.5, atoms: str = "CA", min_plddt: float = 0.0, min_b_factor: float = 0.0, **kwargs):
+    def align(self, mode: str = "auto", seq_gap_open: float = -10,
+              seq_gap_extend: float = -0.5, atoms: str = "CA",
+              min_plddt: float = 0.0, min_b_factor: float = 0.0,
+              hinge_threshold: float = 3.0, hinge_window: int = 15,
+              domain_min_residues: int = 30, **kwargs):
         """
         Runs the alignment process.
 
@@ -767,6 +772,65 @@ class PDBAligner:
         :returns: An AlignmentResult object containing transformation matrices, matched pairs, and metrics.
         :rtype: AlignmentResult
         """
+        # --- flexible domain alignment ---
+        if mode == "flexible":
+            import numpy as np
+            # Step 1: run auto alignment to get matched atom pairs
+            initial = self.align(
+                mode="auto",
+                seq_gap_open=seq_gap_open, seq_gap_extend=seq_gap_extend,
+                atoms=atoms, min_plddt=min_plddt, min_b_factor=min_b_factor,
+                **kwargs,
+            )
+            if initial._chosen.get("seqguided") is None:
+                return initial
+
+            sg = initial._chosen["seqguided"]
+            ref_atoms = sg["ref_atoms"]
+            mob_atoms = sg["mob_atoms"]
+            per_res = sg["si"]["per_residue_rmsd"]
+
+            # Filter to CA atoms for hinge detection
+            ca_idx = [i for i, a in enumerate(ref_atoms) if a.get_name() == "CA"]
+            if not ca_idx:
+                return initial
+
+            ca_rmsd = per_res[ca_idx]
+            ca_ref = [ref_atoms[i] for i in ca_idx]
+            ca_mob = [mob_atoms[i] for i in ca_idx]
+
+            splits = _detect_hinges(
+                ca_rmsd,
+                window=hinge_window,
+                threshold=hinge_threshold,
+                min_segment=domain_min_residues,
+            )
+
+            boundaries = [0] + splits + [len(ca_ref)]
+            domains = []
+            for d_id, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+                seg_ref = ca_ref[start:end]
+                seg_mob = ca_mob[start:end]
+                if len(seg_ref) < 3:
+                    continue
+                ref_coords = np.array([a.get_coord() for a in seg_ref])
+                mob_coords = np.array([a.get_coord() for a in seg_mob])
+                R, t, rmsd = _kabsch(ref_coords, mob_coords)
+
+                domains.append(DomainResult(
+                    domain_id=d_id,
+                    chain_id=seg_ref[0].chain_name,
+                    residue_start=int(seg_ref[0].res_seq),
+                    residue_end=int(seg_ref[-1].res_seq),
+                    n_residues=len(seg_ref),
+                    rmsd=float(rmsd),
+                    rotation=R,
+                    translation=t,
+                ))
+
+            initial.domains = domains if domains else None
+            return initial
+
         if not self.ref_file or not self.mob_file:
             raise ValueError("Both reference and mobile structures must be set before alignment.")
 

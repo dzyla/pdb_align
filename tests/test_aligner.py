@@ -133,3 +133,58 @@ def test_alignment_result_flexible_rmsd_weighted_average():
     )
     # Weighted average: (1.0*50 + 3.0*50) / 100 = 2.0
     assert result.rmsd == pytest.approx(2.0)
+
+
+def test_flexible_alignment_produces_domains(tmp_path):
+    """mode='flexible' should return an AlignmentResult with .domains populated."""
+    import numpy as np
+    import math
+
+    # Reference: 60-residue straight chain along X
+    ref_lines = []
+    atom_num = 1
+    for i in range(60):
+        x = float(i) * 3.8
+        ref_lines.append(
+            f"ATOM  {atom_num:5d}  CA  ALA A{i+1:4d}    {x:8.3f}   0.000   0.000  1.00  0.00           C"
+        )
+        atom_num += 1
+    ref_lines.append("END")
+
+    # Mobile: first 30 residues same as ref; last 30 rotated 45° in XY plane
+    mob_lines = []
+    atom_num = 1
+    for i in range(30):
+        x = float(i) * 3.8
+        mob_lines.append(
+            f"ATOM  {atom_num:5d}  CA  ALA A{i+1:4d}    {x:8.3f}   0.000   0.000  1.00  0.00           C"
+        )
+        atom_num += 1
+    angle = math.radians(45)
+    for i in range(30):
+        x_orig = float(i + 30) * 3.8
+        x = x_orig * math.cos(angle)
+        y = x_orig * math.sin(angle)
+        mob_lines.append(
+            f"ATOM  {atom_num:5d}  CA  ALA A{i+31:4d}    {x:8.3f} {y:8.3f}   0.000  1.00  0.00           C"
+        )
+        atom_num += 1
+    mob_lines.append("END")
+
+    ref = tmp_path / "ref.pdb"
+    mob = tmp_path / "mob.pdb"
+    ref.write_text("\n".join(ref_lines))
+    mob.write_text("\n".join(mob_lines))
+
+    aligner = PDBAligner()
+    aligner.add_reference(str(ref))
+    aligner.add_mobile(str(mob))
+    result = aligner.align(mode="flexible", hinge_threshold=2.0, domain_min_residues=10)
+
+    assert result.domains is not None
+    assert len(result.domains) >= 1
+    for dr in result.domains:
+        assert dr.rmsd >= 0.0
+        assert dr.n_residues > 0
+    assert result.rmsd is not None
+    assert result.rmsd >= 0.0
