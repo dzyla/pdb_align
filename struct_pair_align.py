@@ -398,6 +398,22 @@ class _ChainSelect(Select):
         if chain.id in self.chains: return 1
         return 0
 
+def _remap_long_chain_ids(structure):
+    """Rename chains whose IDs exceed 1 character (PDB format limit) to single-char IDs."""
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    used = {chain.id for model in structure for chain in model if len(chain.id) == 1}
+    replacements = {}
+    for model in structure:
+        for chain in model:
+            if len(chain.id) > 1:
+                if chain.id not in replacements:
+                    for c in alphabet:
+                        if c not in used:
+                            replacements[chain.id] = c
+                            used.add(c)
+                            break
+                chain.id = replacements.get(chain.id, chain.id[0])
+
 def _generate_4_pdbs(ref_file: str, mob_file: str, ref_chains: list, mob_chains: list, R: np.ndarray, t: np.ndarray):
     pathA, pathB = write_uploads_to_temp_files(ref_file, mob_file)
     parserA = MMCIFParser(QUIET=True) if pathA.lower().endswith((".cif",".mmcif")) else PDBParser(QUIET=True)
@@ -405,6 +421,9 @@ def _generate_4_pdbs(ref_file: str, mob_file: str, ref_chains: list, mob_chains:
     
     ref_struct = parserA.get_structure("ref", pathA)
     mob_struct = parserB.get_structure("mob", pathB)
+
+    _remap_long_chain_ids(ref_struct)
+    _remap_long_chain_ids(mob_struct)
 
     for model in mob_struct:
         for atom in model.get_atoms():

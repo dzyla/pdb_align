@@ -616,6 +616,11 @@ class EnsembleResult:
         for df in dfs[1:]:
             common &= set(df["Residue"].tolist())
         common_sorted = sorted(common)
+        if not common_sorted:
+            raise ValueError(
+                "No common residue identifiers found across all models. "
+                "Ensure all structures are aligned to the same reference numbering."
+            )
 
         matrix = []
         for df in dfs:
@@ -691,8 +696,8 @@ class EnsembleResult:
                 km.fit(mat)
                 inertias.append(km.inertia_)
             if len(inertias) >= 2:
-                diffs = np.diff(inertias)
-                n_clusters = ks[int(np.argmax(np.abs(np.diff(diffs)))) + 1] if len(diffs) >= 2 else 2
+                # Standard elbow: k where the drop in inertia is greatest
+                n_clusters = ks[int(np.argmax(-np.diff(inertias)))]
             else:
                 n_clusters = 2
 
@@ -967,7 +972,9 @@ class PDBAligner:
             if initial._chosen.get("seqguided") is None:
                 warnings.warn(
                     "mode='flexible': no sequence-guided alignment available; "
-                    "returning rigid-body result without domain decomposition."
+                    "returning rigid-body result without domain decomposition.",
+                    UserWarning,
+                    stacklevel=2,
                 )
                 return initial
 
@@ -981,7 +988,9 @@ class PDBAligner:
             if not ca_idx:
                 warnings.warn(
                     "mode='flexible': no CA atoms found in alignment; "
-                    "returning rigid-body result without domain decomposition."
+                    "returning rigid-body result without domain decomposition.",
+                    UserWarning,
+                    stacklevel=2,
                 )
                 return initial
 
