@@ -617,7 +617,7 @@ with st.sidebar:
         old_names = sorted(list(st.session_state.structures.keys()))
         if new_names != old_names:
             st.session_state.structures.clear(); st.session_state.sequences.clear(); st.session_state.chain_lengths.clear()
-            st.session_state.last_run_summary = [r for r in st.session_state.last_run_summary if r["mob_file"] in new_names and st.session_state.get("selected_ref_file") in new_names]
+            st.session_state.last_run_summary = [r for r in (st.session_state.last_run_summary or []) if r["mob_file"] in new_names and st.session_state.get("selected_ref_file") in new_names]
             with st.spinner("Parsing structures..."):
                 for f in current_blobs:
                     s, err = parse_structure(f)
