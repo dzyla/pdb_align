@@ -1,130 +1,146 @@
 # pdb_align
-Align two PDB structures and explore local differences.
+Align protein structures and explore local differences — pairwise, domain-flexible, or across full ensembles.
 
-This package provides a robust Python library for scripting high-throughput structural bioinformatics tasks, as well as an interactive Streamlit frontend application.
+This package provides a Python library for structural bioinformatics scripting and an interactive Streamlit web app.
 
 ## Installation
 
-Install the package via `pip` locally. For the core Python API only:
-
+Core library only:
 ```bash
 pip install -e .
 ```
 
-To install with full App and Visualization extras (required for Streamlit and Py3Dmol plotting):
-
+With Streamlit app and visualization extras (Py3Dmol, Plotly):
 ```bash
 pip install -e .[app]
 ```
 
 ## Streamlit App
 
-We provide an interactive web application built with Streamlit and Py3Dmol to visualize the alignment.
-
-To launch the app locally:
+Launch locally:
 ```bash
 streamlit run struct_pair_align.py
 ```
 
-**Features of the Streamlit App:**
-- File uploads for reference and mobile structures
-- Interactive Py3Dmol rendering (cartoon views colored by B-factor/RMSD)
-- Sequence-guided and Sequence-free (shape/window) alignment modes
-- Downloadable alignment data (CSVs, Fasta, ZIPs)
+**Features:**
+- File uploads for reference and mobile structures (PDB, mmCIF)
+- Remote fetch from RCSB PDB (`pdb:XXXX`) and AlphaFold DB (`af:UniProtID`)
+- Sequence-guided and shape/window alignment modes
+- Interactive Py3Dmol 3D views colored by RMSD or B-factor
+- Per-residue RMSD plots and downloadable outputs (CSV, FASTA, ZIP, PyMOL/ChimeraX scripts)
 
-## Python Library Usage
+---
 
-You can use the alignment core logic programmatically as a Python library.
+## Python Library
 
-### Usage
-
-The package provides a robust interface via the `PDBAligner` class allowing structural alignment, data extractions, and batch processing. It can be initialized with `verbose=True` to print detailed runtime information, sequence similarity matrices, and alignment strategies.
-
-## API Documentation
-
-Below is a detailed guide ("wiki") covering the functionalities available within the `PDBAligner` API.
+### One-liner alignment
 
 ```python
-from pdb_align.aligner import PDBAligner
+import pdb_align
 
-# 1. Initialization
-# =================
-# Enable verbose logging to see step-by-step processing, matrix outputs, and reasoning.
+result = pdb_align.align("pdb:8UUP", "af:P00533", chains_ref=["A"], chains_mob=["A"])
+print(result.rmsd, result.tm_score)
+```
+
+### Full API via `PDBAligner`
+
+```python
+from pdb_align import PDBAligner
+
 aligner = PDBAligner(verbose=True)
 
-# 2. Loading Structures and Chains
-# ================================
-# The API automatically handles remote fetching from the RCSB PDB or AlphaFold DB
-aligner.add_reference("pdb:8UUP", chains=["A:10-150", "B"]) # Subdomain selection supported
+# Load structures — local files, PDB IDs, or AlphaFold IDs
+aligner.add_reference("pdb:8UUP", chains=["A:10-150", "B"])
 aligner.add_mobile("af:P00533", chains=["A"])
 
-# Need to update selected chains later? No problem:
-aligner.set_reference_chains(["A"])
-aligner.set_mobile_chains(["A"])
+# Align (mode: "auto", "seq_guided", "seq_free_shape", "seq_free_window", "flexible")
+result = aligner.align(mode="auto", atoms="CA")
 
-# 3. Alignment Execution
-# ======================
-# mode: "auto", "seq_guided", "seq_free_shape", "seq_free_window"
-# atoms: "CA" (default), "backbone", or "all_heavy"
-# Returns a state-free `AlignmentResult` object.
-result = aligner.align(mode="auto", atoms="backbone", seq_gap_open=-10.0, seq_gap_extend=-0.5)
+print(f"RMSD:     {result.rmsd:.3f} Å")
+print(f"TM-score: {result.tm_score:.3f}")
+```
 
-# 4. Accessing Data
-# =================
-print(f"RMSD: {result.rmsd}")                   # Properties evaluated dynamically
-print(f"TM-Score: {result.tm_score}")
+### Domain-flexible alignment
 
-ref_coords, mob_coords = result.get_aligned_coords()
-matched_pairs = result.get_matched_pairs()
-rotation = result.rotation_matrix               # Rotation matrix (numpy)
-translation = result.translation_vector         # Translation vector (numpy)
+For structures with large conformational changes (e.g., multi-domain proteins, hinge motions):
 
-# 5. Sequence Alignments
-# ======================
-# Structure-based Sequence Alignment (based on 3D proximity):
-seqA, seqB, score = result.get_structure_based_sequence_alignment()
-result.print_sequence_alignment() # Prints formatted structure-based alignment
+```python
+result = aligner.align(
+    mode="flexible",
+    hinge_threshold=3.0,   # local RMSD (Å) above which a position is a hinge
+    hinge_window=15,        # sliding-window width for RMSD smoothing
+    domain_min_residues=30, # minimum residues per domain
+)
 
-# Export structural alignment directly to FASTA:
-result.save_sequence_alignment_fasta("alignment.fasta")
+for domain in result.domains:
+    print(f"Domain {domain.domain_id}: residues {domain.residue_start}–{domain.residue_end}, RMSD={domain.rmsd:.2f} Å")
 
-# General/Classic Sequence Alignment (pure 1D string matching between specified chains):
-# Note: general alignment lives on the base aligner class since it is structure-independent
-aligner.print_general_sequence_alignment(ref_chain="A", mob_chain="A")
+print(f"Weighted RMSD: {result.rmsd:.3f} Å")  # residue-count-weighted average
+```
 
-# 6. Exploring Local Structural Deviations
-# ========================================
-# Report the highest C-alpha RMSD peaks ("on" specifies numbering format: 'reference' or 'mobile')
+### Ensemble alignment
+
+Align 10–50 models against a common reference (e.g., cryo-EM heterogeneous refinement):
+
+```python
+aligner.add_reference("reference.pdb")
+
+ens = aligner.align_ensemble(
+    mob_list=["model_001.pdb", "model_002.pdb", ...],
+    mode="auto",
+    out_dir="aligned/",   # optional: save aligned PDBs
+)
+
+# Summary table (model, rmsd, tm_score, gdt_ts, n_aligned)
+print(ens.summary())
+
+# Conformational landscape via PCA
+ens.cluster(n_clusters=3)
+fig = ens.plot_pca(color_by="cluster")
+fig.savefig("pca.png")
+
+# Hierarchical clustering dendrogram
+fig = ens.plot_dendrogram()
+fig.savefig("dendrogram.png")
+
+# Pairwise RMSD matrix
+mat = ens.rmsd_matrix()
+```
+
+### Per-residue analysis and exports
+
+```python
+# Per-residue RMSD as DataFrame
+df = result.get_rmsd_df(on="reference")
+result.save_rmsd_csv("rmsd.csv")
+result.plot_rmsd("rmsd_plot.pdf", style="scientific")
+
+# Top deviation hotspots
 peaks = result.report_peaks(on="reference", top_n=5)
 
-# Retrieve per-residue RMSD as a pandas DataFrame:
-df = result.get_rmsd_df(on="reference")
-# Or directly save it to CSV:
-result.save_rmsd_csv("rmsd.csv", on="reference")
+# Sequence alignment from structure
+result.print_sequence_alignment()
+result.save_sequence_alignment_fasta("alignment.fasta")
 
-# Plot per-residue structural deviation (lines separated by chain hue)
-# Supports publication-ready 'scientific' styling natively.
-result.plot_rmsd("rmsd_plot.pdf", style="scientific", on="reference")
-
-# 7. Batch Processing & Exports
-# =============================
+# Save aligned coordinates
 result.save_aligned_pdb("aligned_mobile.pdb")
-result.save_log("alignment_log.txt") # Save formatted summary of run
 
-# Generate a PyMOL or ChimeraX script that automatically loads both structures,
-# applies the transformation, and visualizes the mobile chain colored by local RMSD.
-result.save_pymol_script("visualization.pml", aligned_mobile_filename="aligned_mobile.pdb")
-result.save_chimerax_script("visualization.cxc", aligned_mobile_filename="aligned_mobile.pdb")
+# Visualization scripts
+result.save_pymol_script("view.pml", aligned_mobile_filename="aligned_mobile.pdb")
+result.save_chimerax_script("view.cxc", aligned_mobile_filename="aligned_mobile.pdb")
+```
 
-# Batch process a whole directory across multiple cores natively
-# Using the iterative generator allows tracking progress natively
-for fname, res in aligner.batch_align_iter(mob_dir="path/", out_dir="out/", mode="auto", workers=4):
-    print(f"Processed {fname} with TM-Score: {res.get('tm_score')}")
+### Batch processing
 
-# Or get a pandas DataFrame immediately
-df_batch = aligner.batch_align(mob_dir="path/", out_dir="out/", mode="auto", workers=4)
+```python
+# Align all PDBs in a directory, returns a DataFrame
+df_batch = aligner.batch_align(mob_dir="models/", out_dir="out/", mode="auto", workers=4)
 
-# And then calculate ensemble-wide metrics across all targets
+# Or iterate for progress tracking
+for fname, res in aligner.batch_align_iter(mob_dir="models/", out_dir="out/", workers=4):
+    print(f"{fname}: RMSD={res.get('rmsd'):.3f}")
+
+# Ensemble statistics across all models
 stats = aligner.get_ensemble_statistics(df_batch)
-print(stats) # Mean RMSD, Median TM-score, etc.
+print(stats)  # mean RMSD, median TM-score, etc.
 ```
