@@ -296,3 +296,60 @@ def test_ensemble_result_plot_dendrogram_returns_figure():
     fig = ens.plot_dendrogram()
     assert isinstance(fig, plt.Figure)
     plt.close("all")
+
+
+def test_align_ensemble_returns_ensemble_result(tmp_path):
+    """align_ensemble() on a list of identical structures returns EnsembleResult."""
+    pdb_content = """\
+ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00           C
+ATOM      2  CA  ALA A   2       4.000   5.000   6.000  1.00  0.00           C
+ATOM      3  CA  ALA A   3       7.000   8.000   9.000  1.00  0.00           C
+ATOM      4  CA  ALA A   4      10.000  11.000  12.000  1.00  0.00           C
+ATOM      5  CA  ALA A   5      13.000  14.000  15.000  1.00  0.00           C
+END
+"""
+    ref = tmp_path / "ref.pdb"
+    ref.write_text(pdb_content)
+
+    mob_files = []
+    for i in range(3):
+        mob = tmp_path / f"mob_{i}.pdb"
+        mob.write_text(pdb_content)
+        mob_files.append(str(mob))
+
+    aligner = PDBAligner()
+    aligner.add_reference(str(ref))
+    ens = aligner.align_ensemble(mob_files)
+
+    from pdb_align.aligner import EnsembleResult
+    assert isinstance(ens, EnsembleResult)
+    assert len(ens.results) == 3
+    assert len(ens.labels) == 3
+    for r in ens.results:
+        assert r.rmsd is not None
+        assert r.rmsd >= 0.0
+
+
+def test_align_ensemble_summary_shape(tmp_path):
+    """summary() on ensemble of 3 models returns 3-row DataFrame."""
+    pdb_content = """\
+ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00           C
+ATOM      2  CA  ALA A   2       4.000   5.000   6.000  1.00  0.00           C
+ATOM      3  CA  ALA A   3       7.000   8.000   9.000  1.00  0.00           C
+ATOM      4  CA  ALA A   4      10.000  11.000  12.000  1.00  0.00           C
+ATOM      5  CA  ALA A   5      13.000  14.000  15.000  1.00  0.00           C
+END
+"""
+    ref = tmp_path / "ref.pdb"
+    ref.write_text(pdb_content)
+    mob_files = []
+    for i in range(3):
+        mob = tmp_path / f"mob_{i}.pdb"
+        mob.write_text(pdb_content)
+        mob_files.append(str(mob))
+
+    aligner = PDBAligner()
+    aligner.add_reference(str(ref))
+    ens = aligner.align_ensemble(mob_files)
+    df = ens.summary()
+    assert df.shape[0] == 3

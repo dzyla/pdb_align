@@ -1181,8 +1181,66 @@ class PDBAligner:
             
         best_chain = self.find_binder_target_chain(binder_chains, candidate_chains)
         self.set_mobile_chains([best_chain])
-        
+
         return self.align(mode=mode, seq_gap_open=seq_gap_open, seq_gap_extend=seq_gap_extend, atoms=atoms, **kwargs)
+
+    def align_ensemble(
+        self,
+        mob_list: List[str],
+        mode: str = "auto",
+        atoms: str = "CA",
+        workers: int = 1,
+        out_dir: Optional[str] = None,
+        **kwargs,
+    ) -> "EnsembleResult":
+        """
+        Align a list of mobile structures against the already-loaded reference.
+
+        Parameters
+        ----------
+        mob_list : list[str]
+            Paths to mobile PDB/CIF files, or remote IDs (``pdb:XXXX``, ``af:UniProtID``).
+        mode : str
+            Alignment mode forwarded to :meth:`align`. Default ``"auto"``.
+        atoms : str
+            Atom selection forwarded to :meth:`align`. Default ``"CA"``.
+        workers : int
+            Reserved for future parallel execution. Currently unused. Default ``1``.
+        out_dir : str | None
+            If given, each aligned mobile PDB is saved here as ``aligned_<filename>``.
+        **kwargs
+            Additional keyword arguments forwarded to :meth:`align`.
+
+        Returns
+        -------
+        EnsembleResult
+        """
+        if not self.ref_file:
+            raise ValueError("Reference structure must be loaded before calling align_ensemble().")
+
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        results = []
+        labels = []
+
+        for mob_path in mob_list:
+            fname = os.path.basename(mob_path)
+            try:
+                self.add_mobile(mob_path)
+                res = self.align(mode=mode, atoms=atoms, **kwargs)
+                if out_dir:
+                    out_pdb = os.path.join(out_dir, f"aligned_{fname}")
+                    res.save_aligned_pdb(out_pdb)
+                results.append(res)
+                labels.append(fname)
+                if self.verbose:
+                    print(f"align_ensemble: {fname} → RMSD={res.rmsd:.3f} Å")
+            except Exception as exc:
+                if self.verbose:
+                    print(f"align_ensemble: {fname} failed — {exc}")
+
+        return EnsembleResult(results=results, labels=labels)
 
     def batch_align_iter(self, mob_dir: str, out_dir: str, mode: str = "auto", workers: int = 1, **kwargs):
         """
