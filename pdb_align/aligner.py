@@ -1225,20 +1225,27 @@ class PDBAligner:
         labels = []
 
         for mob_path in mob_list:
-            fname = os.path.basename(mob_path)
+            label = mob_path  # preserve original input as label
             try:
                 self.add_mobile(mob_path)
+                # Use the resolved local path for filesystem operations
+                safe_fname = os.path.basename(self.mob_file or mob_path)
                 res = self.align(mode=mode, atoms=atoms, **kwargs)
                 if out_dir:
-                    out_pdb = os.path.join(out_dir, f"aligned_{fname}")
+                    out_pdb = os.path.join(out_dir, f"aligned_{safe_fname}")
                     res.save_aligned_pdb(out_pdb)
                 results.append(res)
-                labels.append(fname)
+                labels.append(label)
                 if self.verbose:
-                    print(f"align_ensemble: {fname} → RMSD={res.rmsd:.3f} Å")
+                    print(f"align_ensemble: {label} → RMSD={res.rmsd:.3f} Å")
             except Exception as exc:
+                warnings.warn(
+                    f"align_ensemble: skipping '{label}' — {exc}",
+                    UserWarning,
+                    stacklevel=2,
+                )
                 if self.verbose:
-                    print(f"align_ensemble: {fname} failed — {exc}")
+                    print(f"align_ensemble: {label} failed — {exc}")
 
         return EnsembleResult(results=results, labels=labels)
 

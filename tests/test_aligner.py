@@ -353,3 +353,36 @@ END
     ens = aligner.align_ensemble(mob_files)
     df = ens.summary()
     assert df.shape[0] == 3
+
+
+def test_align_ensemble_out_dir(tmp_path):
+    """align_ensemble with out_dir saves aligned_<filename> files."""
+    pdb_content = """\
+ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00           C
+ATOM      2  CA  ALA A   2       4.000   5.000   6.000  1.00  0.00           C
+ATOM      3  CA  ALA A   3       7.000   8.000   9.000  1.00  0.00           C
+ATOM      4  CA  ALA A   4      10.000  11.000  12.000  1.00  0.00           C
+ATOM      5  CA  ALA A   5      13.000  14.000  15.000  1.00  0.00           C
+END
+"""
+    ref = tmp_path / "ref.pdb"
+    ref.write_text(pdb_content)
+    mob = tmp_path / "mob_0.pdb"
+    mob.write_text(pdb_content)
+
+    out_dir = tmp_path / "aligned"
+    aligner = PDBAligner()
+    aligner.add_reference(str(ref))
+    aligner.align_ensemble([str(mob)], out_dir=str(out_dir))
+
+    assert out_dir.exists()
+    saved = list(out_dir.iterdir())
+    assert len(saved) == 1
+    assert saved[0].name == "aligned_mob_0.pdb"
+
+
+def test_align_ensemble_raises_without_reference():
+    """align_ensemble raises ValueError if no reference is loaded."""
+    aligner = PDBAligner()
+    with pytest.raises(ValueError, match="Reference structure must be loaded"):
+        aligner.align_ensemble(["any.pdb"])
