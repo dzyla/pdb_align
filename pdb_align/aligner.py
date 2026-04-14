@@ -957,7 +957,6 @@ class PDBAligner:
         """
         # --- flexible domain alignment ---
         if mode == "flexible":
-            import numpy as np
             # Step 1: run auto alignment to get matched atom pairs
             initial = self.align(
                 mode="auto",
@@ -966,6 +965,10 @@ class PDBAligner:
                 **kwargs,
             )
             if initial._chosen.get("seqguided") is None:
+                warnings.warn(
+                    "mode='flexible': no sequence-guided alignment available; "
+                    "returning rigid-body result without domain decomposition."
+                )
                 return initial
 
             sg = initial._chosen["seqguided"]
@@ -976,6 +979,10 @@ class PDBAligner:
             # Filter to CA atoms for hinge detection
             ca_idx = [i for i, a in enumerate(ref_atoms) if a.get_name() == "CA"]
             if not ca_idx:
+                warnings.warn(
+                    "mode='flexible': no CA atoms found in alignment; "
+                    "returning rigid-body result without domain decomposition."
+                )
                 return initial
 
             ca_rmsd = per_res[ca_idx]
@@ -1011,6 +1018,8 @@ class PDBAligner:
                     translation=t,
                 ))
 
+            for idx, dr in enumerate(domains):
+                dr.domain_id = idx
             initial.domains = domains if domains else None
             return initial
 
