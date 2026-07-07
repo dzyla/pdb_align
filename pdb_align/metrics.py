@@ -1,5 +1,26 @@
 import numpy as np
 
+# Minimum d0 used by TM-align. The raw d0 formula goes to zero (and even
+# negative) for short chains, so it must be clamped for the score to stay
+# physically meaningful.
+_D0_MIN = 0.5
+
+
+def compute_d0(length: int) -> float:
+    """
+    TM-score normalization distance d0 for a target of *length* residues.
+
+    Uses the TM-align formula ``d0 = 1.24*(L-15)^(1/3) - 1.8`` and clamps the
+    result to a minimum of 0.5 A, matching the reference TM-align behaviour.
+    Without the clamp, d0 is negative for L in ~16-20, which makes the score
+    meaningless.
+    """
+    if length <= 15:
+        return _D0_MIN
+    d0 = 1.24 * np.power(length - 15, 1.0 / 3.0) - 1.8
+    return float(max(d0, _D0_MIN))
+
+
 def calculate_tm_score(ref_coords: np.ndarray, mob_coords: np.ndarray, length: int) -> float:
     """
     Calculates the TM-score for two sets of aligned coordinates.
@@ -14,11 +35,8 @@ def calculate_tm_score(ref_coords: np.ndarray, mob_coords: np.ndarray, length: i
     """
     if len(ref_coords) != len(mob_coords) or len(ref_coords) == 0:
         return 0.0
-        
-    if length <= 15:
-        d0 = 0.5
-    else:
-        d0 = 1.24 * np.power(length - 15, 1/3) - 1.8
+
+    d0 = compute_d0(length)
 
     dists = np.linalg.norm(ref_coords - mob_coords, axis=1)
     score = np.sum(1 / (1 + (dists / d0)**2)) / length
@@ -71,62 +89,53 @@ def calculate_lddt(ref_coords: np.ndarray, mob_coords: np.ndarray, threshold: fl
 
 import math
 
+# Parameters of the random-pair TM-score distribution.
+#
+# TM-score's d0 normalization was designed so that the TM-score of a pair of
+# unrelated ("random") structures has a mean of ~0.17 that is essentially
+# independent of chain length (Zhang & Skolnick, Proteins 2004, 57:702-710).
+# Empirically that random-pair distribution is right-skewed and well described
+# by an extreme-value (Gumbel) distribution with a spread of roughly 0.05.
+_TM_RANDOM_MEAN = 0.17
+_TM_RANDOM_STD = 0.05
+_EULER_GAMMA = 0.5772156649015329
+
+
 def calculate_tm_pvalue(tm_score: float, length: int) -> float:
     """
-    Calculates the p-value for a given TM-score and protein length.
+    Approximate p-value for an observed TM-score.
 
-    The P-value estimates the probability that a random pair of structures
-    would have a TM-score greater than or equal to the observed TM-score.
+    Estimates P(TM_random >= tm_score): the probability that a pair of
+    *unrelated* structures would reach at least this TM-score by chance. Small
+    values indicate significant structural similarity.
 
-    Based on the empirical formula from Zhang & Skolnick (2004) or similar.
-    Specifically: P-value = exp(b0 + b1*TM + b2*TM^2)
-    where b0, b1, and b2 are length-dependent parameters.
-    (This is a generalized implementation mimicking TM-align statistics)
+    The random-pair TM-score distribution is modelled as a Gumbel (extreme
+    value) distribution with mean ~0.17 and std ~0.05, which is approximately
+    length-independent by TM-score's construction. This is an *approximation*
+    intended to give a correctly-behaved significance signal (random matches
+    score near 1, strong matches near 0); it is not a reproduction of any
+    specific tool's exact p-value.
+
+    Parameters
+    ----------
+    tm_score : float
+        Observed TM-score in [0, 1].
+    length : int
+        Target chain length. Below 16 residues the score is not statistically
+        meaningful and the p-value is reported as 1.0.
     """
     if length <= 15:
-        return 1.0  # Not statistically meaningful
-
+        return 1.0  # too short to be statistically meaningful
     if tm_score < 0.0:
         return 1.0
-
-    if tm_score > 1.0:
+    if tm_score >= 1.0:
         return 0.0
 
-    # Empirical parameters approximated from standard TM-align source
-    b0 = 0.5 * length - 12
-    b1 = -2.0 * length - 15
-    b2 = length - 2
+    # Gumbel scale/location from the target mean and std.
+    beta = _TM_RANDOM_STD * math.sqrt(6.0) / math.pi
+    mu = _TM_RANDOM_MEAN - beta * _EULER_GAMMA
 
-    # Actually, a more standard approximation formula across TM-align versions:
-    # P-value = c0 * exp(c1 * TM + c2 * TM^2)
-    # Using the exact one from TM-align paper/code for general lengths:
-    # However, Zhang 2004 established the distribution of TM-scores follows extreme value distribution.
-    # A simpler and widely accepted empirical relation is used here.
-    # To match the exact P-value of TM-align, we use the following constants derived
-    # from Zhang & Skolnick 2004 scoring functions:
-
-    Z = 1.0
-    # From TM-score paper (J. Mol. Biol. 2004 339, 113-130):
-    # The expected TM-score for random alignments is ~0.17
-    if length > 21:
-        # A common simplified p-value estimation used in structure alignments
-        Z_score = (tm_score - (0.17 + 0.0)) / (0.05 + 0.0) # generic std dev for small length
-
-    # But let's use the explicit exponential empirical function if length >= 21
-    # For a given length L:
-    if length < 21:
-        return 1.0 # P-value undefined
-
-    a = -7.53 * math.log(length) + 21.0
-    b = 8.53 * math.log(length) - 52.0
-    c = 1.54 * math.log(length) - 34.0
-
-    # In some TM-score implementations:
-    # E(TM-score) = 0.17
-    # Here we'll implement a robust empirical function mapping TM-score -> P-value
-    # Using Zhang's empirical fits:
-    # P-value = 1 / (1 + exp((TM - mu) / sigma)) -> actually EVD.
-    # We will use the exact power law formula from Zhang (2004):
-    p_val = math.exp(a + b * tm_score + c * (tm_score**2))
-
-    return float(min(1.0, max(0.0, p_val)))
+    # Upper-tail probability: P(X >= x) = 1 - exp(-exp(-(x-mu)/beta)).
+    z = (tm_score - mu) / beta
+    survival = -math.expm1(-math.exp(-z))
+    return float(min(1.0, max(0.0, survival)))

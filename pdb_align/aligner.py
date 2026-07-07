@@ -17,6 +17,7 @@ from .core import (
     _detect_hinges, _kabsch,
 )
 from .exceptions import ParsingError, ChainNotFoundError
+from .metrics import compute_d0
 
 class AlignmentFailedError(Exception):
     """Raised when the alignment fails to produce a viable result."""
@@ -107,7 +108,7 @@ class AlignmentResult:
 
             if L <= 15:
                 return None
-            d0 = 1.24 * (L - 15)**(1.0/3.0) - 1.8
+            d0 = compute_d0(L)
             d0_sq = d0**2
             tm = np.sum(1.0 / (1.0 + (ca_rmsd**2) / d0_sq)) / L
             return float(tm)
@@ -127,7 +128,7 @@ class AlignmentResult:
 
             if L <= 15:
                 return None
-            d0 = 1.24 * (L - 15)**(1.0/3.0) - 1.8
+            d0 = compute_d0(L)
             d0_sq = d0**2
 
             sum_val = 0.0
@@ -175,8 +176,14 @@ class AlignmentResult:
             return self._chosen["seqfree"].pairs
         return None
 
-    def save_aligned_pdb(self, filename: str, subset_only: bool = False):
-        """Saves the aligned mobile structure to a PDB file. Maps alignment distance into B-factor."""
+    def save_aligned_pdb(self, filename: str, subset_only: bool = False, preserve_bfactor: bool = False):
+        """Saves the aligned mobile structure to a PDB file.
+
+        By default the per-residue alignment distance is written into the
+        B-factor column (useful for heat-map colouring). Pass
+        ``preserve_bfactor=True`` to keep the input B-factors (e.g. AlphaFold
+        pLDDT) untouched.
+        """
         if not self._chosen:
             raise ValueError("No alignment results available. Run align() first.")
 
@@ -262,8 +269,10 @@ class AlignmentResult:
                             atom.pos.y = float(new_coord[1])
                             atom.pos.z = float(new_coord[2])
 
-                            # Overwrite B-factor with local deviation distance
-                            atom.b_iso = mapped_bfactor
+                            # Overwrite B-factor with local deviation distance,
+                            # unless the caller asked to preserve the originals.
+                            if not preserve_bfactor:
+                                atom.b_iso = mapped_bfactor
 
             if filename.lower().endswith(".pdb"):
                 out_struct.write_pdb(filename)
@@ -846,6 +855,21 @@ class PDBAligner:
         """Sets the reference structure. Alias for set_reference."""
         self.set_reference(ref_file, chains)
 
+    # Network timeout (seconds) for remote structure fetches; without it a
+    # stalled connection would hang the whole alignment indefinitely.
+    _FETCH_TIMEOUT = 30
+
+    def _download(self, url: str, dest: str, what: str):
+        """Download *url* to *dest*, raising ValueError on any failure."""
+        import requests
+        try:
+            r = requests.get(url, timeout=self._FETCH_TIMEOUT)
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            raise ValueError(f"Could not fetch {what}: {exc}") from exc
+        with open(dest, "w") as f:
+            f.write(r.text)
+
     def _fetch_structure(self, file_or_id: str) -> str:
         """Fetches a structure from PDB or AF-DB if a prefix is detected."""
         if file_or_id.lower().startswith("pdb:"):
@@ -853,22 +877,14 @@ class PDBAligner:
             dest = f"{pdb_id}.cif"
             if not os.path.exists(dest):
                 if self.verbose: print(f"Fetching {pdb_id} from RCSB PDB...")
-                import requests
-                r = requests.get(f"https://files.rcsb.org/download/{pdb_id}.cif")
-                if r.status_code == 200:
-                    with open(dest, 'w') as f: f.write(r.text)
-                else: raise ValueError(f"Could not fetch PDB {pdb_id}")
+                self._download(f"https://files.rcsb.org/download/{pdb_id}.cif", dest, f"PDB {pdb_id}")
             return dest
         elif file_or_id.lower().startswith("af:"):
             af_id = file_or_id[3:].strip()
             dest = f"{af_id}.pdb"
             if not os.path.exists(dest):
                 if self.verbose: print(f"Fetching {af_id} from AlphaFold DB...")
-                import requests
-                r = requests.get(f"https://alphafold.ebi.ac.uk/files/AF-{af_id}-F1-model_v6.pdb")
-                if r.status_code == 200:
-                    with open(dest, 'w') as f: f.write(r.text)
-                else: raise ValueError(f"Could not fetch AlphaFold model {af_id}")
+                self._download(f"https://alphafold.ebi.ac.uk/files/AF-{af_id}-F1-model_v6.pdb", dest, f"AlphaFold model {af_id}")
             return dest
         return file_or_id
 

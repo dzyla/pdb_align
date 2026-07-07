@@ -38,7 +38,7 @@ The package has two layers: a **Python library** and a **Streamlit frontend**.
   - `_kabsch()` — Kabsch SVD superposition; returns `(R, t, rmsd)`
   - `perform_sequence_alignment()` / `get_aligned_atoms_by_alignment()` — sequence-guided alignment path
   - `sequence_independent_alignment_joined_v2()` — sequence-free shape/window alignment
-  - `pick_best_overall()` — selects best result across all strategies
+  - `pick_best_overall()` — selects best result across all strategies using a **coverage-weighted score** (`n_pairs / (1 + (rmsd/3Å)²)`), so a strategy matching only a few residues at low RMSD cannot beat one that superimposes the whole protein
   - `compute_gdt_ts()`, `compute_cad_score_approx()` — scoring functions
   - `progressive_align_ensemble()` — multi-structure ensemble alignment
   - `_sliding_window_mean()` — numba JIT-compiled sliding-window mean (used for hinge detection)
@@ -57,7 +57,7 @@ The package has two layers: a **Python library** and a **Streamlit frontend**.
 
 - **`structure.py`** — `StructureBase` wraps `gemmi.Structure` with chain selection and subdomain range support (e.g., `"A:10-150"`).
 
-- **`metrics.py`** — Standalone metric functions: `calculate_tm_score()`, `calculate_lddt()`.
+- **`metrics.py`** — Standalone metric functions: `compute_d0()` (TM-score normalization distance, clamped to ≥0.5 Å), `calculate_tm_score()`, `calculate_lddt()`, and `calculate_tm_pvalue()` (approximate Gumbel-model significance; random-pair TM≈0.17 → p≈1).
 
 - **`exceptions.py`** — Custom exceptions: `ParsingError`, `ChainNotFoundError`.
 

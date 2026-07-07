@@ -57,13 +57,16 @@ def extract_sequences_and_lengths(struct: gemmi.Structure, fname: str):
         for res in chain:
             resname = res.name
             if resname in AA_DICT:
-                seq.append(AA_DICT[resname])
                 has_ca = False
                 for atom in res:
                     if atom.name == "CA":
                         has_ca = True
                         break
+                # Only residues carrying a CA participate in alignment; keeping
+                # CA-less residues in the sequence would desynchronise the
+                # alignment-to-residue mapping downstream.
                 if has_ca:
+                    seq.append(AA_DICT[resname])
                     ca_count += 1
         if seq:
             seqs[chain.name] = SeqRecord(
@@ -228,11 +231,11 @@ def _extract_ca_infos(
             if ca is None:
                 continue
 
-            if min_b_factor > 0.0 and ca.b_iso < min_b_factor:
-                continue
-            
-            # Since AF models store pLDDT in B-factor column
-            if min_plddt > 0.0 and ca.b_iso < min_plddt:
+            # min_b_factor and min_plddt are both lower bounds on the B-factor
+            # column (AlphaFold stores pLDDT there), so the effective cutoff is
+            # simply the larger of the two.
+            min_biso = max(min_b_factor, min_plddt)
+            if min_biso > 0.0 and ca.b_iso < min_biso:
                 continue
 
             coord = np.array(ca.pos.tolist(), dtype=float)
@@ -731,7 +734,7 @@ def perform_sequence_alignment(seq1:str, seq2:str, gap_open:float, gap_extend:fl
                 self.score = score
         return Wrap(seqA, seqB, a.score)
     except Exception as e:
-        # Avoid print here, log handles it in script
+        logger.warning("Sequence alignment failed: %s", e, exc_info=True)
         return None
 
 def get_aligned_atoms_by_alignment(ref_struct: gemmi.Structure, ref_chains, mob_struct: gemmi.Structure, mob_chains, alignment, atoms: str = "CA", min_b_factor: float = 0.0, min_plddt: float = 0.0):
@@ -982,6 +985,26 @@ def structure_based_alignment_strings(ref_infos: List[ResidueInfo], mob_infos: L
         else: match.append(".")
     return "".join(outA), "".join(outB), "".join(match)
 
+# Length scale (A) for the coverage-weighted selection score. Deviations much
+# smaller than this barely change the score; larger ones are penalised.
+_SELECTION_RMSD_SCALE = 3.0
+
+
+def _coverage_score(rmsd: float, pairs: int) -> float:
+    """
+    Coverage-weighted quality score used to rank alignment candidates.
+
+    ``score = n_pairs / (1 + (rmsd / R0)^2)`` — higher is better. This rewards
+    aligning more residues while still penalising deviation, so a strategy that
+    matches only a few residues at near-zero RMSD cannot beat one that
+    superimposes the whole protein well. When coverage is equal it reduces to
+    preferring the lower RMSD.
+    """
+    if not np.isfinite(rmsd) or pairs <= 0:
+        return -np.inf
+    return pairs / (1.0 + (rmsd / _SELECTION_RMSD_SCALE) ** 2)
+
+
 def pick_best_overall(seqguided, seqfree, min_pairs:int=3):
     cands=[]
     if seqguided is not None:
@@ -990,18 +1013,22 @@ def pick_best_overall(seqguided, seqfree, min_pairs:int=3):
         cands.append(dict(name=f"Sequence-free ({seqfree.method})", rmsd=float(seqfree.rmsd), pairs=int(seqfree.kept_pairs), kind="seqfree"))
     if not cands: return None, "No candidates available."
 
+    for c in cands:
+        c["score"] = _coverage_score(c["rmsd"], c["pairs"])
+
     valid=[c for c in cands if np.isfinite(c["rmsd"]) and c["pairs"]>=min_pairs]
     if not valid: valid=[c for c in cands if np.isfinite(c["rmsd"])]
     if not valid:
         best=min(cands, key=lambda c: (math.isfinite(c["rmsd"])==False, c["rmsd"]))
         return best, "Chose the only available candidate."
-    best=min(valid, key=lambda c: (c["rmsd"], -c["pairs"]))
+    # Highest coverage-weighted score wins; ties fall back to lower RMSD.
+    best=max(valid, key=lambda c: (c["score"], -c["rmsd"]))
     others=[c for c in valid if c is not best]
     if others:
-        alt=min(others, key=lambda c: (c["rmsd"], -c["pairs"]))
-        reason=f"Lower RMSD ({best['rmsd']:.2f} Å) vs {alt['name']} ({alt['rmsd']:.2f} Å)."
-        if abs(best["rmsd"]-alt["rmsd"])<1e-6 and best["pairs"]!=alt["pairs"]:
-            reason+=f" Tie on RMSD; chose higher pairs ({best['pairs']} vs {alt['pairs']})."
+        alt=max(others, key=lambda c: (c["score"], -c["rmsd"]))
+        reason=(f"Higher coverage-weighted score ({best['score']:.1f}: "
+                f"{best['pairs']} pairs @ {best['rmsd']:.2f} Å) vs {alt['name']} "
+                f"({alt['score']:.1f}: {alt['pairs']} pairs @ {alt['rmsd']:.2f} Å).")
     else:
         reason="Single valid candidate."
     return best, reason
