@@ -1,7 +1,7 @@
 # pdb_align
 Align protein structures and explore local differences — pairwise, domain-flexible, or across full ensembles.
 
-This package provides a Python library for structural bioinformatics scripting and an interactive Streamlit web app.
+This package provides a Python library for structural bioinformatics scripting, a CLI, and an interactive Streamlit web app.
 
 ## Installation
 
@@ -14,6 +14,42 @@ With Streamlit app and visualization extras (Py3Dmol, Plotly):
 ```bash
 pip install -e .[app]
 ```
+
+## Command-line quickstart
+
+`pdb_align` is zero-config by default: give it two structures and it prints a stats report to the terminal — no files are written unless you ask for them.
+
+```bash
+pdb_align ref.pdb mob.pdb                 # stats only
+pdb_align pdb:1ABC pdb:2XYZ --plot        # + per-residue RMSD plot (rmsd.png)
+pdb_align a.cif b.cif -o aligned.cif --summary-plot   # + aligned structure + summary figure
+```
+
+`REF`/`MOB` accept local file paths or remote IDs (`pdb:XXXX`, `af:UniProtID`) directly. Other useful flags:
+
+```bash
+pdb_align ref.pdb mob.pdb --strategy global      # force global vs. local multi-chain superposition (default: auto)
+pdb_align ref.pdb mob.pdb --ref-chains A --mob-chains A
+pdb_align ref.pdb mob.pdb --json                 # machine-readable report to stdout
+pdb_align ref.pdb mob.pdb --csv rmsd.csv --report report.txt --save result.npz
+```
+
+Multi-chain complexes (e.g. antibody-antigen, homomultimers) are matched automatically — chain correspondence is found via optimal 1:1 sequence-identity assignment, refined geometrically for near-identical chains — and `--strategy` picks between a global (all-chains) or local (best single chain pair) superposition.
+
+Run `pdb_align --help` for the full flag list.
+
+### Python: saving and reloading results
+
+An `AlignmentResult` can be persisted and later reloaded without the original structure files:
+
+```python
+result.save("result.npz")
+loaded = pdb_align.AlignmentResult.load("result.npz")   # gemmi-free LoadedResult
+print(loaded.report())
+loaded.plot_summary("summary.png")
+```
+
+`result.report(fmt="text"|"json")` gives a human-readable or machine-readable summary at any time; `result.plot_summary()` renders a compact Nature-style multi-panel figure (per-residue RMSD + per-chain/score panel).
 
 ## Streamlit App
 
