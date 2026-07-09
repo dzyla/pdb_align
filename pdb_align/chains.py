@@ -1,6 +1,6 @@
 """Chain correspondence and multi-chain superposition strategy selection."""
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 import numpy as np
 
 from .core import compute_chain_similarity_matrix, _extract_ca_infos, _kabsch
@@ -51,7 +51,7 @@ def match_chains(ref_seqs, mob_seqs, ref_struct, mob_struct,
     # Refine homomultimers where sequence identity ties across candidates.
     if _needs_permutation_refinement(mat) and ref_struct is not None:
         mapping = _refine_by_superposition(
-            mapping, ref_struct, mob_struct, r_ids, m_ids)
+            mapping, ref_struct, mob_struct, r_ids, m_ids, mat)
     return mapping
 
 
@@ -66,7 +66,7 @@ def _needs_permutation_refinement(mat: np.ndarray) -> bool:
     return False
 
 
-def _refine_by_superposition(mapping, ref_struct, mob_struct, r_ids, m_ids):
+def _refine_by_superposition(mapping, ref_struct, mob_struct, r_ids, m_ids, mat):
     """Centroid-ICP refinement: superpose on current mapping, then reassign
     chains by post-superposition centroid proximity. Capped by MAX_PERMUTE_CHAINS."""
     from scipy.optimize import linear_sum_assignment
@@ -105,7 +105,10 @@ def _refine_by_superposition(mapping, ref_struct, mob_struct, r_ids, m_ids):
             moved = R @ m_cen[b] + t
             cost[i, j] = np.linalg.norm(r_cen[a] - moved)
     ri, ci = linear_sum_assignment(cost)
-    id_lookup = {(p[0], p[1]): p[2] for p in mapping.pairs}
+    id_lookup = {
+        (r_ids[i], m_ids[j]): float(mat[i, j])
+        for i in range(len(r_ids)) for j in range(len(m_ids))
+    }
     new_pairs = []
     for i, j in zip(ri, ci):
         a, b = common_r[i], common_m[j]
