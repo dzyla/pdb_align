@@ -37,3 +37,18 @@ def test_plot_summary_returns_figure(tmp_path):
     fig = r.plot_summary(filename=str(out))
     assert fig is not None
     assert out.exists()
+    plt.close(fig)
+
+
+def test_plot_summary_bar_chart_branch(tmp_path):
+    import pandas as pd
+    import pdb_align
+    r = pdb_align.align("tests/data/ref.pdb", "tests/data/mob.pdb")
+    r._per_chain = pd.DataFrame(
+        [{"chain_ref": "A", "chain_mob": "A", "n_residues": 40, "rmsd": 0.68}],
+        columns=["chain_ref", "chain_mob", "n_residues", "rmsd"])
+    out = tmp_path / "bar.png"
+    fig = r.plot_summary(filename=str(out))
+    assert fig is not None
+    assert out.exists()
+    plt.close(fig)

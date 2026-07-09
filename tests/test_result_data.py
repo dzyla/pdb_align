@@ -62,3 +62,13 @@ def test_loaded_result_replots_without_original_files(result, tmp_path):
     out = tmp_path / "r.png"
     loaded.plot_rmsd(filename=str(out))
     assert out.exists()
+
+
+def test_loaded_result_plot_summary(result, tmp_path):
+    p = tmp_path / "run.npz"
+    result.save(str(p))
+    from pdb_align import AlignmentResult
+    loaded = AlignmentResult.load(str(p))
+    out = tmp_path / "summary.png"
+    loaded.plot_summary(filename=str(out))
+    assert out.exists()
