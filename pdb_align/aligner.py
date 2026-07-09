@@ -456,8 +456,10 @@ class AlignmentResult:
         return top_peaks
 
     def plot_rmsd(self, filename: str = "rmsd.pdf", style: str = "scientific", on: str = 'reference'):
+        import contextlib
         import matplotlib.pyplot as plt
         import seaborn as sns
+        from . import plotstyle
         try: df = self.get_rmsd_df(on=on)
         except Exception:
             print("No data to plot.")
@@ -467,24 +469,30 @@ class AlignmentResult:
             return
         with plt.style.context('default'):
             if style == "scientific":
-                sns.set_style("whitegrid")
-                sns.set_context("paper")
-                plt.rcParams.update({
-                    "font.family": "serif", "axes.titlesize": 14, "axes.labelsize": 12,
-                    "xtick.labelsize": 10, "ytick.labelsize": 10, "legend.fontsize": 10, "figure.dpi": 300,
-                })
-            fig, ax = plt.subplots(figsize=(10, 4))
-            sns.lineplot(data=df, x=df.index, y="RMSD", hue="Chain", marker='o', markersize=4, linestyle='-', linewidth=1, ax=ax)
-            n_labels = len(df)
-            step = max(1, n_labels // 10)
-            ax.set_xticks(range(0, n_labels, step))
-            ax.set_xticklabels(df["Residue"].iloc[::step], rotation=45, ha='right')
-            ax.set_xlabel(f"Residue ({on.capitalize()})")
-            ax.set_ylabel(r"C$\alpha$ RMSD ($\AA$)")
-            ax.set_title("Per-Residue Structural Deviation")
-            plt.tight_layout()
-            plt.savefig(filename, bbox_inches='tight')
-            plt.close()
+                style_ctx = plotstyle.apply_nature_style()
+                figsize = (89 / 25.4 * 2, 89 / 25.4 * 1.1)
+                palette = plotstyle.PALETTE[:df["Chain"].nunique()]
+                markersize, linewidth = 3, 0.9
+            else:
+                style_ctx = contextlib.nullcontext()
+                figsize = (10, 4)
+                palette = None
+                markersize, linewidth = 4, 1
+            with style_ctx:
+                fig, ax = plt.subplots(figsize=figsize)
+                sns.lineplot(data=df, x=df.index, y="RMSD", hue="Chain",
+                             palette=palette, marker='o', markersize=markersize,
+                             linestyle='-', linewidth=linewidth, ax=ax)
+                n_labels = len(df)
+                step = max(1, n_labels // 10)
+                ax.set_xticks(range(0, n_labels, step))
+                ax.set_xticklabels(df["Residue"].iloc[::step], rotation=45, ha='right')
+                ax.set_xlabel(f"Residue ({on.capitalize()})")
+                ax.set_ylabel(r"C$\alpha$ RMSD ($\AA$)")
+                ax.set_title("Per-Residue Structural Deviation")
+                plt.tight_layout()
+                plt.savefig(filename, bbox_inches='tight')
+                plt.close()
 
     def save_pymol_script(self, filename: str, aligned_mobile_filename: str = "aligned_mobile.pdb"):
         """
