@@ -2,6 +2,8 @@
 
 from .aligner import PDBAligner, AlignmentResult, AlignmentFailedError, EnsembleResult, DomainResult, LoadedResult
 from .exceptions import ParsingError, ChainNotFoundError
+from .chains import match_chains, align_multichain, ChainMapping
+from .plotstyle import apply_nature_style
 
 __all__ = [
     "align",
@@ -13,6 +15,10 @@ __all__ = [
     "LoadedResult",
     "ParsingError",
     "ChainNotFoundError",
+    "match_chains",
+    "align_multichain",
+    "ChainMapping",
+    "apply_nature_style",
 ]
 
 
