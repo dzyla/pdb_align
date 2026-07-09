@@ -56,6 +56,97 @@ class AlignmentResult:
         self.mob_lens = mob_lens
         self.verbose = verbose
         self.domains = domains  # List[DomainResult] or None
+        self.strategy = "single"
+        self.chain_mapping = None
+        self._per_chain = None  # optional DataFrame set by multi-chain path
+
+    @property
+    def per_chain(self):
+        import pandas as pd
+        if self._per_chain is not None:
+            return self._per_chain
+        return pd.DataFrame(columns=["chain_ref", "chain_mob", "n_residues", "rmsd"])
+
+    def summary_stats(self) -> dict:
+        gdt = None
+        sg = self._chosen.get("seqguided")
+        sf = self._chosen.get("seqfree")
+        if sg and sg.get("si"):
+            gdt = sg["si"].get("gdt_ts")
+        elif sf:
+            gdt = getattr(sf, "gdt_ts", None)
+        try:
+            n_aligned = len(self.get_rmsd_df())
+        except Exception:
+            n_aligned = None
+        l_ref = sum(self.ref_lens.values()) or None
+        coverage = (n_aligned / l_ref * 100.0) if (n_aligned and l_ref) else None
+        mapping = None
+        if self.chain_mapping is not None:
+            mapping = [
+                {"ref": p[0], "mob": p[1], "identity": round(float(p[2]), 1)}
+                for p in self.chain_mapping.pairs
+            ]
+        return {
+            "method": self._chosen.get("name"),
+            "strategy": self.strategy,
+            "reason": self._chosen.get("reason"),
+            "rmsd": self.rmsd,
+            "tm_score": self.tm_score,
+            "tm_score_min": self.get_tm_score("min"),
+            "gdt_ts": gdt,
+            "n_aligned": n_aligned,
+            "coverage_pct": coverage,
+            "chain_mapping": mapping,
+            "ref_file": self.ref_file,
+            "mob_file": self.mob_file,
+        }
+
+    def to_dict(self) -> dict:
+        d = self.summary_stats()
+        d["per_chain"] = self.per_chain.to_dict(orient="records")
+        return d
+
+    def to_json(self, indent: int = 2) -> str:
+        import json
+        return json.dumps(self.to_dict(), indent=indent, default=float)
+
+    def report(self, fmt: str = "text") -> str:
+        if fmt == "json":
+            return self.to_json()
+        if fmt != "text":
+            raise ValueError("fmt must be 'text' or 'json'")
+        s = self.summary_stats()
+        def fmt_num(v, spec):
+            return format(v, spec) if v is not None else "n/a"
+        lines = []
+        lines.append("=" * 52)
+        lines.append(" pdb_align — structural comparison")
+        lines.append("=" * 52)
+        import os
+        lines.append(f" Reference : {os.path.basename(s['ref_file'])}")
+        lines.append(f" Mobile    : {os.path.basename(s['mob_file'])}")
+        lines.append(f" Method    : {s['method']}  (strategy: {s['strategy']})")
+        lines.append("-" * 52)
+        lines.append(f" RMSD          : {fmt_num(s['rmsd'], '.3f')} A")
+        lines.append(f" TM-score      : {fmt_num(s['tm_score'], '.4f')}")
+        lines.append(f" GDT-TS        : {fmt_num(s['gdt_ts'], '.2f')}")
+        lines.append(f" Aligned res   : {s['n_aligned'] if s['n_aligned'] is not None else 'n/a'}")
+        lines.append(f" Coverage      : {fmt_num(s['coverage_pct'], '.1f')} %")
+        if s["chain_mapping"]:
+            lines.append("-" * 52)
+            lines.append(" Chain mapping (ref -> mob, %id):")
+            for m in s["chain_mapping"]:
+                lines.append(f"   {m['ref']} -> {m['mob']}  ({m['identity']:.1f}%)")
+        df = self.per_chain
+        if not df.empty:
+            lines.append("-" * 52)
+            lines.append(" Per-chain RMSD:")
+            for _, r in df.iterrows():
+                lines.append(f"   {r['chain_ref']}->{r['chain_mob']}: "
+                             f"{r['rmsd']:.3f} A ({int(r['n_residues'])} res)")
+        lines.append("=" * 52)
+        return "\n".join(lines)
 
     @property
     def rmsd(self) -> Optional[float]:
