@@ -394,6 +394,8 @@ class AlignmentResult:
         return self.get_sequence_alignment()
 
     def get_sequence_alignment(self) -> Optional[tuple]:
+        if self._chosen["seqguided"] and self._chosen["seqguided"].get("aln") is None and not self._chosen["seqfree"]:
+            return None
         if self._chosen["seqguided"]:
             aln = self._chosen["seqguided"]["aln"]
             return aln.seqA, aln.seqB, aln.score
@@ -1218,7 +1220,7 @@ class PDBAligner:
               seq_gap_extend: float = -0.5, atoms: str = "CA",
               min_plddt: float = 0.0, min_b_factor: float = 0.0,
               hinge_threshold: float = 3.0, hinge_window: int = 15,
-              domain_min_residues: int = 30, **kwargs):
+              domain_min_residues: int = 30, strategy: str = "auto", **kwargs):
         """
         Runs the alignment process.
 
@@ -1249,6 +1251,7 @@ class PDBAligner:
                 mode="auto",
                 seq_gap_open=seq_gap_open, seq_gap_extend=seq_gap_extend,
                 atoms=atoms, min_plddt=min_plddt, min_b_factor=min_b_factor,
+                strategy=strategy,
                 **kwargs,
             )
             if initial._chosen.get("seqguided") is None:
@@ -1322,6 +1325,21 @@ class PDBAligner:
 
         if not ref_chs or not mob_chs:
             raise ValueError("Select at least one chain per file.")
+
+        if mode in ("auto", "Auto (best RMSD)") and len(ref_chs) > 1 and len(mob_chs) > 1:
+            from .chains import match_chains, align_multichain
+            mapping = match_chains(self.ref_seqs, self.mob_seqs,
+                                   self.ref_struct, self.mob_struct, ref_chs, mob_chs)
+            if mapping.pairs:
+                mc = align_multichain(self.ref_struct, self.mob_struct, mapping,
+                                      strategy=strategy, atoms=atoms,
+                                      min_b_factor=min_b_factor, min_plddt=min_plddt)
+                result_obj = self._multichain_to_result(mc, ref_chs, mob_chs)
+                self.last_result = {"seqguided": None, "seqfree": None,
+                                    "chosen": result_obj._chosen}
+                if self.verbose:
+                    print(result_obj.report())
+                return result_obj
 
         seqguided = None
         seqfree = None
@@ -1400,6 +1418,47 @@ class PDBAligner:
             print(f"  Reason: {chosen['reason']}")
 
         return result_obj
+
+    def _multichain_to_result(self, mc, ref_chs, mob_chs):
+        import numpy as np
+        from .core import compute_gdt_ts
+
+        class _PA:
+            def __init__(self, info):
+                self.chain_name = info.chain_id
+                self.res_seq = info.resseq
+                self.res_icode = info.icode
+                self._coord = info.coord
+            def get_name(self): return "CA"
+            def get_coord(self): return self._coord
+
+        ref_atoms = [_PA(i) for i in mc.ref_infos]
+        mob_atoms = [_PA(i) for i in mc.mob_infos]
+        diff = mc.ref_coords - mc.mob_coords_aligned
+        per_res = np.sqrt(np.sum(diff ** 2, axis=1)) if len(diff) else np.array([])
+        gdt = compute_gdt_ts(per_res) if len(per_res) else None
+        si = {"rotation": mc.rotation, "translation": mc.translation,
+              "rmsd": mc.rmsd, "per_residue_rmsd": per_res,
+              "ref_coords": mc.ref_coords, "mob_coords_transformed": mc.mob_coords_aligned,
+              "gdt_ts": gdt}
+        seqguided = {"aln": None, "ref_atoms": ref_atoms, "mob_atoms": mob_atoms, "si": si}
+        chosen = {"name": f"Multi-chain ({mc.strategy})",
+                  "reason": f"Chain-aware {mc.strategy} superposition over "
+                            f"{len(mc.mapping.pairs)} chain pair(s).",
+                  "seqguided": seqguided, "seqfree": None}
+        active_ref_lens = {c: self.ref_lens[c] for c in ref_chs if c in self.ref_lens}
+        active_mob_lens = {c: self.mob_lens[c] for c in mob_chs if c in self.mob_lens}
+        res = AlignmentResult(chosen=chosen, seqguided=seqguided, seqfree=None,
+                              ref_file=self.ref_file, mob_file=self.mob_file,
+                              mob_struct=self.mob_struct,
+                              ref_lens=active_ref_lens, mob_lens=active_mob_lens,
+                              verbose=self.verbose)
+        res.strategy = mc.strategy
+        res.chain_mapping = mc.mapping
+        import pandas as pd
+        res._per_chain = pd.DataFrame(mc.per_chain,
+            columns=["chain_ref", "chain_mob", "n_residues", "rmsd"])
+        return res
 
     def find_binder_target_chain(self, binder_chains: List[str], candidate_chains: List[str]) -> str:
         """

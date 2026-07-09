@@ -121,3 +121,94 @@ def _refine_by_superposition(mapping, ref_struct, mob_struct, r_ids, m_ids, mat)
         unmatched_ref=[c for c in r_ids if c not in used_r],
         unmatched_mob=[c for c in m_ids if c not in used_m],
     )
+
+
+@dataclass
+class MultiChainResult:
+    strategy: str
+    mapping: "ChainMapping"
+    rotation: np.ndarray
+    translation: np.ndarray
+    rmsd: float
+    pairs: list
+    ref_coords: np.ndarray
+    mob_coords_aligned: np.ndarray
+    per_chain: list
+    ref_infos: list
+    mob_infos: list
+
+
+def _coverage_score(n_pairs: int, rmsd: float) -> float:
+    return n_pairs / (1.0 + (rmsd / 3.0) ** 2)
+
+
+def _paired_ca(ref_struct, mob_struct, mapping, atoms, min_b_factor, min_plddt):
+    """Return matched CA coords + infos across all mapped chains (by residue order)."""
+    ref_infos, mob_infos = [], []
+    for a, b, *_ in mapping.pairs:
+        ri = _extract_ca_infos(ref_struct, [a], min_b_factor, min_plddt)
+        mi = _extract_ca_infos(mob_struct, [b], min_b_factor, min_plddt)
+        n = min(len(ri), len(mi))
+        ref_infos.extend(ri[:n]); mob_infos.extend(mi[:n])
+    P = np.array([i.coord for i in ref_infos]) if ref_infos else np.empty((0, 3))
+    Q = np.array([i.coord for i in mob_infos]) if mob_infos else np.empty((0, 3))
+    return P, Q, ref_infos, mob_infos
+
+
+def _per_chain_rmsd(mapping, ref_struct, mob_struct, R, t, min_b_factor, min_plddt):
+    rows = []
+    for a, b, *_ in mapping.pairs:
+        ri = _extract_ca_infos(ref_struct, [a], min_b_factor, min_plddt)
+        mi = _extract_ca_infos(mob_struct, [b], min_b_factor, min_plddt)
+        n = min(len(ri), len(mi))
+        if n == 0:
+            continue
+        P = np.array([x.coord for x in ri[:n]])
+        Q = np.array([x.coord for x in mi[:n]])
+        Qa = (R @ Q.T).T + t
+        rmsd = float(np.sqrt(np.mean(np.sum((P - Qa) ** 2, axis=1))))
+        rows.append({"chain_ref": a, "chain_mob": b, "n_residues": n, "rmsd": rmsd})
+    return rows
+
+
+def align_multichain(ref_struct, mob_struct, mapping, strategy="auto",
+                     atoms="CA", min_b_factor=0.0, min_plddt=0.0) -> MultiChainResult:
+    """Build global and/or local superpositions and pick per coverage-weighted score."""
+    def build(sub_mapping, name):
+        P, Q, ri, mi = _paired_ca(ref_struct, mob_struct, sub_mapping,
+                                  atoms, min_b_factor, min_plddt)
+        if len(P) < 3:
+            return None
+        R, t, rmsd = _kabsch(P, Q)
+        Qa = (R @ Q.T).T + t
+        per_chain = _per_chain_rmsd(sub_mapping, ref_struct, mob_struct, R, t,
+                                    min_b_factor, min_plddt)
+        return MultiChainResult(
+            strategy=name, mapping=sub_mapping, rotation=R, translation=t,
+            rmsd=rmsd, pairs=list(range(len(P))), ref_coords=P,
+            mob_coords_aligned=Qa, per_chain=per_chain,
+            ref_infos=ri, mob_infos=mi)
+
+    global_res = build(mapping, "global")
+
+    # local candidate = single best-identity chain pair
+    local_res = None
+    if mapping.pairs:
+        best = max(mapping.pairs, key=lambda p: p[2])
+        local_map = ChainMapping(pairs=[best])
+        local_res = build(local_map, "local")
+
+    if strategy == "global":
+        if global_res is None:
+            raise ValueError("global strategy requested but no viable multi-chain superposition.")
+        return global_res
+    if strategy == "local":
+        if local_res is None:
+            raise ValueError("local strategy requested but no viable single chain pair.")
+        return local_res
+
+    # auto: pick by coverage-weighted score
+    candidates = [c for c in (global_res, local_res) if c is not None]
+    if not candidates:
+        raise ValueError("No viable multi-chain superposition could be produced.")
+    return max(candidates, key=lambda c: _coverage_score(len(c.ref_coords), c.rmsd))
