@@ -1,4 +1,5 @@
 import os
+import logging
 import tempfile
 import warnings
 from typing import Optional, List, Union
@@ -6,6 +7,8 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from Bio.PDB import PDBParser, MMCIFParser
 
@@ -846,7 +849,13 @@ class PDBAligner:
         self.chains_mob = None
 
         self.last_result = None
-        self._struct_cache: dict = {}  # absolute path str -> gemmi.Structure; parse-once cache, no disk-change invalidation
+        # absolute path str -> (gemmi.Structure, mtime, size); parse-once cache
+        # keyed on file metadata so an edited file on disk is re-parsed.
+        self._struct_cache: dict = {}
+        # Directory for remote (pdb:/af:) downloads. Override with the
+        # PDB_ALIGN_CACHE_DIR env var; never pollutes the current directory.
+        self._fetch_cache_dir = os.environ.get("PDB_ALIGN_CACHE_DIR") or \
+            os.path.join(os.path.expanduser("~"), ".cache", "pdb_align")
 
         if ref_file:
             self.set_reference(ref_file, chains_ref)
@@ -855,37 +864,88 @@ class PDBAligner:
         """Sets the reference structure. Alias for set_reference."""
         self.set_reference(ref_file, chains)
 
+    def _load_cached_structure(self, abspath: str):
+        """Return a fresh clone of the parsed structure, re-parsing if the file
+        on disk changed since it was cached (keyed on mtime + size)."""
+        try:
+            stat = os.stat(abspath)
+            sig = (stat.st_mtime, stat.st_size)
+        except OSError:
+            sig = None
+        cached = self._struct_cache.get(abspath)
+        if cached is None or cached[1] != sig:
+            self._struct_cache[abspath] = (_parse_path(abspath), sig)
+        return self._struct_cache[abspath][0].clone()
+
     # Network timeout (seconds) for remote structure fetches; without it a
     # stalled connection would hang the whole alignment indefinitely.
     _FETCH_TIMEOUT = 30
 
+    # AlphaFold DB model versions to try, newest first. The DB retires old
+    # versions and not every entry exists at the newest one, so we fall back.
+    _AF_MODEL_VERSIONS = (6, 5, 4)
+
     def _download(self, url: str, dest: str, what: str):
-        """Download *url* to *dest*, raising ValueError on any failure."""
+        """Download *url* to *dest* atomically, raising ValueError on failure.
+
+        Writes to a temporary file in the same directory and renames on success
+        so a stalled/failed download never leaves a truncated file behind.
+        """
         import requests
         try:
             r = requests.get(url, timeout=self._FETCH_TIMEOUT)
             r.raise_for_status()
         except requests.RequestException as exc:
             raise ValueError(f"Could not fetch {what}: {exc}") from exc
-        with open(dest, "w") as f:
-            f.write(r.text)
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest) or ".", suffix=".part")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(r.text)
+            os.replace(tmp, dest)
+        except Exception:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
+
+    @staticmethod
+    def _is_usable(path: str) -> bool:
+        """True if *path* exists and is non-empty (i.e. a complete download)."""
+        return os.path.exists(path) and os.path.getsize(path) > 0
 
     def _fetch_structure(self, file_or_id: str) -> str:
-        """Fetches a structure from PDB or AF-DB if a prefix is detected."""
+        """Fetches a structure from PDB or AF-DB if a prefix is detected.
+
+        Downloads are cached under ``self._fetch_cache_dir`` rather than the
+        current working directory.
+        """
+        cache = self._fetch_cache_dir
         if file_or_id.lower().startswith("pdb:"):
             pdb_id = file_or_id[4:].strip()
-            dest = f"{pdb_id}.cif"
-            if not os.path.exists(dest):
+            dest = os.path.join(cache, f"{pdb_id}.cif")
+            if not self._is_usable(dest):
                 if self.verbose: print(f"Fetching {pdb_id} from RCSB PDB...")
                 self._download(f"https://files.rcsb.org/download/{pdb_id}.cif", dest, f"PDB {pdb_id}")
             return dest
         elif file_or_id.lower().startswith("af:"):
             af_id = file_or_id[3:].strip()
-            dest = f"{af_id}.pdb"
-            if not os.path.exists(dest):
-                if self.verbose: print(f"Fetching {af_id} from AlphaFold DB...")
-                self._download(f"https://alphafold.ebi.ac.uk/files/AF-{af_id}-F1-model_v6.pdb", dest, f"AlphaFold model {af_id}")
-            return dest
+            dest = os.path.join(cache, f"{af_id}.pdb")
+            if self._is_usable(dest):
+                return dest
+            if self.verbose: print(f"Fetching {af_id} from AlphaFold DB...")
+            last_exc = None
+            for ver in self._AF_MODEL_VERSIONS:
+                url = f"https://alphafold.ebi.ac.uk/files/AF-{af_id}-F1-model_v{ver}.pdb"
+                try:
+                    self._download(url, dest, f"AlphaFold model {af_id} (v{ver})")
+                    return dest
+                except ValueError as exc:
+                    last_exc = exc
+                    if self.verbose: print(f"  v{ver} unavailable: {exc}")
+            raise ValueError(
+                f"Could not fetch AlphaFold model {af_id} at any known version "
+                f"{self._AF_MODEL_VERSIONS}: {last_exc}"
+            )
         return file_or_id
 
     def set_reference(self, ref_file: str, chains: Optional[List[Union[str, int]]] = None):
@@ -896,9 +956,7 @@ class PDBAligner:
         ref_file = os.path.abspath(ref_file)
         self.ref_file = ref_file
         self.chains_ref = chains
-        if ref_file not in self._struct_cache:
-            self._struct_cache[ref_file] = _parse_path(ref_file)
-        self.ref_struct = self._struct_cache[ref_file].clone()
+        self.ref_struct = self._load_cached_structure(ref_file)
         self.ref_seqs, self.ref_lens = extract_sequences_and_lengths(self.ref_struct, os.path.basename(ref_file))
         if self.verbose:
             print(f"Reference set to: {self.ref_file}")
@@ -913,9 +971,7 @@ class PDBAligner:
         mob_file = os.path.abspath(mob_file)
         self.mob_file = mob_file
         self.chains_mob = chains
-        if mob_file not in self._struct_cache:
-            self._struct_cache[mob_file] = _parse_path(mob_file)
-        self.mob_struct = self._struct_cache[mob_file].clone()
+        self.mob_struct = self._load_cached_structure(mob_file)
         self.mob_seqs, self.mob_lens = extract_sequences_and_lengths(self.mob_struct, os.path.basename(mob_file))
         if self.verbose:
             print(f"Mobile set to: {self.mob_file}")
@@ -1067,7 +1123,13 @@ class PDBAligner:
             if aln:
                 ref_atoms, mob_atoms = get_aligned_atoms_by_alignment(self.ref_struct, ref_chs, self.mob_struct, mob_chs, aln, atoms=atoms, min_b_factor=min_b_factor, min_plddt=min_plddt)
                 if ref_atoms and mob_atoms:
-                    si = superimpose_atoms(ref_atoms, mob_atoms)
+                    # Forward outlier-rejection controls so the seq-guided path is
+                    # governed by the same recycles/keep_fraction as seq-free.
+                    si = superimpose_atoms(
+                        ref_atoms, mob_atoms,
+                        recycles=int(kwargs.get("recycles", 0)),
+                        keep_fraction=float(kwargs.get("keep_fraction", 1.0)),
+                    )
                     if si:
                         seqguided = dict(aln=aln, ref_atoms=ref_atoms, mob_atoms=mob_atoms, si=si)
 
@@ -1088,8 +1150,7 @@ class PDBAligner:
                 )
                 seqfree = res
             except Exception as e:
-                import traceback
-                traceback.print_exc()
+                logger.warning("Sequence-free alignment failed: %s", e, exc_info=True)
 
         if mode in ("auto", "Auto (best RMSD)"):
             best, reason = pick_best_overall(seqguided, seqfree, min_pairs=3)
@@ -1440,115 +1501,49 @@ class PDBAligner:
             raise ValueError("Both reference and mobile structures must be set.")
         return compute_chain_similarity_matrix(self.ref_seqs, self.mob_seqs)
 
-    def save_aligned_pdb(self, filename: str, subset_only: bool = False):
-        """Saves the aligned mobile structure to a PDB file. Maps alignment distance into B-factor."""
+    def save_aligned_pdb(self, filename: str, subset_only: bool = False,
+                         preserve_bfactor: bool = False):
+        """Saves the aligned mobile structure to a PDB file. Maps alignment
+        distance into the B-factor column (unless ``preserve_bfactor=True``).
+
+        Delegates to :meth:`AlignmentResult.save_aligned_pdb` so there is a
+        single implementation of the transform/B-factor logic.
+        """
         if not self.last_result:
             raise ValueError("No alignment results available. Run align() first.")
 
-        chosen = self.last_result["chosen"]
-        R = None
-        t = None
-        per_res_rmsd = None
-        ref_atoms = []
-        mob_atoms = []
-
-        if chosen["seqguided"]:
-            R = chosen["seqguided"]["si"]["rotation"]
-            t = chosen["seqguided"]["si"]["translation"]
-            per_res_rmsd = chosen["seqguided"]["si"]["per_residue_rmsd"]
-            ref_atoms = chosen["seqguided"]["ref_atoms"]
-            mob_atoms = chosen["seqguided"]["mob_atoms"]
-        elif chosen["seqfree"]:
-            R = chosen["seqfree"].rotation
-            t = chosen["seqfree"].translation
-            # Sequence-free aligns CA only usually
-            ref_subset = chosen["seqfree"].ref_subset_ca_coords
-            mob_subset = chosen["seqfree"].mob_subset_ca_coords_aligned
-            pairs = chosen["seqfree"].pairs
-            ref_infos = chosen["seqfree"].ref_subset_infos
-            mob_infos = chosen["seqfree"].mob_subset_infos
-
-            import numpy as np
-            per_res_rmsd = []
-            for (i, j) in pairs:
-                dist = np.linalg.norm(ref_subset[i] - mob_subset[j])
-                per_res_rmsd.append(dist)
-
-            class PseudoAtom:
-                def __init__(self, c_name, r_seq, r_ico):
-                    self.chain_name = c_name
-                    self.res_seq = r_seq
-                    self.res_icode = r_ico
-
-            # Since pairs are (i,j) indexes into ref_infos and mob_infos
-            ref_atoms = []
-            mob_atoms = []
-            for (i, j) in pairs:
-                ref_atoms.append(PseudoAtom(ref_infos[i].chain_id, ref_infos[i].resseq, ref_infos[i].icode))
-                mob_atoms.append(PseudoAtom(mob_infos[j].chain_id, mob_infos[j].resseq, mob_infos[j].icode))
-
-        if R is not None and t is not None:
-            # We use gemmi to save the transformed structure
-            import numpy as np
-            out_struct = self.mob_struct.clone() if hasattr(self.mob_struct, 'clone') else self.mob_struct.copy()
-
-            # Create a lookup mapping for distances
-            dist_map = {}
-            if mob_atoms and per_res_rmsd is not None:
-                for k in range(min(len(mob_atoms), len(per_res_rmsd))):
-                    ma = mob_atoms[k]
-                    # Handle pseudo atoms and normal atoms uniformly
-                    c_name = getattr(ma, 'chain_name', getattr(ma, 'last_chain_name', 'A'))
-                    # Usually get_id() for normal atoms
-                    if hasattr(ma, 'get_id'):
-                        het, r_seq, r_ico = ma.get_parent().get_id()
-                    else:
-                        r_seq = ma.res_seq
-                        r_ico = ma.res_icode
-
-                    key = (c_name, r_seq, r_ico.strip() if hasattr(r_ico, 'strip') else "")
-                    dist_map[key] = float(per_res_rmsd[k])
-
-            for model in out_struct:
-                for chain in model:
-                    for residue in chain:
-                        resseq = residue.seqid.num
-                        icode = residue.seqid.icode if hasattr(residue.seqid, 'has_icode') and residue.seqid.has_icode() else ""
-                        if not icode and hasattr(residue.seqid, 'icode') and residue.seqid.icode != ' ':
-                            icode = residue.seqid.icode
-
-                        key = (chain.name, resseq, icode.strip() if hasattr(icode, 'strip') else "")
-                        mapped_bfactor = dist_map.get(key, 0.0)
-
-                        for atom in residue:
-                            coord = np.array(atom.pos.tolist(), dtype=float)
-                            new_coord = (R @ coord) + t
-                            atom.pos.x = float(new_coord[0])
-                            atom.pos.y = float(new_coord[1])
-                            atom.pos.z = float(new_coord[2])
-
-                            # Overwrite B-factor with local deviation distance
-                            atom.b_iso = mapped_bfactor
-
-            if filename.lower().endswith(".pdb"):
-                out_struct.write_pdb(filename)
-            elif filename.lower().endswith(".cif") or filename.lower().endswith(".mmcif"):
-                out_struct.make_mmcif_document().write_file(filename)
-            else:
-                out_struct.write_pdb(filename)
+        result = AlignmentResult(
+            chosen=self.last_result["chosen"],
+            seqguided=self.last_result["seqguided"],
+            seqfree=self.last_result["seqfree"],
+            ref_file=self.ref_file, mob_file=self.mob_file,
+            mob_struct=self.mob_struct,
+            ref_lens=self.ref_lens, mob_lens=self.mob_lens,
+            verbose=self.verbose,
+        )
+        result.save_aligned_pdb(filename, subset_only=subset_only,
+                                preserve_bfactor=preserve_bfactor)
 
     def get_log(self) -> str:
         """Returns the alignment log summary as a string."""
-        if not self._chosen:
+        if not self.last_result:
             raise ValueError("No alignment results available. Run align() first.")
+        chosen = self.last_result["chosen"]
+        seqguided = chosen.get("seqguided")
+        seqfree = chosen.get("seqfree")
+        if seqguided:
+            rmsd = seqguided["si"]["rmsd"]
+        elif seqfree:
+            rmsd = seqfree.rmsd
+        else:
+            rmsd = None
         lines = []
         lines.append("PDB Aligner Result Log")
         lines.append("="*20)
         lines.append(f"Reference: {self.ref_file}")
         lines.append(f"Mobile: {self.mob_file}")
-        chosen = self._chosen
         lines.append(f"Chosen method: {chosen['name']}")
-        lines.append(f"RMSD: {self.get_rmsd():.3f} Å" if self.get_rmsd() is not None else "RMSD: None")
+        lines.append(f"RMSD: {rmsd:.3f} Å" if rmsd is not None else "RMSD: None")
         lines.append(f"Reason: {chosen['reason']}")
         return "\n".join(lines)
 

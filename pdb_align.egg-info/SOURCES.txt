@@ -2,6 +2,7 @@ README.md
 pyproject.toml
 setup.py
 pdb_align/__init__.py
+pdb_align/__main__.py
 pdb_align/aligner.py
 pdb_align/aligner_patch.py
 pdb_align/core.py
@@ -15,3 +16,5 @@ pdb_align.egg-info/SOURCES.txt
 pdb_align.egg-info/dependency_links.txt
 pdb_align.egg-info/requires.txt
 pdb_align.egg-info/top_level.txt
+tests/test_aligner.py
+tests/test_core.py

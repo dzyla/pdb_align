@@ -574,13 +574,13 @@ def sequence_independent_alignment_joined_v2(
         summaries["window"]=AlignSummary("window", float(rmsd_w), active_len_w, len(pairs_w), 1+recycles)
         candidates["window"]=dict(pairs=pairs_w, rmsd=rmsd_w, R=R_w, t=t_w, mask=mask_w)
 
-    # choose by lowest RMSD; pairs only tie-break
+    # choose by coverage-weighted score (same philosophy as pick_best_overall):
+    # a strategy matching a few residues at low RMSD must not beat one that
+    # superimposes many residues well.
     if method=="shape": chosen="shape"
     elif method=="window": chosen="window"
     else:
-        def keyfun(mname):
-            s=summaries[mname]; return (s.rmsd, -s.inliers)
-        chosen=min(candidates.keys(), key=keyfun)
+        chosen=_select_seqfree_method({k: summaries[k] for k in candidates})
 
     R=candidates[chosen]["R"]; t=candidates[chosen]["t"]
     final_pairs=candidates[chosen]["pairs"]; final_rmsd=float(candidates[chosen]["rmsd"])
@@ -786,12 +786,16 @@ def get_aligned_atoms_by_alignment(ref_struct: gemmi.Structure, ref_chains, mob_
                             if not in_bounds:
                                 continue
 
+                        # Require a CA in every mode: the alignment sequence is
+                        # built from CA-bearing residues only, so including a
+                        # CA-less residue here would desynchronise the residue
+                        # list from the sequence and mis-pair downstream.
                         has_ca = False
                         for atom in res:
                             if atom.name == "CA":
                                 has_ca = True
                                 break
-                        if atoms == "CA" and not has_ca:
+                        if not has_ca:
                             continue
 
                         # Filter by B-factor for CA atoms if requested
@@ -1005,10 +1009,30 @@ def _coverage_score(rmsd: float, pairs: int) -> float:
     return pairs / (1.0 + (rmsd / _SELECTION_RMSD_SCALE) ** 2)
 
 
+def _select_seqfree_method(summaries: Dict[str, "AlignSummary"]) -> str:
+    """
+    Pick the best sequence-free strategy (shape vs window) by coverage-weighted
+    score. Higher score wins; ties fall back to the lower RMSD. ``inliers`` is
+    the active (kept) pair count after outlier rejection.
+    """
+    return max(
+        summaries.keys(),
+        key=lambda m: (_coverage_score(summaries[m].rmsd, summaries[m].inliers),
+                       -summaries[m].rmsd),
+    )
+
+
 def pick_best_overall(seqguided, seqfree, min_pairs:int=3):
     cands=[]
     if seqguided is not None:
-        cands.append(dict(name="Sequence-guided", rmsd=float(seqguided["si"]["rmsd"]), pairs=len(seqguided["ref_atoms"]), kind="seqguided"))
+        # Count residues (CA atoms), not atoms: with atoms="backbone"/"all_heavy"
+        # ref_atoms holds several atoms per residue, which would otherwise inflate
+        # the coverage term and bias selection toward the seq-guided candidate.
+        ref_atoms = seqguided["ref_atoms"]
+        n_res = sum(1 for a in ref_atoms if getattr(a, "get_name", lambda: "CA")() == "CA")
+        if n_res == 0:
+            n_res = len(ref_atoms)
+        cands.append(dict(name="Sequence-guided", rmsd=float(seqguided["si"]["rmsd"]), pairs=n_res, kind="seqguided"))
     if seqfree is not None:
         cands.append(dict(name=f"Sequence-free ({seqfree.method})", rmsd=float(seqfree.rmsd), pairs=int(seqfree.kept_pairs), kind="seqfree"))
     if not cands: return None, "No candidates available."

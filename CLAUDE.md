@@ -50,7 +50,7 @@ The package has two layers: a **Python library** and a **Streamlit frontend**.
   - `AlignmentResult` — stateless result object. All properties computed lazily from `_chosen`/`_seqguided`/`_seqfree` dicts. Has `rmsd` (weighted-average when `domains` is set), `tm_score`, `domains` (List[DomainResult] or None), export methods, and plotting.
   - `EnsembleResult` — holds a list of `AlignmentResult` objects from an ensemble run. Methods: `summary()` → DataFrame, `rmsd_matrix()` → NxN DataFrame, `cluster(n_clusters)` → K-means labels, `plot_pca(color_by)` → matplotlib Figure, `plot_dendrogram()` → matplotlib Figure.
   - `PDBAligner` — orchestrates loading, aligning, and batch processing:
-    - `add_reference()` / `add_mobile()` — parse and cache structures; `_struct_cache` (instance-scoped dict, keyed by `os.path.abspath`) avoids re-parsing the same file; always returns `.clone()` on cache hit
+    - `add_reference()` / `add_mobile()` — parse and cache structures via `_load_cached_structure()`; `_struct_cache` (instance-scoped dict, keyed by `os.path.abspath`, storing `(structure, (mtime, size))`) avoids re-parsing an unchanged file and re-parses when the file changes on disk; always returns `.clone()` on cache hit. Remote IDs (`pdb:XXXX`, `af:UniProtID`) are downloaded to `self._fetch_cache_dir` (default `~/.cache/pdb_align`, override with `PDB_ALIGN_CACHE_DIR`), written atomically; AlphaFold fetches fall back across model versions (v6→v5→v4).
     - `align(mode, atoms, ...)` — modes: `"auto"`, `"seq_guided"`, `"seq_free_shape"`, `"seq_free_window"`, `"flexible"`. Flexible mode runs auto first, then detects hinges via `_detect_hinges`, runs per-domain Kabsch, returns domains in `result.domains`.
     - `align_ensemble(mob_list, mode, atoms, out_dir)` — iterates a list of mobile paths, returns `EnsembleResult`; emits `UserWarning` per failed model
     - `batch_align()` / `batch_align_iter()` — directory-level batch with `ProcessPoolExecutor`
@@ -72,5 +72,6 @@ Single-file app that exposes the `PDBAligner` API via file uploads, interactive 
 - `AlignmentResult` is **stateless** — all properties are computed lazily from the raw alignment dicts stored at construction time.
 - `mode="auto"` runs both sequence-guided and sequence-free paths, then calls `pick_best_overall()` to select the winner.
 - `mode="flexible"` first runs `mode="auto"`, then detects hinges on per-residue CA RMSD, and re-runs `_kabsch()` independently per domain.
-- The structure cache is **instance-scoped** (not shared across `PDBAligner` instances) and returns `.clone()` on every hit to prevent in-place mutation from corrupting cached structures.
+- The structure cache is **instance-scoped** (not shared across `PDBAligner` instances) and returns `.clone()` on every hit to prevent in-place mutation from corrupting cached structures. It invalidates when the file's mtime/size changes.
+- Both the internal shape-vs-window choice (`_select_seqfree_method`) and the overall seq-guided-vs-seq-free choice (`pick_best_overall`) rank candidates by the same coverage-weighted score, counting residues (CA atoms), not raw atoms.
 - `numba` JIT decorates `_sliding_window_mean` in `core.py`; the fallback no-op decorator ensures the code runs without numba installed.
