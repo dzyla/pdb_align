@@ -1,4 +1,5 @@
 import os
+import io
 import logging
 import tempfile
 import warnings
@@ -121,7 +122,7 @@ class AlignmentResult:
             return format(v, spec) if v is not None else "n/a"
         lines = []
         lines.append("=" * 52)
-        lines.append(" pdb_align — structural comparison")
+        lines.append(" pdb_align - structural comparison")
         lines.append("=" * 52)
         import os
         lines.append(f" Reference : {os.path.basename(s['ref_file'])}")
@@ -797,7 +798,7 @@ class LoadedResult:
             "Chain": list(z["rmsd_chains"]),
             "RMSD": z["rmsd_values"],
         })
-        per_chain = pd.read_json(str(z["per_chain_json"]), orient="records")
+        per_chain = pd.read_json(io.StringIO(str(z["per_chain_json"])), orient="records")
         return cls(meta, rmsd_df, per_chain, z["ref_coords"], z["mob_coords"])
 
     def summary_stats(self):
@@ -1423,17 +1424,11 @@ class PDBAligner:
         import numpy as np
         from .core import compute_gdt_ts
 
-        class _PA:
-            def __init__(self, info):
-                self.chain_name = info.chain_id
-                self.res_seq = info.resseq
-                self.res_icode = info.icode
-                self._coord = info.coord
-            def get_name(self): return "CA"
-            def get_coord(self): return self._coord
-
-        ref_atoms = [_PA(i) for i in mc.ref_infos]
-        mob_atoms = [_PA(i) for i in mc.mob_infos]
+        # mc.ref_infos / mc.mob_infos are already PseudoAtom objects (from
+        # core.get_aligned_atoms_by_alignment), exposing get_name()/get_coord()/
+        # chain_name/res_seq/res_icode -- no wrapping needed.
+        ref_atoms = mc.ref_infos
+        mob_atoms = mc.mob_infos
         diff = mc.ref_coords - mc.mob_coords_aligned
         per_res = np.sqrt(np.sum(diff ** 2, axis=1)) if len(diff) else np.array([])
         gdt = compute_gdt_ts(per_res) if len(per_res) else None

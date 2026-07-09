@@ -3,7 +3,11 @@ from dataclasses import dataclass, field
 from typing import List, Tuple
 import numpy as np
 
-from .core import compute_chain_similarity_matrix, _extract_ca_infos, _kabsch
+from .core import (
+    compute_chain_similarity_matrix, _extract_ca_infos, _kabsch,
+    extract_sequences_and_lengths, perform_sequence_alignment,
+    get_aligned_atoms_by_alignment, _SELECTION_RMSD_SCALE,
+)
 
 MAX_PERMUTE_CHAINS = 12
 _TIE_TOL = 5.0  # % identity within which chains are treated as indistinguishable
@@ -49,7 +53,7 @@ def match_chains(ref_seqs, mob_seqs, ref_struct, mob_struct,
     )
 
     # Refine homomultimers where sequence identity ties across candidates.
-    if _needs_permutation_refinement(mat) and ref_struct is not None:
+    if _needs_permutation_refinement(mat) and ref_struct is not None and mob_struct is not None:
         mapping = _refine_by_superposition(
             mapping, ref_struct, mob_struct, r_ids, m_ids, mat)
     return mapping
@@ -139,32 +143,55 @@ class MultiChainResult:
 
 
 def _coverage_score(n_pairs: int, rmsd: float) -> float:
-    return n_pairs / (1.0 + (rmsd / 3.0) ** 2)
+    return n_pairs / (1.0 + (rmsd / _SELECTION_RMSD_SCALE) ** 2)
+
+
+def _matched_atoms_per_chain(ref_struct, mob_struct, mapping, atoms, min_b_factor, min_plddt):
+    """For each mapped chain pair, pair residues by sequence alignment (not
+    list index) so unmodeled/missing residues in either chain don't shift
+    every subsequent residue's pairing. Returns a list of
+    (ref_chain, mob_chain, ref_atoms, mob_atoms) with equal-length matched
+    atom lists honoring `atoms` (CA/backbone/all_heavy)."""
+    ref_seqs, _ = extract_sequences_and_lengths(ref_struct, "ref")
+    mob_seqs, _ = extract_sequences_and_lengths(mob_struct, "mob")
+    out = []
+    for a, b, *_ in mapping.pairs:
+        if a not in ref_seqs or b not in mob_seqs:
+            continue
+        aln = perform_sequence_alignment(str(ref_seqs[a].seq), str(mob_seqs[b].seq), -10.0, -0.5)
+        if not aln:
+            continue
+        ratoms, matoms = get_aligned_atoms_by_alignment(
+            ref_struct, [a], mob_struct, [b], aln, atoms=atoms,
+            min_b_factor=min_b_factor, min_plddt=min_plddt)
+        if not ratoms or not matoms:
+            continue
+        out.append((a, b, ratoms, matoms))
+    return out
 
 
 def _paired_ca(ref_struct, mob_struct, mapping, atoms, min_b_factor, min_plddt):
-    """Return matched CA coords + infos across all mapped chains (by residue order)."""
-    ref_infos, mob_infos = [], []
-    for a, b, *_ in mapping.pairs:
-        ri = _extract_ca_infos(ref_struct, [a], min_b_factor, min_plddt)
-        mi = _extract_ca_infos(mob_struct, [b], min_b_factor, min_plddt)
-        n = min(len(ri), len(mi))
-        ref_infos.extend(ri[:n]); mob_infos.extend(mi[:n])
-    P = np.array([i.coord for i in ref_infos]) if ref_infos else np.empty((0, 3))
-    Q = np.array([i.coord for i in mob_infos]) if mob_infos else np.empty((0, 3))
-    return P, Q, ref_infos, mob_infos
+    """Return matched atom coords + atom objects across all mapped chains,
+    paired by per-chain sequence alignment (correctly skips gaps)."""
+    per_chain = _matched_atoms_per_chain(ref_struct, mob_struct, mapping,
+                                        atoms, min_b_factor, min_plddt)
+    ref_atoms, mob_atoms = [], []
+    for a, b, ra, ma in per_chain:
+        ref_atoms.extend(ra); mob_atoms.extend(ma)
+    P = np.array([x.get_coord() for x in ref_atoms]) if ref_atoms else np.empty((0, 3))
+    Q = np.array([x.get_coord() for x in mob_atoms]) if mob_atoms else np.empty((0, 3))
+    return P, Q, ref_atoms, mob_atoms
 
 
-def _per_chain_rmsd(mapping, ref_struct, mob_struct, R, t, min_b_factor, min_plddt):
+def _per_chain_rmsd_from_matches(per_chain_matches, R, t):
+    """Compute each chain's RMSD from its own matched atoms under (R, t)."""
     rows = []
-    for a, b, *_ in mapping.pairs:
-        ri = _extract_ca_infos(ref_struct, [a], min_b_factor, min_plddt)
-        mi = _extract_ca_infos(mob_struct, [b], min_b_factor, min_plddt)
-        n = min(len(ri), len(mi))
+    for a, b, ra, ma in per_chain_matches:
+        n = len(ra)
         if n == 0:
             continue
-        P = np.array([x.coord for x in ri[:n]])
-        Q = np.array([x.coord for x in mi[:n]])
+        P = np.array([x.get_coord() for x in ra])
+        Q = np.array([x.get_coord() for x in ma])
         Qa = (R @ Q.T).T + t
         rmsd = float(np.sqrt(np.mean(np.sum((P - Qa) ** 2, axis=1))))
         rows.append({"chain_ref": a, "chain_mob": b, "n_residues": n, "rmsd": rmsd})
@@ -175,19 +202,23 @@ def align_multichain(ref_struct, mob_struct, mapping, strategy="auto",
                      atoms="CA", min_b_factor=0.0, min_plddt=0.0) -> MultiChainResult:
     """Build global and/or local superpositions and pick per coverage-weighted score."""
     def build(sub_mapping, name):
-        P, Q, ri, mi = _paired_ca(ref_struct, mob_struct, sub_mapping,
-                                  atoms, min_b_factor, min_plddt)
+        per_chain_matches = _matched_atoms_per_chain(
+            ref_struct, mob_struct, sub_mapping, atoms, min_b_factor, min_plddt)
+        ref_atoms, mob_atoms = [], []
+        for a, b, ra, ma in per_chain_matches:
+            ref_atoms.extend(ra); mob_atoms.extend(ma)
+        P = np.array([x.get_coord() for x in ref_atoms]) if ref_atoms else np.empty((0, 3))
+        Q = np.array([x.get_coord() for x in mob_atoms]) if mob_atoms else np.empty((0, 3))
         if len(P) < 3:
             return None
         R, t, rmsd = _kabsch(P, Q)
         Qa = (R @ Q.T).T + t
-        per_chain = _per_chain_rmsd(sub_mapping, ref_struct, mob_struct, R, t,
-                                    min_b_factor, min_plddt)
+        per_chain = _per_chain_rmsd_from_matches(per_chain_matches, R, t)
         return MultiChainResult(
             strategy=name, mapping=sub_mapping, rotation=R, translation=t,
             rmsd=rmsd, pairs=list(range(len(P))), ref_coords=P,
             mob_coords_aligned=Qa, per_chain=per_chain,
-            ref_infos=ri, mob_infos=mi)
+            ref_infos=ref_atoms, mob_infos=mob_atoms)
 
     global_res = build(mapping, "global")
 
