@@ -55,7 +55,7 @@ def main(argv=None) -> int:
     ref_chains = args.ref_chains.split() if args.ref_chains else None
     mob_chains = args.mob_chains.split() if args.mob_chains else None
 
-    aligner = PDBAligner(verbose=args.verbose)
+    aligner = PDBAligner(verbose=args.verbose and not args.json)
     try:
         aligner.add_reference(ref, chains=ref_chains)
         aligner.add_mobile(mob, chains=mob_chains)

@@ -45,3 +45,23 @@ def test_legacy_ref_mob_flags_still_work(tmp_path, capsys):
     rc = main(["--ref", str(ref), "--mob", str(mob)])
     assert rc == 0
     assert "RMSD" in capsys.readouterr().out
+
+
+def test_json_with_verbose_still_valid_json(tmp_path, capsys):
+    ref, mob = tmp_path / "r.pdb", tmp_path / "m.pdb"
+    _write_single(str(ref)); _write_single(str(mob), x0=2.0)
+    rc = main([str(ref), str(mob), "--json", "-v"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)   # must not raise
+    assert "strategy" in payload
+
+
+def test_missing_args_returns_2(capsys):
+    rc = main([])
+    assert rc == 2
+
+
+def test_alignment_failure_returns_1(tmp_path):
+    mob = tmp_path / "m.pdb"; _write_single(str(mob))
+    rc = main([str(tmp_path / "does_not_exist.pdb"), str(mob)])
+    assert rc == 1
