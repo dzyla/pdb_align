@@ -702,6 +702,81 @@ view
     def __repr__(self):
         return f"<AlignmentResult RMSD: {self.rmsd:.3f}Å, Method: {self._chosen['name']}>"
 
+    _SAVE_VERSION = 1
+
+    def save(self, path: str):
+        """Persist all computed data to a versioned .npz (no gemmi needed to reload)."""
+        import numpy as np, json
+        df = self.get_rmsd_df()
+        per_chain = self.per_chain
+        meta = self.summary_stats()
+        meta["_save_version"] = self._SAVE_VERSION
+        coords = self.get_aligned_coords()
+        ref_c, mob_c = (coords if coords is not None else (np.empty((0, 3)), np.empty((0, 3))))
+        np.savez_compressed(
+            path,
+            meta_json=json.dumps(meta, default=float),
+            rmsd_residues=np.array(df["Residue"].tolist(), dtype=object),
+            rmsd_chains=np.array(df["Chain"].tolist(), dtype=object),
+            rmsd_values=df["RMSD"].to_numpy(dtype=float),
+            per_chain_json=per_chain.to_json(orient="records"),
+            ref_coords=np.asarray(ref_c, dtype=float),
+            mob_coords=np.asarray(mob_c, dtype=float),
+        )
+
+    @staticmethod
+    def load(path: str) -> "LoadedResult":
+        return LoadedResult._from_npz(path)
+
+
+class LoadedResult:
+    """A replayable, gemmi-free view of a saved AlignmentResult."""
+
+    def __init__(self, meta, rmsd_df, per_chain, ref_coords, mob_coords):
+        self._meta = meta
+        self._rmsd_df = rmsd_df
+        self._per_chain = per_chain
+        self.ref_coords = ref_coords
+        self.mob_coords_aligned = mob_coords
+        self.strategy = meta.get("strategy")
+        self.rmsd = meta.get("rmsd")
+        self.tm_score = meta.get("tm_score")
+
+    @classmethod
+    def _from_npz(cls, path):
+        import numpy as np, json, pandas as pd
+        z = np.load(path, allow_pickle=True)
+        meta = json.loads(str(z["meta_json"]))
+        if meta.get("_save_version") != AlignmentResult._SAVE_VERSION:
+            raise ValueError(
+                f"Unsupported save version {meta.get('_save_version')}; "
+                f"expected {AlignmentResult._SAVE_VERSION}."
+            )
+        rmsd_df = pd.DataFrame({
+            "Residue": list(z["rmsd_residues"]),
+            "Chain": list(z["rmsd_chains"]),
+            "RMSD": z["rmsd_values"],
+        })
+        per_chain = pd.read_json(str(z["per_chain_json"]), orient="records")
+        return cls(meta, rmsd_df, per_chain, z["ref_coords"], z["mob_coords"])
+
+    def summary_stats(self):
+        return dict(self._meta)
+
+    def get_rmsd_df(self, on="reference"):
+        return self._rmsd_df.copy()
+
+    @property
+    def per_chain(self):
+        return self._per_chain
+
+    # Reuse the exact rendering logic from AlignmentResult by delegation.
+    report = AlignmentResult.report
+    plot_rmsd = AlignmentResult.plot_rmsd
+    # NOTE: plot_summary is added in Task 4; intentionally omitted here to
+    # avoid AttributeError at class-definition time. A later task will add:
+    #   plot_summary = AlignmentResult.plot_summary
+
 
 class EnsembleResult:
     """

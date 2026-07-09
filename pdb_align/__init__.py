@@ -1,6 +1,6 @@
 """pdb_align — high-performance protein structure alignment."""
 
-from .aligner import PDBAligner, AlignmentResult, AlignmentFailedError, EnsembleResult, DomainResult
+from .aligner import PDBAligner, AlignmentResult, AlignmentFailedError, EnsembleResult, DomainResult, LoadedResult
 from .exceptions import ParsingError, ChainNotFoundError
 
 __all__ = [
@@ -10,6 +10,7 @@ __all__ = [
     "AlignmentFailedError",
     "EnsembleResult",
     "DomainResult",
+    "LoadedResult",
     "ParsingError",
     "ChainNotFoundError",
 ]

@@ -35,3 +35,30 @@ def test_report_text_mentions_rmsd(result):
 def test_report_json_roundtrips(result):
     payload = json.loads(result.report(fmt="json"))
     assert payload["strategy"] == result.strategy
+
+
+def test_save_load_roundtrip_reproduces_stats(result, tmp_path):
+    p = tmp_path / "run.npz"
+    result.save(str(p))
+    from pdb_align import AlignmentResult
+    loaded = AlignmentResult.load(str(p))
+    assert loaded.strategy == result.strategy
+    a, b = result.summary_stats(), loaded.summary_stats()
+    for key in ("rmsd", "tm_score", "n_aligned", "strategy"):
+        av, bv = a[key], b[key]
+        if av is None and bv is None:
+            continue
+        if isinstance(av, (int, float)) and isinstance(bv, (int, float)):
+            assert abs(av - bv) < 1e-6
+        else:
+            assert av == bv
+
+
+def test_loaded_result_replots_without_original_files(result, tmp_path):
+    p = tmp_path / "run.npz"
+    result.save(str(p))
+    from pdb_align import AlignmentResult
+    loaded = AlignmentResult.load(str(p))
+    out = tmp_path / "r.png"
+    loaded.plot_rmsd(filename=str(out))
+    assert out.exists()
