@@ -28,3 +28,12 @@ def test_panel_label_adds_text():
     plotstyle.panel_label(ax, "a")
     assert any(t.get_text() == "a" for t in ax.texts)
     plt.close(fig)
+
+
+def test_plot_summary_returns_figure(tmp_path):
+    import pdb_align
+    r = pdb_align.align("tests/data/ref.pdb", "tests/data/mob.pdb")
+    out = tmp_path / "summary.png"
+    fig = r.plot_summary(filename=str(out))
+    assert fig is not None
+    assert out.exists()

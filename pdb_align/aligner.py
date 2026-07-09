@@ -585,6 +585,44 @@ class AlignmentResult:
                 plt.savefig(filename, bbox_inches='tight')
                 plt.close()
 
+    def plot_summary(self, filename: str = None, show: bool = False):
+        """Compact multi-panel Nature-style summary: per-residue RMSD + per-chain bar + scores."""
+        import matplotlib
+        if not show:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from . import plotstyle
+        df = self.get_rmsd_df()
+        stats = self.summary_stats()
+        with plotstyle.apply_nature_style():
+            fig, axes = plt.subplots(1, 2, figsize=(183/25.4, 183/25.4*0.4))
+            ax0, ax1 = axes
+            if not df.empty:
+                for i, (chain, g) in enumerate(df.groupby("Chain")):
+                    ax0.plot(range(len(g)), g["RMSD"], lw=0.9,
+                             color=plotstyle.PALETTE[i % len(plotstyle.PALETTE)], label=str(chain))
+                ax0.set_xlabel("Residue index"); ax0.set_ylabel(r"C$\alpha$ deviation ($\AA$)")
+                if df["Chain"].nunique() > 1:
+                    ax0.legend(frameon=False)
+            plotstyle.panel_label(ax0, "a")
+            pc = self.per_chain
+            if not pc.empty:
+                labels = [f"{a}->{b}" for a, b in zip(pc["chain_ref"], pc["chain_mob"])]
+                ax1.bar(labels, pc["rmsd"], color=plotstyle.PALETTE[0])
+                ax1.set_ylabel(r"RMSD ($\AA$)"); ax1.tick_params(axis="x", rotation=45)
+            else:
+                txt = (f"RMSD {stats['rmsd']:.2f} A\n"
+                       f"TM {stats['tm_score']:.3f}" if stats['rmsd'] is not None else "n/a")
+                ax1.text(0.5, 0.5, txt, ha="center", va="center", transform=ax1.transAxes)
+                ax1.axis("off")
+            plotstyle.panel_label(ax1, "b")
+            fig.tight_layout()
+            if filename:
+                fig.savefig(filename)
+            if show:
+                plt.show()
+        return fig
+
     def save_pymol_script(self, filename: str, aligned_mobile_filename: str = "aligned_mobile.pdb"):
         """
         Generates a .pml script for PyMOL to easily visualize the alignment.
@@ -773,9 +811,7 @@ class LoadedResult:
     # Reuse the exact rendering logic from AlignmentResult by delegation.
     report = AlignmentResult.report
     plot_rmsd = AlignmentResult.plot_rmsd
-    # NOTE: plot_summary is added in Task 4; intentionally omitted here to
-    # avoid AttributeError at class-definition time. A later task will add:
-    #   plot_summary = AlignmentResult.plot_summary
+    plot_summary = AlignmentResult.plot_summary
 
 
 class EnsembleResult:
