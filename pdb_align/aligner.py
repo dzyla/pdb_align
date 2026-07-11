@@ -279,37 +279,43 @@ class AlignmentResult:
         ``preserve_bfactor=True`` to keep the input B-factors (e.g. AlphaFold
         pLDDT) untouched.
         """
+        color_by = "bfactor" if preserve_bfactor else "rmsd"
+        out_struct = self._build_aligned_structure(color_by=color_by)
+        if filename.lower().endswith(".cif") or filename.lower().endswith(".mmcif"):
+            out_struct.make_mmcif_document().write_file(filename)
+        else:
+            out_struct.write_pdb(filename)
+
+    def _build_aligned_structure(self, color_by: str = "rmsd"):
+        """Return a transformed clone of the mobile structure.
+
+        ``color_by="rmsd"`` writes the per-residue alignment deviation (Å) into
+        every atom's ``b_iso``; ``color_by`` in ``{"bfactor", "plddt"}`` leaves the
+        original B-factors untouched. Shared by :meth:`save_aligned_pdb` and
+        :meth:`aligned_structure` so file output and in-memory views are identical.
+        """
+        import numpy as np
         if not self._chosen:
             raise ValueError("No alignment results available. Run align() first.")
 
         chosen = self._chosen
-        R = None
-        t = None
-        per_res_rmsd = None
-        ref_atoms = []
+        R = t = per_res_rmsd = None
         mob_atoms = []
 
         if chosen["seqguided"]:
             R = chosen["seqguided"]["si"]["rotation"]
             t = chosen["seqguided"]["si"]["translation"]
             per_res_rmsd = chosen["seqguided"]["si"]["per_residue_rmsd"]
-            ref_atoms = chosen["seqguided"]["ref_atoms"]
             mob_atoms = chosen["seqguided"]["mob_atoms"]
         elif chosen["seqfree"]:
             R = chosen["seqfree"].rotation
             t = chosen["seqfree"].translation
-            # Sequence-free aligns CA only usually
             ref_subset = chosen["seqfree"].ref_subset_ca_coords
             mob_subset = chosen["seqfree"].mob_subset_ca_coords_aligned
             pairs = chosen["seqfree"].pairs
-            ref_infos = chosen["seqfree"].ref_subset_infos
             mob_infos = chosen["seqfree"].mob_subset_infos
-
-            import numpy as np
-            per_res_rmsd = []
-            for (i, j) in pairs:
-                dist = np.linalg.norm(ref_subset[i] - mob_subset[j])
-                per_res_rmsd.append(dist)
+            per_res_rmsd = [float(np.linalg.norm(ref_subset[i] - mob_subset[j]))
+                            for (i, j) in pairs]
 
             class PseudoAtom:
                 def __init__(self, c_name, r_seq, r_ico):
@@ -317,64 +323,57 @@ class AlignmentResult:
                     self.res_seq = r_seq
                     self.res_icode = r_ico
 
-            # Since pairs are (i,j) indexes into ref_infos and mob_infos
-            ref_atoms = []
-            mob_atoms = []
-            for (i, j) in pairs:
-                ref_atoms.append(PseudoAtom(ref_infos[i].chain_id, ref_infos[i].resseq, ref_infos[i].icode))
-                mob_atoms.append(PseudoAtom(mob_infos[j].chain_id, mob_infos[j].resseq, mob_infos[j].icode))
+            mob_atoms = [PseudoAtom(mob_infos[j].chain_id, mob_infos[j].resseq,
+                                    mob_infos[j].icode) for (i, j) in pairs]
 
-        if R is not None and t is not None:
-            # We use gemmi to save the transformed structure
-            import numpy as np
-            out_struct = self.mob_struct.clone() if hasattr(self.mob_struct, 'clone') else self.mob_struct.copy()
+        if R is None or t is None:
+            raise ValueError("Chosen alignment has no transform.")
 
-            # Create a lookup mapping for distances
-            dist_map = {}
-            if mob_atoms and per_res_rmsd is not None:
-                for k in range(min(len(mob_atoms), len(per_res_rmsd))):
-                    ma = mob_atoms[k]
-                    # Handle pseudo atoms and normal atoms uniformly
-                    c_name = getattr(ma, 'chain_name', getattr(ma, 'last_chain_name', 'A'))
-                    # Usually get_id() for normal atoms
-                    if hasattr(ma, 'get_id'):
-                        het, r_seq, r_ico = ma.get_parent().get_id()
-                    else:
-                        r_seq = ma.res_seq
-                        r_ico = ma.res_icode
+        out_struct = self.mob_struct.clone() if hasattr(self.mob_struct, 'clone') \
+            else self.mob_struct.copy()
 
-                    key = (c_name, r_seq, r_ico.strip() if hasattr(r_ico, 'strip') else "")
-                    dist_map[key] = float(per_res_rmsd[k])
+        write_rmsd = (color_by == "rmsd")
+        dist_map = {}
+        if write_rmsd and mob_atoms and per_res_rmsd is not None:
+            for k in range(min(len(mob_atoms), len(per_res_rmsd))):
+                ma = mob_atoms[k]
+                c_name = getattr(ma, 'chain_name', getattr(ma, 'last_chain_name', 'A'))
+                if hasattr(ma, 'get_id'):
+                    het, r_seq, r_ico = ma.get_parent().get_id()
+                else:
+                    r_seq = ma.res_seq
+                    r_ico = ma.res_icode
+                key = (c_name, r_seq, r_ico.strip() if hasattr(r_ico, 'strip') else "")
+                dist_map[key] = float(per_res_rmsd[k])
 
-            for model in out_struct:
-                for chain in model:
-                    for residue in chain:
-                        resseq = residue.seqid.num
-                        icode = residue.seqid.icode if hasattr(residue.seqid, 'has_icode') and residue.seqid.has_icode() else ""
-                        if not icode and hasattr(residue.seqid, 'icode') and residue.seqid.icode != ' ':
-                            icode = residue.seqid.icode
+        for model in out_struct:
+            for chain in model:
+                for residue in chain:
+                    resseq = residue.seqid.num
+                    icode = residue.seqid.icode if hasattr(residue.seqid, 'has_icode') and residue.seqid.has_icode() else ""
+                    if not icode and hasattr(residue.seqid, 'icode') and residue.seqid.icode != ' ':
+                        icode = residue.seqid.icode
+                    key = (chain.name, resseq, icode.strip() if hasattr(icode, 'strip') else "")
+                    mapped_bfactor = dist_map.get(key, 0.0)
 
-                        key = (chain.name, resseq, icode.strip() if hasattr(icode, 'strip') else "")
-                        mapped_bfactor = dist_map.get(key, 0.0)
+                    for atom in residue:
+                        coord = np.array(atom.pos.tolist(), dtype=float)
+                        new_coord = (R @ coord) + t
+                        atom.pos.x = float(new_coord[0])
+                        atom.pos.y = float(new_coord[1])
+                        atom.pos.z = float(new_coord[2])
+                        if write_rmsd:
+                            atom.b_iso = mapped_bfactor
+        return out_struct
 
-                        for atom in residue:
-                            coord = np.array(atom.pos.tolist(), dtype=float)
-                            new_coord = (R @ coord) + t
-                            atom.pos.x = float(new_coord[0])
-                            atom.pos.y = float(new_coord[1])
-                            atom.pos.z = float(new_coord[2])
+    def aligned_structure(self, color_by: str = "rmsd"):
+        """In-memory transformed mobile structure for 3D viewing/export.
 
-                            # Overwrite B-factor with local deviation distance,
-                            # unless the caller asked to preserve the originals.
-                            if not preserve_bfactor:
-                                atom.b_iso = mapped_bfactor
-
-            if filename.lower().endswith(".pdb"):
-                out_struct.write_pdb(filename)
-            elif filename.lower().endswith(".cif") or filename.lower().endswith(".mmcif"):
-                out_struct.make_mmcif_document().write_file(filename)
-            else:
-                out_struct.write_pdb(filename)
+        Returns a :class:`gemmi.Structure` moved onto the reference frame. With
+        ``color_by="rmsd"`` (default) the per-residue deviation is stored in the
+        B-factor column; ``"bfactor"``/``"plddt"`` preserve the input B-factors.
+        """
+        return self._build_aligned_structure(color_by=color_by)
 
     def get_log(self) -> str:
         lines = []
