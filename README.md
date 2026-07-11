@@ -51,6 +51,32 @@ loaded.plot_summary("summary.png")
 
 `result.report(fmt="text"|"json")` gives a human-readable or machine-readable summary at any time; `result.plot_summary()` renders a compact Nature-style multi-panel figure (per-residue RMSD + per-chain/score panel).
 
+### Python: quality verdict, 3D structure, and one-call export
+
+Every `AlignmentResult` carries a plain-language quality assessment and can hand
+you a ready-to-view structure or a complete output bundle:
+
+```python
+r = pdb_align.align("ref.pdb", "mob.pdb")
+
+# Plain-language interpretation (band / verdict / confidence / flagged regions)
+print(r.quality.verdict)          # e.g. "Same fold: 97% of residues within 1.4 A, TM=0.82"
+print(r.quality.band, r.quality.confidence)
+for region in r.quality.flagged_regions:
+    print(region.chain, region.start_label, region.end_label, region.kind)
+
+# In-memory transformed mobile structure, B-factors = per-residue RMSD (for 3D)
+struct = r.aligned_structure(color_by="rmsd")   # gemmi.Structure
+
+# One reproducible bundle: aligned coords, RMSD CSV, plots, PyMOL/ChimeraX, report
+r.export_bundle("result.zip")                    # or fmt="dir" for a folder
+```
+
+The verdict also appears in `result.report()` and `result.to_json()["quality"]`,
+so the CLI (`pdb_align ref.pdb mob.pdb`, or `--json`) shows it too. For ensembles,
+`EnsembleResult.export_bundle("ensemble.zip")` writes the RMSD matrix, cluster
+labels, PCA, and dendrogram.
+
 ## Streamlit App
 
 Launch locally:
