@@ -421,6 +421,88 @@ class AlignmentResult:
         """
         return self._build_aligned_structure(color_by=color_by)
 
+    def _write_pymol_script(self, path, aligned_name, ref_name):
+        lines = [
+            f"load {ref_name}, ref",
+            f"load {aligned_name}, mob",
+            "hide everything",
+            "show cartoon",
+            "color grey70, ref",
+            "spectrum b, blue_white_red, mob",
+            "set cartoon_transparency, 0.1",
+            "zoom",
+        ]
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def _write_chimerax_script(self, path, aligned_name, ref_name):
+        lines = [
+            f"open {ref_name}",
+            f"open {aligned_name}",
+            "hide atoms",
+            "show cartoons",
+            "color #1 grey",
+            "color byattribute bfactor #2 palette blue:white:red",
+            "view",
+        ]
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def export_bundle(self, path, include=None, fmt="zip"):
+        """Write a reproducible bundle of alignment outputs.
+
+        Components (``include``, default all): ``aligned`` (transformed mobile
+        structure coloured by per-residue RMSD), ``rmsd_csv``, ``plots``
+        (summary + per-residue figures), ``pymol`` (.pml), ``chimerax`` (.cxc),
+        and ``report`` (text + JSON, both carrying the quality verdict).
+        ``fmt="zip"`` writes a ``.zip``; ``fmt="dir"`` a folder. Returns the path.
+        """
+        import os
+        import tempfile
+        import zipfile
+        import shutil
+        components = include or ["aligned", "rmsd_csv", "plots", "pymol",
+                                 "chimerax", "report"]
+        ref_name = "aligned.pdb"
+        workdir = tempfile.mkdtemp(prefix="pdb_align_bundle_")
+        try:
+            if "aligned" in components:
+                self.aligned_structure(color_by="rmsd").write_pdb(
+                    os.path.join(workdir, "aligned.pdb"))
+            if "rmsd_csv" in components:
+                self.get_rmsd_df().to_csv(os.path.join(workdir, "rmsd.csv"),
+                                          index=False)
+            if "plots" in components:
+                try:
+                    self.plot_summary(os.path.join(workdir, "summary.png"))
+                    self.plot_rmsd(filename=os.path.join(workdir, "rmsd.png"))
+                except Exception:
+                    pass
+            if "pymol" in components:
+                self._write_pymol_script(os.path.join(workdir, "view.pml"),
+                                         "aligned.pdb", ref_name)
+            if "chimerax" in components:
+                self._write_chimerax_script(os.path.join(workdir, "view.cxc"),
+                                            "aligned.pdb", ref_name)
+            if "report" in components:
+                with open(os.path.join(workdir, "report.txt"), "w") as f:
+                    f.write(self.report(fmt="text") + "\n")
+                with open(os.path.join(workdir, "report.json"), "w") as f:
+                    f.write(self.to_json())
+
+            if fmt == "dir":
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                shutil.copytree(workdir, path)
+                return path
+            zpath = path if path.endswith(".zip") else path + ".zip"
+            with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+                for fn in sorted(os.listdir(workdir)):
+                    z.write(os.path.join(workdir, fn), fn)
+            return zpath
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
     def get_log(self) -> str:
         lines = []
         lines.append("PDB Aligner Result Log")
