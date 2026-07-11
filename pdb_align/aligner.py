@@ -1122,6 +1122,46 @@ class EnsembleResult:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         return fig
 
+    def export_bundle(self, path, fmt="zip"):
+        """Write a reproducible ensemble bundle: ``summary.csv``,
+        ``rmsd_matrix.csv``, ``clusters.csv``, ``pca.png``, ``dendrogram.png``.
+
+        ``fmt="zip"`` writes a ``.zip``; ``fmt="dir"`` a folder. Returns the path.
+        """
+        import os
+        import tempfile
+        import zipfile
+        import shutil
+        workdir = tempfile.mkdtemp(prefix="pdb_align_ens_")
+        try:
+            self.summary().to_csv(os.path.join(workdir, "summary.csv"), index=False)
+            self.rmsd_matrix().to_csv(os.path.join(workdir, "rmsd_matrix.csv"))
+            try:
+                import pandas as pd
+                labels = self.cluster()
+                pd.DataFrame({"model": self.labels, "cluster": labels}).to_csv(
+                    os.path.join(workdir, "clusters.csv"), index=False)
+            except Exception:
+                pass
+            for meth, fn in ((self.plot_pca, "pca.png"),
+                             (self.plot_dendrogram, "dendrogram.png")):
+                try:
+                    meth(save_path=os.path.join(workdir, fn))
+                except Exception:
+                    pass
+            if fmt == "dir":
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                shutil.copytree(workdir, path)
+                return path
+            zpath = path if path.endswith(".zip") else path + ".zip"
+            with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+                for fn in sorted(os.listdir(workdir)):
+                    z.write(os.path.join(workdir, fn), fn)
+            return zpath
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
     def __repr__(self) -> str:
         n = len(self.results)
         preview = self.labels[:3]
