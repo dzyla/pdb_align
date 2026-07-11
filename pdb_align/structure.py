@@ -26,11 +26,15 @@ class StructureBase:
             return [chain.name for chain in self._struct[0]]
         
         parsed_chains = []
+        n_chains = len(self._struct[0])
         for c in chains:
             if isinstance(c, int):
-                if c >= len(self._struct[0]):
-                    raise ChainNotFoundError(f"Chain index {c} out of bounds.")
-                parsed_chains.append(self._struct[0][c].name)
+                # 1-based indexing, matching core._resolve_selectors.
+                if not (1 <= c <= n_chains):
+                    raise ChainNotFoundError(
+                        f"Chain index {c} out of range 1..{n_chains}."
+                    )
+                parsed_chains.append(self._struct[0][c - 1].name)
             else:
                 # Store string representations (could be "A" or "A:10-150")
                 parsed_chains.append(str(c))

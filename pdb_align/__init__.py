@@ -1,7 +1,10 @@
 """pdb_align — high-performance protein structure alignment."""
 
-from .aligner import PDBAligner, AlignmentResult, AlignmentFailedError, EnsembleResult, DomainResult
+from .aligner import PDBAligner, AlignmentResult, AlignmentFailedError, EnsembleResult, DomainResult, LoadedResult
 from .exceptions import ParsingError, ChainNotFoundError
+from .chains import match_chains, align_multichain, ChainMapping
+from .plotstyle import apply_nature_style
+from .interpretation import AlignmentQuality, FlaggedRegion
 
 __all__ = [
     "align",
@@ -10,8 +13,15 @@ __all__ = [
     "AlignmentFailedError",
     "EnsembleResult",
     "DomainResult",
+    "LoadedResult",
+    "AlignmentQuality",
+    "FlaggedRegion",
     "ParsingError",
     "ChainNotFoundError",
+    "match_chains",
+    "align_multichain",
+    "ChainMapping",
+    "apply_nature_style",
 ]
 
 
