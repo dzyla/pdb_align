@@ -4,6 +4,7 @@ from .aligner import PDBAligner, AlignmentResult, AlignmentFailedError, Ensemble
 from .exceptions import ParsingError, ChainNotFoundError
 from .chains import match_chains, align_multichain, ChainMapping
 from .plotstyle import apply_nature_style
+from .interpretation import AlignmentQuality, FlaggedRegion
 
 __all__ = [
     "align",
@@ -13,6 +14,8 @@ __all__ = [
     "EnsembleResult",
     "DomainResult",
     "LoadedResult",
+    "AlignmentQuality",
+    "FlaggedRegion",
     "ParsingError",
     "ChainNotFoundError",
     "match_chains",

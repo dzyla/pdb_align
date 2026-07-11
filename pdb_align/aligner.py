@@ -103,9 +103,44 @@ class AlignmentResult:
             "mob_file": self.mob_file,
         }
 
+    @property
+    def quality(self):
+        """Plain-language :class:`~pdb_align.interpretation.AlignmentQuality`.
+
+        A lazy, pure interpretation of the numbers already on this result:
+        quality band, one-line verdict, confidence, flagged flexible regions,
+        and warnings. Shared by :meth:`report`, :meth:`to_dict`, and the CLI.
+        """
+        from pdb_align.interpretation import assess
+        s = self.summary_stats()
+        try:
+            df = self.get_rmsd_df(on="reference")
+            per_residue = list(zip(df["Chain"], df["Residue"], df["RMSD"]))
+        except Exception:
+            per_residue = []
+        # Compare the two raw candidates (both are populated even for the loser),
+        # so a large seq-guided vs seq-free disagreement lowers confidence.
+        cand = []
+        if isinstance(self._seqguided, dict) and isinstance(self._seqguided.get("si"), dict):
+            cand.append(self._seqguided["si"].get("rmsd"))
+        if self._seqfree is not None:
+            cand.append(getattr(self._seqfree, "rmsd", None))
+        hinge = None
+        if self.domains:
+            hinge = [(d.chain_id, f"{d.chain_id}:{d.residue_start}",
+                      f"{d.chain_id}:{d.residue_end}") for d in self.domains]
+        return assess(
+            tm_score=s.get("tm_score"), rmsd=s.get("rmsd"),
+            coverage_pct=s.get("coverage_pct"), n_aligned=s.get("n_aligned"),
+            per_residue=per_residue, chain_mapping=s.get("chain_mapping"),
+            candidate_rmsds=cand, hinge_regions=hinge,
+            tm_pvalue=self.tm_pvalue,
+        )
+
     def to_dict(self) -> dict:
         d = self.summary_stats()
         d["per_chain"] = self.per_chain.to_dict(orient="records")
+        d["quality"] = self.quality.to_dict()
         return d
 
     def to_json(self, indent: int = 2) -> str:
@@ -146,6 +181,17 @@ class AlignmentResult:
             for _, r in df.iterrows():
                 lines.append(f"   {r['chain_ref']}->{r['chain_mob']}: "
                              f"{r['rmsd']:.3f} A ({int(r['n_residues'])} res)")
+        q = self.quality
+        lines.append("-" * 52)
+        lines.append(f" Quality   : {q.band.upper()}  (confidence: {q.confidence})")
+        lines.append(f" Verdict   : {q.verdict}")
+        if q.flagged_regions:
+            lines.append(" Flagged regions:")
+            for fr in q.flagged_regions[:5]:
+                lines.append(f"   {fr.chain} {fr.start_label}..{fr.end_label} "
+                             f"({fr.kind}, max {fr.max_rmsd:.1f} A)")
+        for w in q.warnings:
+            lines.append(f" ! {w}")
         lines.append("=" * 52)
         return "\n".join(lines)
 
