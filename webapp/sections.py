@@ -89,13 +89,16 @@ def render_ensemble(ens):
     st.dataframe(ens.summary(), use_container_width=True, hide_index=True)
     st.plotly_chart(F.ensemble_rmsd_heatmap(ens.rmsd_matrix()),
                     use_container_width=True, key="ens_heat")
-    n = st.slider("Clusters", 2, max(2, len(ens.results)), 2)
-    try:
-        ens.cluster(n_clusters=n)
-        st.pyplot(ens.plot_pca(color_by="cluster"))
-        st.pyplot(ens.plot_dendrogram())
-    except Exception as e:
-        st.info(f"Clustering unavailable: {e}")
+    if len(ens.results) >= 3:
+        n = st.slider("Clusters", 2, len(ens.results), min(3, len(ens.results)))
+        try:
+            ens.cluster(n_clusters=n)
+            st.pyplot(ens.plot_pca(color_by="cluster"))
+            st.pyplot(ens.plot_dendrogram())
+        except Exception as e:
+            st.info(f"Clustering unavailable: {e}")
+    else:
+        st.info("Add 3+ mobile structures to enable clustering / PCA.")
 
 
 def render_export(obj, is_ensemble):
