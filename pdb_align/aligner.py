@@ -1982,3 +1982,19 @@ class PDBAligner:
         """Saves alignment log summary."""
         with open(filename, "w") as f:
             f.write(self.get_log() + "\n")
+
+
+def inspect_structure(path_or_id, cache_dir=None):
+    """List chains, residue counts, and sequences for a structure.
+
+    Accepts a local file path or a remote ID (``pdb:XXXX`` / ``af:UniProtID``).
+    Returns ``{"chains": {chain: n_residues}, "sequences": {chain: seq_str}}``.
+    A public accessor so callers (e.g. the GUI) need no ``pdb_align.core``.
+    """
+    al = PDBAligner()
+    if cache_dir:
+        al._fetch_cache_dir = cache_dir
+    al.add_reference(path_or_id)
+    chains = {c: int(n) for c, n in al.ref_lens.items()}
+    sequences = {c: str(rec.seq) for c, rec in al.ref_seqs.items()}
+    return {"chains": chains, "sequences": sequences}
