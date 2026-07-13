@@ -1,5 +1,7 @@
 """pdb_align — high-performance protein structure alignment."""
 
+__version__ = "0.1.0"
+
 from .aligner import PDBAligner, AlignmentResult, AlignmentFailedError, EnsembleResult, DomainResult, LoadedResult, inspect_structure
 from .exceptions import ParsingError, ChainNotFoundError
 from .chains import match_chains, align_multichain, ChainMapping

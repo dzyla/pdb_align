@@ -4,6 +4,7 @@ pandas
 scikit-learn
 scipy
 biopython
+requests
 py3Dmol
 stmol
 plotly
