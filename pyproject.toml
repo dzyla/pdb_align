@@ -14,3 +14,8 @@ dependencies = [
 app = [
     "streamlit", "py3Dmol", "stmol", "plotly", "matplotlib", "seaborn", "streamlit-molstar"
 ]
+
+[tool.pytest.ini_options]
+# Put the repo root on sys.path so tests can import the app-level `webapp`
+# package (shipped alongside struct_pair_align.py, not inside the installed pkg).
+pythonpath = ["."]

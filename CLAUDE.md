@@ -65,6 +65,7 @@ The package has two layers: a **Python library** and a **Streamlit frontend**.
     - `align(mode, atoms, strategy="auto", ...)` — modes: `"auto"`, `"seq_guided"`, `"seq_free_shape"`, `"seq_free_window"`, `"flexible"`. Flexible mode runs auto first, then detects hinges via `_detect_hinges`, runs per-domain Kabsch, returns domains in `result.domains`. When `mode="auto"` and **both** structures have more than one active chain, `align()` auto-dispatches to the multi-chain path (`chains.match_chains()` + `chains.align_multichain()`) instead of the single-chain seq-guided/seq-free comparison; single-chain behavior is unchanged. `strategy` (`"auto"`/`"global"`/`"local"`) is forwarded to `align_multichain()`.
     - `align_ensemble(mob_list, mode, atoms, out_dir)` — iterates a list of mobile paths, returns `EnsembleResult`; emits `UserWarning` per failed model
     - `batch_align()` / `batch_align_iter()` — directory-level batch with `ProcessPoolExecutor`
+  - `inspect_structure(path_or_id, cache_dir=None)` — module-level helper returning `{"chains": {chain: n_residues}, "sequences": {chain: seq_str}}` for a local file or remote ID. Public so callers (e.g. the GUI chain pickers) never need `pdb_align.core`.
 
 - **`chains.py`** — Chain correspondence and multi-chain superposition strategy, used when both structures have multiple chains:
   - `ChainMapping` — dataclass: `pairs` (list of `(ref_chain, mob_chain, identity, score)`), `unmatched_ref`, `unmatched_mob`
@@ -87,9 +88,16 @@ The package has two layers: a **Python library** and a **Streamlit frontend**.
 
 - **`__main__.py`** — CLI entry point, positional-first: `pdb_align REF MOB [options]`. By default it only prints a stats report to the terminal (`res.report(fmt="text")`, or `res.to_json()` with `--json`) — no files are written unless requested. Opt-in outputs: `-o/--out` (aligned structure via `save_aligned_pdb`), `--plot [FILE]` (per-residue RMSD plot, default `rmsd.png`), `--summary-plot [FILE]` (`plot_summary`, default `summary.png`), `--report FILE` (text or JSON, by extension), `--csv FILE` (per-residue RMSD table), `--save FILE.npz` (`AlignmentResult.save`), `--json` (machine-readable report to stdout), plus `--strategy {auto,global,local}`, `--mode`, `--ref-chains`/`--mob-chains`, `--atoms`, `--min-plddt`, `--show` (open plot windows instead of headless `Agg`), `-v/--verbose`. Legacy `--ref`/`--mob` flags remain accepted alongside the positionals. `REF`/`MOB` accept local file paths or remote IDs (`pdb:XXXX`, `af:UniProtID`) directly as positionals.
 
-### Streamlit App (`struct_pair_align.py`)
+### Streamlit App (`struct_pair_align.py` + `webapp/` package)
 
-Single-file app that exposes the `PDBAligner` API via file uploads, interactive Py3Dmol 3D views (cartoon colored by B-factor/RMSD), per-residue RMSD plots, and downloadable outputs (CSV, FASTA, ZIP, PyMOL/ChimeraX scripts). All `st.plotly_chart` calls must use unique `key=` arguments. Multi-character chain IDs (e.g., from mmCIF files) are remapped to single characters before `PDBIO.save()` via `_remap_long_chain_ids()`.
+The app is a **thin entry** (`struct_pair_align.py`, ~130 lines: page config, sidebar inputs, tab dispatch) on top of a small **`webapp/` package**, and imports **only the public API** — never `pdb_align.core`. This is enforced by `tests/test_convergence_guard.py` (scans the entry + every `webapp/*.py`). The `webapp/` package is app-level (like the entry script), not part of the installed `pdb_align` package; `pyproject.toml` sets `pythonpath = ["."]` so tests can import it.
+
+- **`webapp/data.py`** — IO + orchestration: `save_upload_to_temp`, `list_chains` (via `pdb_align.inspect_structure`), `run_pairwise`/`run_ensemble` (thin wrappers over `PDBAligner.align`/`align_ensemble`), and `input_key` (stable hash of inputs for `st.session_state` result caching). No `st.*`, unit-tested.
+- **`webapp/figures.py`** — pure Plotly builders (`per_residue_figure`, `distance_matrix_figure`, `pair_distance_hist`, `ensemble_rmsd_heatmap`), return figures, no `st.*`.
+- **`webapp/viewer.py`** — Py3Dmol superposition from `AlignmentResult.aligned_structure()`; `remap_long_chain_ids()` (gemmi, >1-char chain names → unique single chars) and `structure_to_pdb_string()`.
+- **`webapp/sections.py`** — thin `st.*` tab renderers: `render_header` (quality verdict), `render_overview`, `render_3d`, `render_per_residue`, `render_ensemble`, `render_export` (one-click `export_bundle`). The reference PDB text for the 3D view is stashed in `st.session_state["_ref_pdb_str"]` by the entry after a run. All `st.plotly_chart` calls use unique `key=` arguments.
+
+Layout: compact sidebar (upload/fetch, ref + mobile(s), chain pickers, Mode/Strategy, Advanced) → persistent verdict header → tabs (Overview, 3D, Per-residue, [Ensemble when >1 mobile], Export). `tests/test_app_render.py` drives the real renderers end-to-end via Streamlit's `AppTest` (skipped without the `[app]` extras).
 
 ### Key design patterns
 

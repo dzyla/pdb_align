@@ -1,15 +1,18 @@
+import glob
 import os
 import re
 
-import pytest
-
-GUI = os.path.join(os.path.dirname(__file__), "..", "struct_pair_align.py")
+ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 
-@pytest.mark.xfail(reason="GUI still imports pdb_align.core; converged in SP2",
-                   strict=False)
-def test_gui_does_not_import_core():
-    with open(GUI) as f:
-        src = f.read()
-    assert not re.search(r"from\s+pdb_align\.core\s+import", src)
-    assert not re.search(r"import\s+pdb_align\.core", src)
+def _files():
+    yield os.path.join(ROOT, "struct_pair_align.py")
+    yield from glob.glob(os.path.join(ROOT, "webapp", "*.py"))
+
+
+def test_app_does_not_import_core():
+    for path in _files():
+        with open(path) as f:
+            src = f.read()
+        assert not re.search(r"from\s+pdb_align\.core\s+import", src), path
+        assert not re.search(r"import\s+pdb_align\.core", src), path
