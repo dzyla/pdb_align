@@ -84,12 +84,21 @@ Launch locally:
 streamlit run struct_pair_align.py
 ```
 
-**Features:**
-- File uploads for reference and mobile structures (PDB, mmCIF)
-- Remote fetch from RCSB PDB (`pdb:XXXX`) and AlphaFold DB (`af:UniProtID`)
-- Sequence-guided and shape/window alignment modes
-- Interactive Py3Dmol 3D views colored by RMSD or B-factor
-- Per-residue RMSD plots and downloadable outputs (CSV, FASTA, ZIP, PyMOL/ChimeraX scripts)
+The app is built entirely on the public `pdb_align` API (the same alignment the
+CLI and library use — no separate code path). Inputs live in a compact sidebar;
+results open with a plain-language **quality verdict header** (band, one-line
+verdict, RMSD/TM-score/GDT-TS/coverage, confidence, warnings) followed by tabs:
+
+- **Overview** — method/strategy, chain mapping, per-chain RMSD, flagged regions
+- **3D** — interactive Py3Dmol superposition coloured by per-residue RMSD / pLDDT / chain
+- **Per-residue** — RMSD plot with flagged regions shaded, plus sequence-alignment and distance-matrix expanders
+- **Ensemble** (when you pick more than one mobile) — summary table, RMSD-matrix heatmap, clustering, PCA, dendrogram
+- **Export** — one-click reproducible bundle (aligned structure, CSV, plots, PyMOL/ChimeraX, report)
+
+**Inputs:**
+- File uploads (PDB, mmCIF) and remote fetch (`pdb:XXXX`, `af:UniProtID`)
+- Reference + one-or-more mobile selection with per-structure chain pickers
+- Mode (Auto / sequence-guided / sequence-free / flexible) and multi-chain Strategy, with gap penalties and pLDDT filtering under **Advanced**
 
 ---
 
