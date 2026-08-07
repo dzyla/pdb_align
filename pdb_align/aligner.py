@@ -1335,9 +1335,11 @@ class PDBAligner:
             raise FileNotFoundError(f"Reference file not found: {ref_file}")
         ref_file = os.path.abspath(ref_file)
         self.ref_file = ref_file
-        self.chains_ref = chains
         self.ref_struct = self._load_cached_structure(ref_file)
         self.ref_seqs, self.ref_lens = extract_sequences_and_lengths(self.ref_struct, os.path.basename(ref_file))
+        # Validate AFTER the sequences are read, so an unknown chain can be named against
+        # what the file actually contains. See _validate_chain_selection.
+        self.chains_ref = self._validate_chain_selection(chains, self.ref_seqs, "Reference")
         if self.verbose:
             print(f"Reference set to: {self.ref_file}")
             for ch in (self.chains_ref if self.chains_ref else self.ref_seqs.keys()):
@@ -1350,9 +1352,11 @@ class PDBAligner:
             raise FileNotFoundError(f"Mobile file not found: {mob_file}")
         mob_file = os.path.abspath(mob_file)
         self.mob_file = mob_file
-        self.chains_mob = chains
         self.mob_struct = self._load_cached_structure(mob_file)
         self.mob_seqs, self.mob_lens = extract_sequences_and_lengths(self.mob_struct, os.path.basename(mob_file))
+        # Validate AFTER the sequences are read, so an unknown chain can be named against
+        # what the file actually contains. See _validate_chain_selection.
+        self.chains_mob = self._validate_chain_selection(chains, self.mob_seqs, "Mobile")
         if self.verbose:
             print(f"Mobile set to: {self.mob_file}")
             for ch in (self.chains_mob if self.chains_mob else self.mob_seqs.keys()):
@@ -1368,11 +1372,49 @@ class PDBAligner:
                         if not __import__('numpy').isnan(ident):
                             print(f"  Chain {r_ch} (ref) - Chain {m_ch} (mobile): {ident:.1f}%")
 
+    @staticmethod
+    def _validate_chain_selection(chains, available, side: str):
+        """Reject a chain selection that cannot mean what the caller intended.
+
+        A DUPLICATE entry silently aligns one chain against two different partners, which
+        produces a plausible-looking but meaningless RMSD rather than an error. This is
+        easy to hit when a caller maps reference chains onto mobile chains through a
+        correspondence table and falls back to the identity for entries the table omits:
+        two distinct reference chains then land on the same mobile chain. Observed in the
+        wild on a two-copy assembly where only one copy was modelled -- the joint fit
+        reported 23.65 A for a structure that superposes at 4.82 A, with the giveaway
+        being a per-chain breakdown showing identical values for chains that are not
+        identical. Failing loudly here costs one exception; failing silently costs a wrong
+        number that looks right.
+        """
+        if chains is None:
+            return None
+        seq = list(chains)
+        dupes = sorted({str(c) for c in seq if seq.count(c) > 1})
+        if dupes:
+            raise ValueError(
+                f"{side} chain selection contains duplicate chain(s) {dupes}: {seq}. "
+                f"Each chain may appear at most once -- a repeated chain would be aligned "
+                f"against two different partners and the resulting RMSD would be "
+                f"meaningless. If you built this list from a chain-correspondence map, "
+                f"drop the entries the map does not resolve instead of falling back to "
+                f"the identity for them."
+            )
+        if available:
+            unknown = [str(c) for c in seq if str(c) not in {str(a) for a in available}]
+            if unknown:
+                raise ValueError(
+                    f"{side} chain(s) {unknown} are not present in the structure "
+                    f"(available: {sorted(str(a) for a in available)})."
+                )
+        return seq
+
     def set_reference_chains(self, chains: List[Union[str, int]]):
         """Changes the reference chains to use for alignment."""
         if not self.ref_file:
             raise ValueError("Reference structure must be set first.")
-        self.chains_ref = chains
+        self.chains_ref = self._validate_chain_selection(
+            chains, getattr(self, "ref_seqs", None), "Reference")
         if self.verbose:
             print(f"Reference chains updated to: {chains}")
 
@@ -1380,7 +1422,8 @@ class PDBAligner:
         """Changes the mobile chains to use for alignment."""
         if not self.mob_file:
             raise ValueError("Mobile structure must be set first.")
-        self.chains_mob = chains
+        self.chains_mob = self._validate_chain_selection(
+            chains, getattr(self, "mob_seqs", None), "Mobile")
         if self.verbose:
             print(f"Mobile chains updated to: {chains}")
 
