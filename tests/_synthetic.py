@@ -13,18 +13,28 @@ ATOM_OFFSETS = {
 }
 _ELEMENT = {"N": "N", "CA": "C", "C": "C", "O": "O", "CB": "C"}
 
+AA_1TO3 = {
+    "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS", "Q": "GLN",
+    "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE", "L": "LEU", "K": "LYS",
+    "M": "MET", "F": "PHE", "P": "PRO", "S": "SER", "T": "THR", "W": "TRP",
+    "Y": "TYR", "V": "VAL",
+}
+
 
 def make_chain(name, n_res, origin, resname="ALA", b_iso=50.0, start_num=1,
-               direction=np.array([1.0, 0.0, 0.0])):
+               direction=np.array([1.0, 0.0, 0.0]), sequence=None):
+    """Straight-line chain; `sequence` (one-letter) overrides `resname`/`n_res`."""
     chain = gemmi.Chain(name)
     origin = np.asarray(origin, dtype=float)
+    if sequence is not None:
+        n_res = len(sequence)
     for i in range(n_res):
         res = gemmi.Residue()
-        res.name = resname
+        res.name = AA_1TO3[sequence[i]] if sequence is not None else resname
         res.seqid = gemmi.SeqId(str(start_num + i))
         ca = origin + direction * (SPACING * i)
         for aname, off in ATOM_OFFSETS.items():
-            if resname == "GLY" and aname == "CB":
+            if res.name == "GLY" and aname == "CB":
                 continue
             atom = gemmi.Atom()
             atom.name = aname

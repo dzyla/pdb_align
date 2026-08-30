@@ -26,6 +26,11 @@ def build_parser():
                         "adds epitope/paratope metrics)")
     p.add_argument("--antigen-chains", nargs="+",
                    help="Antigen chains in the reference")
+    p.add_argument("--confidence", nargs="+",
+                   help="Confidence file per model (AF2/AF3/Boltz JSON or PAE "
+                        "npz/npy), in the same order as --models; use '-' to "
+                        "skip a model. Omit to auto-discover sibling files. "
+                        "Adds ipTM and (with PAE + an interface) pDockQ2.")
     p.add_argument("--ref", dest="ref_flag", help="Reference (alias for positional)")
     p.add_argument("--mob", dest="mob_flag", help="Mobile (alias for positional)")
     p.add_argument("--ref-chains", "--ref_chains", dest="ref_chains",
@@ -63,6 +68,13 @@ def main(argv=None) -> int:
             print("error: --models requires a reference structure.", file=sys.stderr)
             return 2
         from .evaluate import evaluate_models
+        confidence = None
+        if args.confidence:
+            if len(args.confidence) != len(args.models):
+                print("error: --confidence must list one file per model "
+                      "('-' to skip).", file=sys.stderr)
+                return 2
+            confidence = [None if c == "-" else c for c in args.confidence]
         try:
             ev = evaluate_models(
                 ref, args.models,
@@ -71,6 +83,7 @@ def main(argv=None) -> int:
                 antibody_chains=args.antibody_chains,
                 antigen_chains=args.antigen_chains,
                 mode=args.mode, atoms=args.atoms, min_plddt=args.min_plddt,
+                confidence_files=confidence,
             )
         except (ValueError, AlignmentFailedError) as e:
             print(f"Evaluation failed: {e}", file=sys.stderr)
