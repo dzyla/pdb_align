@@ -38,9 +38,38 @@ except ImportError:
         return decorator
 
 VALID_AA_3 = set(standard_aa_names)
+
+# Curated map of common modified/non-standard residues to their parent
+# standard residue's one-letter code. Only parent letters are used (never
+# 'X' or lowercase) so downstream BLOSUM62 sequence alignments stay valid.
+# Without this, phosphorylated/methylated residues silently vanish from the
+# extracted sequences and create phantom alignment gaps.
+MODIFIED_AA_3TO1 = {
+    "MSE": "M",  # selenomethionine
+    "SEP": "S",  # phosphoserine
+    "TPO": "T",  # phosphothreonine
+    "PTR": "Y",  # phosphotyrosine
+    "HYP": "P",  # hydroxyproline
+    "MLY": "K",  # N-dimethyllysine
+    "M3L": "K",  # N-trimethyllysine
+    "ALY": "K",  # N-acetyllysine
+    "KCX": "K",  # carboxylysine
+    "PYL": "K",  # pyrrolysine (parent K)
+    "CSO": "C",  # S-hydroxycysteine
+    "OCS": "C",  # cysteine sulfonic acid
+    "CME": "C",  # S,S-(2-hydroxyethyl)thiocysteine
+    "CSX": "C",  # S-oxycysteine
+    "SEC": "C",  # selenocysteine (parent C; 'U' is not in BLOSUM62)
+    "PCA": "E",  # pyroglutamate
+    "CGU": "E",  # gamma-carboxyglutamate
+    "FME": "M",  # N-formylmethionine
+    "HIC": "H",  # 4-methylhistidine
+    "MLZ": "K",  # N-methyllysine
+}
+
 def _aa_dict() -> Dict[str, str]:
     d = {k: protein_letters_3to1[k] for k in VALID_AA_3}
-    d['MSE'] = 'M'
+    d.update(MODIFIED_AA_3TO1)
     return d
 AA_DICT = _aa_dict()
 
@@ -114,15 +143,44 @@ class AlignmentResultSF:
     shift_scores: Optional[np.ndarray] = None
     active_mask: Optional[np.ndarray] = None
     gdt_ts: Optional[float] = None
-    cad_score: Optional[float] = None
+    contact_overlap: Optional[float] = None
 
-def compute_gdt_ts(dists: np.ndarray, cutoffs: List[float] = [1.0, 2.0, 4.0, 8.0]) -> float:
+    @property
+    def cad_score(self) -> Optional[float]:
+        """Deprecated alias for :attr:`contact_overlap` (it was never CAD)."""
+        return self.contact_overlap
+
+GDT_CUTOFFS = (1.0, 2.0, 4.0, 8.0)
+
+def compute_gdt_ts(dists: np.ndarray, n_total: Optional[int] = None,
+                   cutoffs: Tuple[float, ...] = GDT_CUTOFFS) -> float:
+    """GDT_TS of a single superposition.
+
+    ``dists`` must be the distances of ALL matched residue pairs under the
+    final superposition (never an inlier subset — normalizing by survivors
+    of outlier rejection inflates the score). ``n_total`` is the number of
+    residues in the reference selection; CASP-style, residues that could not
+    be aligned count as failures at every cutoff. When ``n_total`` is None
+    the matched-pair count is used (coverage is then NOT penalized — label
+    such values accordingly).
+
+    Note: CASP's GDT_TS additionally maximizes each cutoff's fraction over
+    many superpositions (LGA); this single-superposition value is a lower
+    bound on that.
+    """
     if len(dists) == 0: return 0.0
-    fractions = [np.mean(dists <= c) for c in cutoffs]
+    denom = int(n_total) if n_total else len(dists)
+    if denom <= 0: return 0.0
+    fractions = [np.sum(dists <= c) / denom for c in cutoffs]
     return float(np.mean(fractions)) * 100.0
 
-def compute_cad_score_approx(ref_coords: np.ndarray, mob_coords: np.ndarray, contact_dist: float = 8.0) -> float:
-    # Pseudo-CAD using purely C-alpha contact maps (O(N^2) naive). Real CAD requires Voronoi, but this captures local environment change.
+def compute_contact_overlap(ref_coords: np.ndarray, mob_coords: np.ndarray, contact_dist: float = 8.0) -> float:
+    """Jaccard index of the two C-alpha contact maps (contact_dist cutoff,
+    self and sequence-adjacent pairs excluded). Superposition-invariant.
+
+    This is a contact-map overlap metric, NOT the CAD-score of Olechnovic &
+    Venclovas (which is defined on Voronoi contact *areas* over heavy atoms).
+    """
     if len(ref_coords) == 0: return 0.0
     d_ref = _pairwise_dists(ref_coords)
     d_mob = _pairwise_dists(mob_coords)
@@ -136,11 +194,20 @@ def compute_cad_score_approx(ref_coords: np.ndarray, mob_coords: np.ndarray, con
 
     c_ref = (d_ref <= contact_dist) & mask
     c_mob = (d_mob <= contact_dist) & mask
-    
+
     # Jaccard index of contacts
     intersection = np.sum(c_ref & c_mob)
     union = np.sum(c_ref | c_mob)
     return float(intersection / union) if union > 0 else 0.0
+
+def compute_cad_score_approx(ref_coords: np.ndarray, mob_coords: np.ndarray, contact_dist: float = 8.0) -> float:
+    """Deprecated: this never computed CAD-score. Use compute_contact_overlap."""
+    import warnings as _warnings
+    _warnings.warn(
+        "compute_cad_score_approx is a contact-map Jaccard index, not CAD-score; "
+        "it has been renamed to compute_contact_overlap.",
+        DeprecationWarning, stacklevel=2)
+    return compute_contact_overlap(ref_coords, mob_coords, contact_dist)
 
 def _parse_path(path: str) -> gemmi.Structure:
     return gemmi.read_structure(path)
@@ -629,41 +696,43 @@ def sequence_independent_alignment_joined_v2(
             if not r_res or not m_res:
                 continue
 
+            # Sequence-free pairing can match residues of different types;
+            # pairing side-chain atoms by name across unlike residues (e.g.
+            # an ALA CB against an ARG CB pointing elsewhere entirely) is
+            # chemically meaningless, so unlike pairs contribute backbone only.
+            pair_targets = target_atoms
+            if r_res.name != m_res.name and target_atoms is None:
+                pair_targets = {"N", "CA", "C", "O"}
+
             for atA in r_res:
                 if atA.element.name == "H": continue
-                if target_atoms is not None and atA.name not in target_atoms: continue
+                if pair_targets is not None and atA.name not in pair_targets: continue
                 for atB in m_res:
                     if atB.name == atA.name:
-                        # Construct a light pseudo-atom with coordinate interface
-                        # Since _kabsch just needs a numpy array, we append PseudoAtom here
-                        class PseudoAtom:
-                            def __init__(self, pos):
-                                self.pos = pos
-                            def get_coord(self):
-                                return np.array(self.pos.tolist(), dtype=float)
-                        
-                        final_ref_atoms.append(PseudoAtom(atA.pos))
-                        final_mob_atoms.append(PseudoAtom(atB.pos))
+                        final_ref_atoms.append(np.array(atA.pos.tolist(), dtype=float))
+                        final_mob_atoms.append(np.array(atB.pos.tolist(), dtype=float))
                         break
 
         if final_ref_atoms and final_mob_atoms and len(final_ref_atoms) == len(final_mob_atoms):
-            ref_c = np.array([a.get_coord() for a in final_ref_atoms])
-            mob_c = np.array([a.get_coord() for a in final_mob_atoms])
+            ref_c = np.vstack(final_ref_atoms)
+            mob_c = np.vstack(final_mob_atoms)
             R, t, final_rmsd = _kabsch(ref_c, mob_c)
 
-    mob_all_infos=_extract_ca_infos(_parse_path(file_mob), chain_filter=None, min_b_factor=min_b_factor, min_plddt=min_plddt)
+    mob_all_infos=_extract_ca_infos(mob_struct, chain_filter=None, min_b_factor=min_b_factor, min_plddt=min_plddt)
     mob_all_ca=np.vstack([mi.coord for mi in mob_all_infos]); mob_all_ca_aligned=_transform(mob_all_ca, R, t)
     
     mob_subset_aligned = _transform(mob_subset, R, t)
-    # Calculate GDT_TS and pseudo-CAD for the active fraction
-    active_ref_idx = [i for idx, (i,j) in enumerate(final_pairs) if final_mask[idx]]
-    active_mob_idx = [j for idx, (i,j) in enumerate(final_pairs) if final_mask[idx]]
-    
-    gdt_ts, cad_score = 0.0, 0.0
-    if len(active_ref_idx) > 0:
-        dists = np.linalg.norm(ref_subset[active_ref_idx] - mob_subset_aligned[active_mob_idx], axis=1)
-        gdt_ts = compute_gdt_ts(dists)
-        cad_score = compute_cad_score_approx(ref_subset[active_ref_idx], mob_subset_aligned[active_mob_idx])
+    # GDT_TS over ALL matched pairs (never the inlier subset), normalized by
+    # the reference selection's residue count so unaligned residues count as
+    # failures (CASP semantics). Contact overlap over the matched region.
+    all_ref_idx = [i for (i, j) in final_pairs]
+    all_mob_idx = [j for (i, j) in final_pairs]
+
+    gdt_ts, contact_overlap = 0.0, 0.0
+    if len(all_ref_idx) > 0:
+        dists = np.linalg.norm(ref_subset[all_ref_idx] - mob_subset_aligned[all_mob_idx], axis=1)
+        gdt_ts = compute_gdt_ts(dists, n_total=len(ref_infos))
+        contact_overlap = compute_contact_overlap(ref_subset[all_ref_idx], mob_subset_aligned[all_mob_idx])
 
     logger.info(f"Seq-free alignment ({chosen}) finished. RMSD = {final_rmsd:.3f}, GDT_TS = {gdt_ts:.2f}")
 
@@ -677,7 +746,7 @@ def sequence_independent_alignment_joined_v2(
         summaries=summaries,
         shift_matrix=shift_matrix if chosen == "shape" else None,
         shift_scores=shift_scores if chosen == "window" else None,
-        active_mask=final_mask, gdt_ts=gdt_ts, cad_score=cad_score
+        active_mask=final_mask, gdt_ts=gdt_ts, contact_overlap=contact_overlap
     )
 
 def perform_sequence_alignment(seq1:str, seq2:str, gap_open:float, gap_extend:float):
@@ -876,7 +945,14 @@ def get_aligned_atoms_by_alignment(ref_struct: gemmi.Structure, ref_chains, mob_
 
     return ref_atoms, mob_atoms
 
-def superimpose_atoms(ref_atoms, mob_atoms, recycles: int = 0, keep_fraction: float = 1.0):
+def superimpose_atoms(ref_atoms, mob_atoms, recycles: int = 0, keep_fraction: float = 1.0,
+                      n_total: Optional[int] = None):
+    """Kabsch superposition of matched atom lists.
+
+    ``n_total`` is the reference selection's residue count used to normalize
+    GDT_TS (CASP semantics: unaligned residues fail every cutoff). When None,
+    GDT is normalized by the matched CA count (coverage not penalized).
+    """
     if not ref_atoms or not mob_atoms or len(ref_atoms)!=len(mob_atoms): return None
     ref_coords=np.array([a.get_coord() for a in ref_atoms])
     mob_coords=np.array([a.get_coord() for a in mob_atoms])
@@ -899,22 +975,26 @@ def superimpose_atoms(ref_atoms, mob_atoms, recycles: int = 0, keep_fraction: fl
             active_ref_atoms.append(a)
             active_mob_atoms.append(mob_atoms[i])
 
-    gdt_ts, cad_score = 0.0, 0.0
-    if len(active_ref_atoms) > 0:
-        active_ref_c = np.array([a.get_coord() for a in active_ref_atoms])
-        active_mob_c = np.array([a.get_coord() for a in active_mob_atoms])
-        
-        # Calculate active distances
-        dists = np.linalg.norm(active_ref_c - _transform(active_mob_c, R, t), axis=1)
-        gdt_ts = compute_gdt_ts(dists)
-        cad_score = compute_cad_score_approx(active_ref_c, _transform(active_mob_c, R, t))
+    # GDT_TS on CA atoms over ALL matched pairs (never the inlier subset),
+    # normalized by the reference residue count when available.
+    gdt_ts, contact_overlap = 0.0, 0.0
+    ca_idx = [i for i, a in enumerate(ref_atoms)
+              if getattr(a, "get_name", lambda: "CA")() == "CA"]
+    if not ca_idx:
+        ca_idx = list(range(len(ref_atoms)))
+    if ca_idx:
+        ca_dists = per_res[ca_idx]
+        gdt_ts = compute_gdt_ts(ca_dists, n_total=n_total)
+        contact_overlap = compute_contact_overlap(
+            ref_coords[ca_idx], mob_aligned[ca_idx])
         logger.info(f"Superimpose resulted in RMSD = {rmsd:.3f}, GDT_TS = {gdt_ts:.2f}")
 
     return dict(rmsd=float(rmsd), rotation=R, translation=t,
                 ref_coords=ref_coords, mob_coords_transformed=mob_aligned,
                 per_residue_rmsd=per_res, residue_labels=res_labels,
                 active_ref_atoms=active_ref_atoms, active_mob_atoms=active_mob_atoms,
-                mask=mask, gdt_ts=gdt_ts, cad_score=cad_score)
+                mask=mask, gdt_ts=gdt_ts, contact_overlap=contact_overlap,
+                cad_score=contact_overlap)  # cad_score: deprecated alias key
 
 def compute_chain_similarity_matrix(seqsA, seqsB)->Tuple[pd.DataFrame,pd.DataFrame]:
     chainsA=list(seqsA.keys()); chainsB=list(seqsB.keys())

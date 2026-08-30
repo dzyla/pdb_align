@@ -16,11 +16,14 @@ def render_header(res):
     q = res.quality
     s = res.summary_stats()
     st.subheader(f"{_BADGE.get(q.band, '⚪')} {q.band.upper()}  ·  {q.verdict}")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("RMSD (Å)", f"{s['rmsd']:.3f}" if s["rmsd"] is not None else "—")
     c2.metric("TM-score", f"{s['tm_score']:.3f}" if s["tm_score"] is not None else "—")
-    c3.metric("GDT-TS", f"{s['gdt_ts']:.1f}" if s["gdt_ts"] is not None else "—")
-    c4.metric("Coverage",
+    c3.metric("GDT_TS", f"{s['gdt_ts']:.1f}" if s["gdt_ts"] is not None else "—",
+              help="Single superposition, normalized by reference length")
+    c4.metric("lDDT-Cα", f"{s['lddt_ca']:.3f}" if s.get("lddt_ca") is not None else "—",
+              help="Superposition-free, matched residues")
+    c5.metric("Coverage",
               f"{s['coverage_pct']:.0f}%" if s["coverage_pct"] is not None else "—")
     st.caption(f"Confidence: {q.confidence}")
     for w in q.warnings:

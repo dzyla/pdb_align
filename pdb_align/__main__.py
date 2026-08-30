@@ -7,9 +7,25 @@ from .aligner import PDBAligner, AlignmentFailedError
 def build_parser():
     p = argparse.ArgumentParser(
         prog="pdb_align",
-        description="Compare two protein structures. Prints stats; writes files only when asked.")
+        description="Compare two protein structures, or rank N models against "
+                    "a reference (--models). Prints stats; writes files only when asked.")
+    from . import __version__
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("ref", nargs="?", help="Reference structure (file, pdb:XXXX, af:UniProtID)")
     p.add_argument("mob", nargs="?", help="Mobile structure (file, pdb:XXXX, af:UniProtID)")
+    p.add_argument("--models", nargs="+",
+                   help="Evaluate/rank these model structures against REF "
+                        "(TM/RMSD/GDT/lDDT; plus DockQ with --receptor-chains/"
+                        "--ligand-chains or --antibody-chains/--antigen-chains)")
+    p.add_argument("--receptor-chains", nargs="+",
+                   help="Reference chains of the interface receptor side (DockQ)")
+    p.add_argument("--ligand-chains", nargs="+",
+                   help="Reference chains of the interface ligand side (DockQ)")
+    p.add_argument("--antibody-chains", nargs="+",
+                   help="Antibody chains in the reference (H L; merged as receptor; "
+                        "adds epitope/paratope metrics)")
+    p.add_argument("--antigen-chains", nargs="+",
+                   help="Antigen chains in the reference")
     p.add_argument("--ref", dest="ref_flag", help="Reference (alias for positional)")
     p.add_argument("--mob", dest="mob_flag", help="Mobile (alias for positional)")
     p.add_argument("--ref-chains", "--ref_chains", dest="ref_chains",
@@ -40,6 +56,32 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     ref = args.ref or args.ref_flag
     mob = args.mob or args.mob_flag
+
+    # --- model-evaluation mode: rank N models against the reference ---
+    if args.models:
+        if not ref:
+            print("error: --models requires a reference structure.", file=sys.stderr)
+            return 2
+        from .evaluate import evaluate_models
+        try:
+            ev = evaluate_models(
+                ref, args.models,
+                receptor_chains=args.receptor_chains,
+                ligand_chains=args.ligand_chains,
+                antibody_chains=args.antibody_chains,
+                antigen_chains=args.antigen_chains,
+                mode=args.mode, atoms=args.atoms, min_plddt=args.min_plddt,
+            )
+        except (ValueError, AlignmentFailedError) as e:
+            print(f"Evaluation failed: {e}", file=sys.stderr)
+            return 1
+        if args.json:
+            import json
+            print(json.dumps(ev.to_dict(), indent=2, default=float))
+        else:
+            print(ev.report())
+        return 0
+
     if not ref or not mob:
         print("error: need a reference and a mobile structure "
               "(positional REF MOB or --ref/--mob).", file=sys.stderr)
@@ -61,7 +103,7 @@ def main(argv=None) -> int:
         aligner.add_mobile(mob, chains=mob_chains)
         res = aligner.align(mode=args.mode, strategy=args.strategy,
                             atoms=args.atoms, min_plddt=args.min_plddt)
-    except (AlignmentFailedError, Exception) as e:
+    except Exception as e:
         print(f"Alignment failed: {e}", file=sys.stderr)
         return 1
 

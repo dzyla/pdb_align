@@ -6,7 +6,7 @@ import numpy as np
 from .core import (
     compute_chain_similarity_matrix, _extract_ca_infos, _kabsch,
     extract_sequences_and_lengths, perform_sequence_alignment,
-    get_aligned_atoms_by_alignment, _SELECTION_RMSD_SCALE,
+    get_aligned_atoms_by_alignment, _coverage_score,
 )
 
 MAX_PERMUTE_CHAINS = 12
@@ -142,10 +142,6 @@ class MultiChainResult:
     mob_infos: list
 
 
-def _coverage_score(n_pairs: int, rmsd: float) -> float:
-    return n_pairs / (1.0 + (rmsd / _SELECTION_RMSD_SCALE) ** 2)
-
-
 def _matched_atoms_per_chain(ref_struct, mob_struct, mapping, atoms, min_b_factor, min_plddt):
     """For each mapped chain pair, pair residues by sequence alignment (not
     list index) so unmodeled/missing residues in either chain don't shift
@@ -242,4 +238,4 @@ def align_multichain(ref_struct, mob_struct, mapping, strategy="auto",
     candidates = [c for c in (global_res, local_res) if c is not None]
     if not candidates:
         raise ValueError("No viable multi-chain superposition could be produced.")
-    return max(candidates, key=lambda c: _coverage_score(len(c.ref_coords), c.rmsd))
+    return max(candidates, key=lambda c: _coverage_score(c.rmsd, len(c.ref_coords)))

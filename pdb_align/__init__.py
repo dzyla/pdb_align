@@ -1,12 +1,19 @@
-"""pdb_align — high-performance protein structure alignment."""
+"""pdb_align — high-performance protein structure alignment and model assessment."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .aligner import PDBAligner, AlignmentResult, AlignmentFailedError, EnsembleResult, DomainResult, LoadedResult, inspect_structure
 from .exceptions import ParsingError, ChainNotFoundError
 from .chains import match_chains, align_multichain, ChainMapping
 from .plotstyle import apply_nature_style
 from .interpretation import AlignmentQuality, FlaggedRegion
+from .interface import (
+    compute_dockq, DockQResult, dockq_formula, capri_class,
+    epitope_metrics, SiteComparison,
+    evaluate_antibody_complex, ImmuneComplexResult,
+    compute_pdockq, PDockQResult,
+)
+from .evaluate import evaluate_models, ModelEvaluation
 
 __all__ = [
     "align",
@@ -25,6 +32,19 @@ __all__ = [
     "align_multichain",
     "ChainMapping",
     "apply_nature_style",
+    # interface / model-assessment layer
+    "compute_dockq",
+    "DockQResult",
+    "dockq_formula",
+    "capri_class",
+    "epitope_metrics",
+    "SiteComparison",
+    "evaluate_antibody_complex",
+    "ImmuneComplexResult",
+    "compute_pdockq",
+    "PDockQResult",
+    "evaluate_models",
+    "ModelEvaluation",
 ]
 
 

@@ -4,16 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdb_align"
-version = "0.1.0"
-description = "High-performance protein structure alignment package."
+version = "0.2.0"
+description = "Protein structure alignment and prediction-model assessment (TM-score, lDDT, GDT, DockQ, epitope metrics, pDockQ)."
+requires-python = ">=3.9"
 dependencies = [
-    "numpy<2.0", "pandas", "scipy", "scikit-learn", "biopython", "numba", "requests"
+    "numpy<2.0",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "biopython",
+    "gemmi",
+    "numba",
+    "requests",
+    "matplotlib",
 ]
+
+[project.scripts]
+pdb_align = "pdb_align.__main__:main"
 
 [project.optional-dependencies]
 app = [
-    "streamlit", "py3Dmol", "stmol", "plotly", "matplotlib", "seaborn", "streamlit-molstar"
+    "streamlit", "py3Dmol", "stmol", "plotly", "seaborn", "streamlit-molstar"
 ]
+
+[tool.setuptools]
+packages = ["pdb_align"]
 
 [tool.pytest.ini_options]
 # Put the repo root on sys.path so tests can import the app-level `webapp`

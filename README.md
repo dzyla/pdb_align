@@ -38,6 +38,74 @@ Multi-chain complexes (e.g. antibody-antigen, homomultimers) are matched automat
 
 Run `pdb_align --help` for the full flag list.
 
+## Model evaluation: rank predictions against a reference (DockQ, epitope metrics, pDockQ)
+
+Given one experimental structure (or template) and N predicted models
+(AlphaFold/Boltz/...), `--models` ranks them:
+
+```bash
+# fold metrics only: TM-score, RMSD, GDT_TS, lDDT-Ca, coverage
+pdb_align native.pdb --models model1.cif model2.cif model3.cif
+
+# + interface metrics (DockQ/fnat/iRMSD/LRMSD/CAPRI class + pDockQ)
+pdb_align native.pdb --models m*.cif --receptor-chains A --ligand-chains B
+
+# immune complexes: antibody H+L merged as receptor, plus epitope/paratope
+# precision/recall/F1 (right-epitope-wrong-pose vs wrong-surface diagnostics)
+pdb_align native.pdb --models m*.cif --antibody-chains H L --antigen-chains G
+```
+
+Or from Python:
+
+```python
+from pdb_align import evaluate_models, compute_dockq, evaluate_antibody_complex, compute_pdockq
+
+ev = evaluate_models("native.pdb", ["m1.cif", "m2.cif"],
+                     antibody_chains=["H", "L"], antigen_chains=["G"])
+print(ev.report()); print(ev.best)
+
+dq = compute_dockq("native.pdb", "model.cif", ["H", "L"], ["G"])   # DockQResult
+ab = evaluate_antibody_complex("native.pdb", "model.cif", ["H", "L"], ["G"])
+pq = compute_pdockq("model.cif", ["H", "L"], ["G"])   # reference-free, needs pLDDT
+```
+
+### Metric definitions (and their sources)
+
+Every reported number follows the published definition and is cross-validated
+in the test suite against the reference implementation where one exists:
+
+- **DockQ** (Basu & Wallner 2016, PLoS ONE; validated against the official
+  `DockQ` package to <1e-3 on decoys): fnat = fraction of native interface
+  contacts (any heavy-atom pair < 5 Å) recovered; iRMSD = backbone RMSD over
+  the native 10 Å interface residues; LRMSD = ligand backbone RMSD after
+  superposing the receptor; DockQ = (fnat + 1/(1+(iRMSD/1.5)²) +
+  1/(1+(LRMSD/8.5)²))/3 with CAPRI classes (incorrect/acceptable/medium/high).
+  Residue correspondence is established by per-chain sequence alignment, so
+  mismatched numbering or chain naming cannot mis-pair residues; sequence-
+  identical chains are assigned by an fnat-maximizing permutation search
+  (symmetric homomultimers).
+- **Epitope/paratope metrics**: precision/recall/F1/Jaccard of the model's
+  4.5 Å contact residue sets against the native ones — separates "right
+  epitope, mis-oriented pose" from "wrong antigen surface", which one DockQ
+  number conflates.
+- **pDockQ** (Bryant, Pozzati & Elofsson 2022, Nat Commun): reference-free
+  interface confidence from interface pLDDT × log10(contacts); exact
+  published sigmoid constants.
+- **TM-score** (Zhang & Skolnick 2004): reported as the maximum over rigid
+  superpositions for the matched correspondence (as TM-align reports it),
+  not the TM of the RMSD-optimal frame; validated against TM-align (tmtools).
+- **TM-score p-value** (Xu & Zhang 2010): extreme-value distribution with the
+  published parameters (μ=0.1512, σ=0.0242); P(TM≥0.5) = 5.5e-7 reproduces
+  the paper's value.
+- **lDDT-Cα** (Mariani et al. 2013): superposition-free, 15 Å inclusion
+  radius, 0.5/1/2/4 Å thresholds, computed over matched residues (read with
+  coverage).
+- **GDT_TS**: single-superposition GDT normalized by the reference selection
+  length (unaligned residues count as failures) — a lower bound on CASP's
+  multi-superposition GDT, and never normalized by an inlier subset.
+- **Contact overlap**: Jaccard index of Cα contact maps (this metric was
+  previously mislabeled "CAD-score"; it is not CAD).
+
 ### Python: saving and reloading results
 
 An `AlignmentResult` can be persisted and later reloaded without the original structure files:

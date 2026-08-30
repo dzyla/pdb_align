@@ -21,7 +21,7 @@ from .core import (
     _detect_hinges, _kabsch,
 )
 from .exceptions import ParsingError, ChainNotFoundError
-from .metrics import compute_d0
+from .metrics import compute_d0, tm_optimal_superposition, calculate_lddt
 
 class AlignmentFailedError(Exception):
     """Raised when the alignment fails to produce a viable result."""
@@ -60,6 +60,8 @@ class AlignmentResult:
         self.strategy = "single"
         self.chain_mapping = None
         self._per_chain = None  # optional DataFrame set by multi-chain path
+        self._tm_cache = {}     # normalize_by -> TM-optimal score
+        self._lddt_cache = None
 
     @property
     def per_chain(self):
@@ -95,7 +97,9 @@ class AlignmentResult:
             "rmsd": self.rmsd,
             "tm_score": self.tm_score,
             "tm_score_min": self.get_tm_score("min"),
+            "tm_pvalue": self.tm_pvalue,
             "gdt_ts": gdt,
+            "lddt_ca": self.lddt_ca,
             "n_aligned": n_aligned,
             "coverage_pct": coverage,
             "chain_mapping": mapping,
@@ -165,8 +169,10 @@ class AlignmentResult:
         lines.append(f" Method    : {s['method']}  (strategy: {s['strategy']})")
         lines.append("-" * 52)
         lines.append(f" RMSD          : {fmt_num(s['rmsd'], '.3f')} A")
-        lines.append(f" TM-score      : {fmt_num(s['tm_score'], '.4f')}")
-        lines.append(f" GDT-TS        : {fmt_num(s['gdt_ts'], '.2f')}")
+        lines.append(f" TM-score      : {fmt_num(s['tm_score'], '.4f')}"
+                     + (f"  (p = {s['tm_pvalue']:.2g})" if s.get('tm_pvalue') is not None else ""))
+        lines.append(f" GDT_TS*       : {fmt_num(s['gdt_ts'], '.2f')}")
+        lines.append(f" lDDT-Ca       : {fmt_num(s.get('lddt_ca'), '.3f')}  (matched residues)")
         lines.append(f" Aligned res   : {s['n_aligned'] if s['n_aligned'] is not None else 'n/a'}")
         lines.append(f" Coverage      : {fmt_num(s['coverage_pct'], '.1f')} %")
         if s["chain_mapping"]:
@@ -192,6 +198,11 @@ class AlignmentResult:
                              f"({fr.kind}, max {fr.max_rmsd:.1f} A)")
         for w in q.warnings:
             lines.append(f" ! {w}")
+        lines.append("-" * 52)
+        lines.append(" * GDT_TS: single superposition, normalized by the")
+        lines.append("   reference selection length (lower bound on CASP GDT).")
+        lines.append(" Refs: TM-score Zhang&Skolnick'04 (TM-optimal superpos.);")
+        lines.append("   p-value EVD Xu&Zhang'10; lDDT Mariani'13.")
         lines.append("=" * 52)
         return "\n".join(lines)
 
@@ -214,9 +225,41 @@ class AlignmentResult:
         """Wrapper for get_tm_score('reference') to maintain backwards compatibility."""
         return self.get_tm_score(normalize_by='reference')
 
+    def _matched_ca_coords(self):
+        """Matched CA coordinate pairs (P_ref, Q_mob) for the chosen alignment.
+
+        Q is returned in whatever frame is at hand (original or aligned) —
+        callers that superpose re-derive the rigid transform themselves.
+        Returns (None, None) when no matched CAs exist.
+        """
+        import numpy as np
+        if self._chosen["seqguided"]:
+            ref_atoms = self._chosen["seqguided"]["ref_atoms"]
+            mob_atoms = self._chosen["seqguided"]["mob_atoms"]
+            ca_idx = [i for i, a in enumerate(ref_atoms) if a.get_name() == "CA"]
+            if not ca_idx:
+                return None, None
+            P = np.array([ref_atoms[i].get_coord() for i in ca_idx])
+            Q = np.array([mob_atoms[i].get_coord() for i in ca_idx])
+            return P, Q
+        elif self._chosen["seqfree"]:
+            sf = self._chosen["seqfree"]
+            if not sf.pairs:
+                return None, None
+            P = np.array([sf.ref_subset_ca_coords[i] for (i, j) in sf.pairs])
+            Q = np.array([sf.mob_subset_ca_coords_aligned[j] for (i, j) in sf.pairs])
+            return P, Q
+        return None, None
+
     def get_tm_score(self, normalize_by: str = 'reference') -> Optional[float]:
         """
-        Calculates the TM-score.
+        TM-score of the alignment (Zhang & Skolnick 2004).
+
+        Reported as TM-align/TM-score do: the *maximum* TM-score over rigid
+        superpositions for the matched residue correspondence (via
+        :func:`pdb_align.metrics.tm_optimal_superposition`), not the TM-score
+        of the RMSD-optimal superposition — the latter systematically
+        underestimates TM whenever flexible tails drag the least-squares fit.
 
         normalize_by: 'reference', 'mobile', or 'min'.
 
@@ -224,61 +267,40 @@ class AlignmentResult:
         protein. Changing the normalization length breaks TM-score comparability
         across different targets.
         """
-        import numpy as np
+        if normalize_by in self._tm_cache:
+            return self._tm_cache[normalize_by]
 
-        # Calculate TM-score dynamically
-        if self._chosen["seqguided"]:
-            ref_atoms = self._chosen["seqguided"]["ref_atoms"]
-            mob_atoms = self._chosen["seqguided"]["mob_atoms"]
-            per_res_rmsd = self._chosen["seqguided"]["si"]["per_residue_rmsd"]
+        L_ref = sum(self.ref_lens.values())
+        L_mob = sum(self.mob_lens.values())
+        if normalize_by == 'reference': L = L_ref
+        elif normalize_by == 'mobile': L = L_mob
+        elif normalize_by == 'min': L = min(L_ref, L_mob)
+        else: raise ValueError("normalize_by must be 'reference', 'mobile', or 'min'")
+        if L <= 15:
+            return None
 
-            # Filter to CA only for TM-score if backbone/all_heavy was used
-            ca_indices = [i for i, a in enumerate(ref_atoms) if a.get_name() == "CA"]
-            if not ca_indices:
-                return None
-            ca_rmsd = per_res_rmsd[ca_indices]
+        P, Q = self._matched_ca_coords()
+        if P is None or len(P) == 0:
+            return None
+        tm, _R, _t = tm_optimal_superposition(P, Q, L)
+        self._tm_cache[normalize_by] = float(tm)
+        return float(tm)
 
-            # The length should be the total length of the chains, not just the matched atoms
-            L_ref = sum(self.ref_lens.values())
-            L_mob = sum(self.mob_lens.values())
+    @property
+    def lddt_ca(self) -> Optional[float]:
+        """lDDT-Ca over the matched residues (Mariani et al. 2013).
 
-            if normalize_by == 'reference': L = L_ref
-            elif normalize_by == 'mobile': L = L_mob
-            elif normalize_by == 'min': L = min(L_ref, L_mob)
-            else: raise ValueError("normalize_by must be 'reference', 'mobile', or 'min'")
-
-            if L <= 15:
-                return None
-            d0 = compute_d0(L)
-            d0_sq = d0**2
-            tm = np.sum(1.0 / (1.0 + (ca_rmsd**2) / d0_sq)) / L
-            return float(tm)
-
-        elif self._chosen["seqfree"]:
-            ref_subset = self._chosen["seqfree"].ref_subset_infos
-            mob_subset = self._chosen["seqfree"].mob_subset_infos
-            pairs = self._chosen["seqfree"].pairs
-
-            L_ref = sum(self.ref_lens.values())
-            L_mob = sum(self.mob_lens.values())
-
-            if normalize_by == 'reference': L = L_ref
-            elif normalize_by == 'mobile': L = L_mob
-            elif normalize_by == 'min': L = min(L_ref, L_mob)
-            else: raise ValueError("normalize_by must be 'reference', 'mobile', or 'min'")
-
-            if L <= 15:
-                return None
-            d0 = compute_d0(L)
-            d0_sq = d0**2
-
-            sum_val = 0.0
-            for (i, j) in pairs:
-                diff = self._chosen["seqfree"].ref_subset_ca_coords[i] - self._chosen["seqfree"].mob_subset_ca_coords_aligned[j]
-                dist_sq = np.sum(diff**2)
-                sum_val += 1.0 / (1.0 + dist_sq / d0_sq)
-            return float(sum_val / L)
-        return None
+        Superposition-free: compares internal CA-CA distance matrices with a
+        15 A inclusion radius and 0.5/1/2/4 A tolerance thresholds. Computed
+        over matched residues only — read it together with ``coverage_pct``.
+        """
+        if self._lddt_cache is not None:
+            return self._lddt_cache
+        P, Q = self._matched_ca_coords()
+        if P is None or len(P) < 2:
+            return None
+        self._lddt_cache = float(calculate_lddt(P, Q))
+        return self._lddt_cache
 
     @property
     def tm_pvalue(self) -> Optional[float]:
@@ -1564,10 +1586,12 @@ class PDBAligner:
                 if ref_atoms and mob_atoms:
                     # Forward outlier-rejection controls so the seq-guided path is
                     # governed by the same recycles/keep_fraction as seq-free.
+                    # n_total normalizes GDT_TS by the reference selection length.
                     si = superimpose_atoms(
                         ref_atoms, mob_atoms,
                         recycles=int(kwargs.get("recycles", 0)),
                         keep_fraction=float(kwargs.get("keep_fraction", 1.0)),
+                        n_total=sum(self.ref_lens[c] for c in ref_chs if c in self.ref_lens) or None,
                     )
                     if si:
                         seqguided = dict(aln=aln, ref_atoms=ref_atoms, mob_atoms=mob_atoms, si=si)
@@ -1641,7 +1665,13 @@ class PDBAligner:
         mob_atoms = mc.mob_infos
         diff = mc.ref_coords - mc.mob_coords_aligned
         per_res = np.sqrt(np.sum(diff ** 2, axis=1)) if len(diff) else np.array([])
-        gdt = compute_gdt_ts(per_res) if len(per_res) else None
+        # GDT_TS on CA distances only (atoms="backbone"/"all_heavy" include
+        # several atoms per residue), normalized by the reference selection.
+        ca_idx = [i for i, a in enumerate(ref_atoms)
+                  if getattr(a, "get_name", lambda: "CA")() == "CA"]
+        n_total = sum(self.ref_lens[c] for c in ref_chs if c in self.ref_lens) or None
+        gdt = (compute_gdt_ts(per_res[ca_idx] if ca_idx else per_res, n_total=n_total)
+               if len(per_res) else None)
         si = {"rotation": mc.rotation, "translation": mc.translation,
               "rmsd": mc.rmsd, "per_residue_rmsd": per_res,
               "ref_coords": mc.ref_coords, "mob_coords_transformed": mc.mob_coords_aligned,

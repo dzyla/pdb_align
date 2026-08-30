@@ -66,7 +66,7 @@ def test_app_renders_verdict_and_all_tabs():
     assert not at.exception, at.exception
     blob = " ".join(str(el.value) for el in at.subheader)
     assert any(b in blob for b in ("EXCELLENT", "GOOD", "MODERATE", "POOR"))
-    assert len(at.metric) == 4
+    assert len(at.metric) == 5  # RMSD, TM, GDT_TS, lDDT-Ca, coverage
 
 
 def test_app_renders_ensemble_without_crash():
