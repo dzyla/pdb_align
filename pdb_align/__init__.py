@@ -1,6 +1,6 @@
 """pdb_align — high-performance protein structure alignment and model assessment."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .aligner import PDBAligner, AlignmentResult, AlignmentFailedError, EnsembleResult, DomainResult, LoadedResult, inspect_structure
 from .exceptions import ParsingError, ChainNotFoundError
@@ -14,6 +14,11 @@ from .interface import (
     compute_pdockq, PDockQResult,
 )
 from .evaluate import evaluate_models, ModelEvaluation
+from .confidence import (
+    load_confidence, find_confidence_files, ModelConfidence,
+    compute_pdockq2, PDockQ2Result,
+)
+from .cdr import annotate_cdrs, cdr_rmsd, CDRResult, CDRAnnotation
 
 __all__ = [
     "align",
@@ -45,6 +50,16 @@ __all__ = [
     "PDockQResult",
     "evaluate_models",
     "ModelEvaluation",
+    # confidence ingestion (PAE / ipTM) and CDR metrics
+    "load_confidence",
+    "find_confidence_files",
+    "ModelConfidence",
+    "compute_pdockq2",
+    "PDockQ2Result",
+    "annotate_cdrs",
+    "cdr_rmsd",
+    "CDRResult",
+    "CDRAnnotation",
 ]
 
 

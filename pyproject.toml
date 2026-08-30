@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdb_align"
-version = "0.2.0"
+version = "0.3.0"
 description = "Protein structure alignment and prediction-model assessment (TM-score, lDDT, GDT, DockQ, epitope metrics, pDockQ)."
 requires-python = ">=3.9"
 dependencies = [
@@ -26,6 +26,10 @@ pdb_align = "pdb_align.__main__:main"
 app = [
     "streamlit", "py3Dmol", "stmol", "plotly", "seaborn", "streamlit-molstar"
 ]
+# CDR annotation (IMGT numbering). anarci also needs an HMMER 3.3.x `hmmscan`
+# on PATH (e.g. `conda install -c bioconda 'hmmer=3.3*'`); HMMER >= 3.4 text
+# output is not parsed correctly by anarci's Biopython parser.
+antibody = ["anarci"]
 
 [tool.setuptools]
 packages = ["pdb_align"]

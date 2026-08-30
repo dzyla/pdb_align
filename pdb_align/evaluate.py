@@ -23,6 +23,7 @@ from .aligner import PDBAligner
 from .interface import (
     compute_dockq, epitope_metrics, compute_pdockq, capri_class,
 )
+from .confidence import load_confidence, find_confidence_files, compute_pdockq2
 
 
 @dataclass
@@ -92,6 +93,8 @@ def evaluate_models(
     atoms: str = "CA",
     min_plddt: float = 0.0,
     with_pdockq: bool = True,
+    confidence_files: Optional[Sequence] = None,
+    with_cdr: bool = True,
     **align_kwargs,
 ) -> ModelEvaluation:
     """
@@ -104,9 +107,16 @@ def evaluate_models(
         of an interface to score with DockQ (optional).
     antibody_chains, antigen_chains : immune-complex shorthand — equivalent to
         receptor/ligand but additionally reports epitope/paratope
-        precision/recall/F1 (antibody chains are merged as the receptor).
+        precision/recall/F1 (antibody chains are merged as the receptor) and,
+        when ANARCI is available and ``with_cdr``, per-CDR RMSD after
+        framework superposition (``cdr_h3`` column; full set in ``details``).
     with_pdockq : also compute reference-free pDockQ per model when an
         interface is specified (needs pLDDT in the model B-factor column).
+    confidence_files : per-model confidence files (AF2/AF3/Boltz JSON, PAE
+        npz/npy); each entry may be a path, a list of paths, or None. When the
+        argument is omitted entirely, sibling files are auto-discovered via
+        :func:`pdb_align.confidence.find_confidence_files`. Adds an ``iptm``
+        column, and — with a PAE matrix and an interface — ``pdockq2``.
     Other keyword arguments are forwarded to :meth:`PDBAligner.align`.
 
     Notes
@@ -130,6 +140,8 @@ def evaluate_models(
         labels = [os.path.splitext(os.path.basename(str(m)))[0] for m in models]
     if len(labels) != len(models):
         raise ValueError("labels must match models in length.")
+    if confidence_files is not None and len(confidence_files) != len(models):
+        raise ValueError("confidence_files must match models in length.")
 
     aligner = PDBAligner()
     aligner.add_reference(reference)
@@ -137,7 +149,7 @@ def evaluate_models(
 
     rows: List[dict] = []
     details: List[dict] = []
-    for label, model in zip(labels, models):
+    for model_idx, (label, model) in enumerate(zip(labels, models)):
         row = {"model": label, "rmsd": np.nan, "tm_score": np.nan,
                "gdt_ts": np.nan, "lddt_ca": np.nan, "coverage_pct": np.nan}
         detail = {"model": label, "path": str(model)}
@@ -157,6 +169,25 @@ def evaluate_models(
             rows.append(row)
             details.append(detail)
             continue
+
+        # --- confidence ingestion (ipTM / PAE), explicit or auto-discovered ---
+        conf = None
+        conf_paths = None
+        if confidence_files is not None:
+            entry = confidence_files[model_idx]
+            if entry:
+                conf_paths = [entry] if isinstance(entry, (str, os.PathLike)) else list(entry)
+        else:
+            conf_paths = find_confidence_files(str(model)) or None
+        if conf_paths:
+            try:
+                conf = load_confidence(conf_paths)
+                detail["confidence"] = conf.to_dict()
+                row["iptm"] = conf.iptm if conf.iptm is not None else np.nan
+            except Exception as e:
+                warnings.warn(f"Model '{label}': could not parse confidence "
+                              f"file(s) {conf_paths}: {e}", UserWarning, stacklevel=2)
+                detail["confidence_error"] = str(e)
 
         if interface_scored:
             row.update({"dockq": np.nan, "fnat": np.nan, "irmsd": np.nan,
@@ -184,12 +215,13 @@ def evaluate_models(
                 except Exception as e:
                     detail["epitope_error"] = str(e)
 
+            model_dq = detail.get("dockq", {})
+            rec_model = [m.split("->")[1] for m in model_dq.get("receptor_mapping", [])]
+            lig_model = [m.split("->")[1] for m in model_dq.get("ligand_mapping", [])]
+
             if with_pdockq:
                 row["pdockq"] = np.nan
                 try:
-                    model_dq = detail.get("dockq", {})
-                    rec_model = [m.split("->")[1] for m in model_dq.get("receptor_mapping", [])]
-                    lig_model = [m.split("->")[1] for m in model_dq.get("ligand_mapping", [])]
                     if rec_model and lig_model:
                         with warnings.catch_warnings():
                             warnings.simplefilter("ignore", UserWarning)
@@ -198,6 +230,37 @@ def evaluate_models(
                         detail["pdockq"] = pq.to_dict()
                 except Exception as e:
                     detail["pdockq_error"] = str(e)
+
+            # PAE-based pDockQ2 (Zhu 2023) when a PAE matrix was ingested
+            if conf is not None and conf.pae is not None:
+                row["pdockq2"] = np.nan
+                try:
+                    if rec_model and lig_model:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", UserWarning)
+                            pq2 = compute_pdockq2(model_path, rec_model,
+                                                  lig_model, conf.pae)
+                        row["pdockq2"] = pq2.pdockq2
+                        detail["pdockq2"] = pq2.to_dict()
+                except Exception as e:
+                    detail["pdockq2_error"] = str(e)
+
+            # per-CDR RMSD after framework superposition (needs ANARCI)
+            if antibody_mode and with_cdr:
+                row["cdr_h3"] = np.nan
+                try:
+                    from .cdr import cdr_rmsd
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        cdrs = cdr_rmsd(ref_path, model_path, receptor_chains,
+                                        model_antibody_chains=rec_model or None)
+                    detail["cdr"] = cdrs.to_dict()
+                    if cdrs.h3 is not None:
+                        row["cdr_h3"] = cdrs.h3
+                except RuntimeError as e:  # ANARCI unavailable/broken
+                    detail["cdr_error"] = str(e)
+                except Exception as e:
+                    detail["cdr_error"] = str(e)
 
         rows.append(row)
         details.append(detail)

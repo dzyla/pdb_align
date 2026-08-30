@@ -52,7 +52,13 @@ pdb_align native.pdb --models m*.cif --receptor-chains A --ligand-chains B
 
 # immune complexes: antibody H+L merged as receptor, plus epitope/paratope
 # precision/recall/F1 (right-epitope-wrong-pose vs wrong-surface diagnostics)
+# and per-CDR RMSD after framework superposition (cdr_h3 column; needs ANARCI)
 pdb_align native.pdb --models m*.cif --antibody-chains H L --antigen-chains G
+
+# AF2/AF3/Boltz confidence files (ipTM + PAE -> pDockQ2) are auto-discovered
+# next to each model, or given explicitly ('-' skips a model):
+pdb_align native.pdb --models m1.cif m2.cif --receptor-chains A --ligand-chains B \
+    --confidence m1_scores.json -
 ```
 
 Or from Python:
@@ -91,6 +97,20 @@ in the test suite against the reference implementation where one exists:
 - **pDockQ** (Bryant, Pozzati & Elofsson 2022, Nat Commun): reference-free
   interface confidence from interface pLDDT × log10(contacts); exact
   published sigmoid constants.
+- **pDockQ2** (Zhu, Shenoy, Kundrotas & Elofsson 2023, Bioinformatics):
+  PAE-aware per-interface confidence — X = ⟨1/(1+(PAE/10)²)⟩ · ⟨pLDDT⟩ over
+  the interface, with the reference implementation's sigmoid constants.
+  PAE/ipTM are ingested from AF2/ColabFold scores JSON, AF3
+  `*_summary_confidences.json`/`*_confidences.json`, Boltz
+  `confidence_*.json`/`pae_*.npz`, or bare PAE `.npy`/`.npz` (auto-discovered
+  next to each model, `pdb_align.load_confidence` / `find_confidence_files`).
+- **Per-CDR RMSD** (IMGT CDR definitions; ANARCI numbering, Dunbar & Deane
+  2016): backbone RMSD of each CDR after superposing the model's framework
+  onto the reference framework — CDR-H3 RMSD being the standard antibody-
+  modelling headline number. Install with `pip install anarci` plus an HMMER
+  3.3.x `hmmscan` (`conda install -c bioconda 'hmmer=3.3*'`; HMMER ≥ 3.4
+  output is not parsed correctly by ANARCI). Any custom numbering callable
+  can be injected instead (`cdr_rmsd(..., numberer=...)`).
 - **TM-score** (Zhang & Skolnick 2004): reported as the maximum over rigid
   superpositions for the matched correspondence (as TM-align reports it),
   not the TM of the RMSD-optimal frame; validated against TM-align (tmtools).

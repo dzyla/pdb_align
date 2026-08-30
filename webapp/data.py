@@ -9,7 +9,7 @@ import json
 import os
 import tempfile
 
-from pdb_align import PDBAligner, inspect_structure
+from pdb_align import PDBAligner, inspect_structure, evaluate_models
 
 
 def save_upload_to_temp(name: str, data: bytes) -> str:
@@ -48,6 +48,24 @@ def run_ensemble(ref_path, mob_paths, ref_chains, mob_chains_map, mode, strategy
         mob_list=list(mob_paths),
         **_apply_opts(dict(mode=mode), opts),
     )
+
+
+def run_evaluation(ref_path, mob_paths, labels, receptor_chains, ligand_chains,
+                   antibody_mode, mode, opts):
+    """Rank the mobile structures against the reference (public API only).
+
+    ``receptor_chains``/``ligand_chains`` may be None (fold metrics only).
+    In antibody mode they are passed as antibody/antigen groups, adding
+    epitope F1 and CDR columns.
+    """
+    kwargs = _apply_opts(dict(mode=mode), opts)
+    if antibody_mode and receptor_chains and ligand_chains:
+        return evaluate_models(ref_path, list(mob_paths), labels=list(labels),
+                               antibody_chains=receptor_chains,
+                               antigen_chains=ligand_chains, **kwargs)
+    return evaluate_models(ref_path, list(mob_paths), labels=list(labels),
+                           receptor_chains=receptor_chains,
+                           ligand_chains=ligand_chains, **kwargs)
 
 
 def input_key(ref, mobs, ref_chains, mob_chains_map, mode, strategy, opts) -> str:

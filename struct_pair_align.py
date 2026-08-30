@@ -56,6 +56,18 @@ with st.sidebar:
         "Mode",
         ["auto", "seq_guided", "seq_free_shape", "seq_free_window", "flexible"])
     strategy = st.selectbox("Strategy", ["auto", "global", "local"])
+
+    with st.expander("🧪 Model evaluation (interface)"):
+        st.caption("Rank the mobile structure(s) as models of the reference; "
+                   "pick the two sides of an interface for DockQ scoring.")
+        eval_on = st.checkbox("Evaluate models vs reference", value=False)
+        eval_receptor = st.multiselect(
+            "Receptor / antibody chains (reference)", ref_chain_opts, default=[])
+        eval_ligand = st.multiselect(
+            "Ligand / antigen chains (reference)",
+            [c for c in ref_chain_opts if c not in eval_receptor], default=[])
+        eval_antibody = st.checkbox(
+            "Antibody mode (epitope F1 + CDR-H3 RMSD)", value=False)
     with st.expander("Advanced"):
         opts = dict(
             seq_gap_open=st.slider("Gap open", -20, -1, -10),
@@ -73,7 +85,10 @@ is_ensemble = len(mob_names) > 1
 mob_paths = [st.session_state.uploads[n] for n in mob_names]
 
 if run:
-    key = D.input_key(ref_path, mob_paths, ref_chains, {}, mode_label, strategy, opts)
+    eval_cfg = dict(on=eval_on, receptor=eval_receptor, ligand=eval_ligand,
+                    antibody=eval_antibody)
+    key = D.input_key(ref_path, mob_paths, ref_chains, eval_cfg,
+                      mode_label, strategy, opts)
     if key not in st.session_state.results:
         with st.spinner("Aligning…"):
             try:
@@ -93,6 +108,15 @@ if run:
             except Exception as e:
                 st.error(f"Alignment failed: {e}")
                 st.stop()
+    if eval_on:
+        with st.spinner("Evaluating models…"):
+            try:
+                st.session_state["_eval_" + key] = D.run_evaluation(
+                    ref_path, mob_paths, mob_names,
+                    eval_receptor or None, eval_ligand or None,
+                    eval_antibody, mode_label, opts)
+            except Exception as e:
+                st.error(f"Model evaluation failed: {e}")
     st.session_state["_last_key"] = key
 
 key = st.session_state.get("_last_key")
@@ -101,11 +125,15 @@ if not key or key not in st.session_state.results:
     st.stop()
 
 kind, obj = st.session_state.results[key]
+evaluation = st.session_state.get("_eval_" + key)
 
 if kind == "ensemble":
     best = min(obj.results, key=lambda r: r.rmsd if r.rmsd is not None else 1e9)
     S.render_header(best)
-    tabs = st.tabs(["Overview", "3D", "Per-residue", "Ensemble", "Export"])
+    names = ["Overview", "3D", "Per-residue", "Ensemble"]
+    names += ["Evaluation"] if evaluation is not None else []
+    names += ["Export"]
+    tabs = st.tabs(names)
     with tabs[0]:
         S.render_overview(best)
     with tabs[1]:
@@ -114,16 +142,25 @@ if kind == "ensemble":
         S.render_per_residue(best)
     with tabs[3]:
         S.render_ensemble(obj)
-    with tabs[4]:
+    if evaluation is not None:
+        with tabs[4]:
+            S.render_evaluation(evaluation)
+    with tabs[-1]:
         S.render_export(obj, is_ensemble=True)
 else:
     S.render_header(obj)
-    tabs = st.tabs(["Overview", "3D", "Per-residue", "Export"])
+    names = ["Overview", "3D", "Per-residue"]
+    names += ["Evaluation"] if evaluation is not None else []
+    names += ["Export"]
+    tabs = st.tabs(names)
     with tabs[0]:
         S.render_overview(obj)
     with tabs[1]:
         S.render_3d(obj)
     with tabs[2]:
         S.render_per_residue(obj)
-    with tabs[3]:
+    if evaluation is not None:
+        with tabs[3]:
+            S.render_evaluation(evaluation)
+    with tabs[-1]:
         S.render_export(obj, is_ensemble=False)

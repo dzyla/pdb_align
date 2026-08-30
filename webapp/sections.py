@@ -104,6 +104,37 @@ def render_ensemble(ens):
         st.info("Add 3+ mobile structures to enable clustering / PCA.")
 
 
+def render_evaluation(ev):
+    """Ranked model-evaluation table (ModelEvaluation from run_evaluation)."""
+    ranked_by = "DockQ (interface)" if ev.interface_scored else "TM-score"
+    st.write(f"**Ranked by:** {ranked_by}")
+    if ev.table.empty:
+        st.warning("No models could be evaluated.")
+        return
+    st.dataframe(ev.table, hide_index=True, use_container_width=True,
+                 column_config={"model": st.column_config.TextColumn("model")})
+    best = ev.table.iloc[0]
+    cols = st.columns(3)
+    cols[0].metric("Best model", str(best["model"]))
+    if ev.interface_scored and "dockq" in ev.table.columns and best.notna().get("dockq", False):
+        cols[1].metric("DockQ", f"{best['dockq']:.3f}",
+                       help="Basu & Wallner 2016; incorrect <0.23 ≤ acceptable "
+                            "<0.49 ≤ medium <0.80 ≤ high")
+        cols[2].metric("CAPRI class", str(best.get("capri", "")))
+    else:
+        cols[1].metric("TM-score", f"{best['tm_score']:.3f}")
+        cols[2].metric("RMSD (Å)", f"{best['rmsd']:.2f}")
+    if ev.antibody_mode:
+        st.caption("Epitope F1 ≈ 1 with low DockQ = right epitope, mis-oriented "
+                   "pose; low F1 = wrong antigen surface. cdr_h3 = CDR-H3 "
+                   "backbone RMSD after framework superposition (needs ANARCI).")
+    st.download_button(
+        "⬇️ Ranking table (CSV)", data=ev.table.to_csv(index=False),
+        file_name="model_evaluation.csv", key="eval_csv")
+    with st.expander("Per-model details (JSON)"):
+        st.json(ev.to_dict())
+
+
 def render_export(obj, is_ensemble):
     st.write("One-click reproducible bundle:")
     if st.button("📦 Build bundle (ZIP)"):

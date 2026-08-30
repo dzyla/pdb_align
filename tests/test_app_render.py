@@ -60,6 +60,21 @@ S.render_export(ens, is_ensemble=True)
 """
 
 
+_EVALUATION_SCRIPT = f"""
+import streamlit as st
+from webapp import data as D
+from webapp import sections as S
+
+REF = {os.path.join(DATA, "ref.pdb")!r}
+MOB = {os.path.join(DATA, "mob.pdb")!r}
+OPTS = {{"seq_gap_open": -10, "seq_gap_extend": -0.5, "atoms": "CA", "min_plddt": 0.0}}
+
+ev = D.run_evaluation(REF, [MOB, REF], ["decoy", "perfect"],
+                      None, None, False, "auto", OPTS)
+S.render_evaluation(ev)
+"""
+
+
 def test_app_renders_verdict_and_all_tabs():
     at = AppTest.from_string(_SCRIPT, default_timeout=120)
     at.run()
@@ -74,3 +89,16 @@ def test_app_renders_ensemble_without_crash():
     at = AppTest.from_string(_ENSEMBLE_SCRIPT, default_timeout=120)
     at.run()
     assert not at.exception, at.exception
+
+
+def test_app_renders_evaluation_tab():
+    at = AppTest.from_string(_EVALUATION_SCRIPT, default_timeout=120)
+    at.run()
+    assert not at.exception, at.exception
+    blob = " ".join(str(el.value) for el in at.markdown)
+    assert "TM-score" in blob                 # ranked-by line (no interface)
+    metrics = {str(m.label) for m in at.metric}
+    assert "Best model" in metrics
+    # the perfect model must be ranked first
+    best_values = [str(m.value) for m in at.metric if str(m.label) == "Best model"]
+    assert best_values == ["perfect"]
