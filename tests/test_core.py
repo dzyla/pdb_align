@@ -4,7 +4,7 @@ import numpy as np
 
 from pdb_align.core import (
     compute_gdt_ts,
-    compute_cad_score_approx,
+    compute_contact_overlap,
     progressive_align_ensemble,
     _extract_ca_infos,
     _parse_path,
@@ -24,7 +24,7 @@ def test_compute_gdt_ts():
     score = compute_gdt_ts(dists)
     assert np.isclose(score, 58.333, atol=0.1)
 
-def test_compute_cad_score_approx():
+def test_compute_contact_overlap():
     # Mock some points. 1, 2, 3 in a line
     ref = np.array([
         [0.0, 0.0, 0.0],
@@ -32,18 +32,18 @@ def test_compute_cad_score_approx():
         [6.0, 0.0, 0.0]
     ])
     # Exact same mob
-    cad = compute_cad_score_approx(ref, ref, contact_dist=8.0)
+    overlap = compute_contact_overlap(ref, ref, contact_dist=8.0)
     # Jaccard index for self should be 1.0
-    assert cad == 1.0
+    assert overlap == 1.0
 
-    # If completely far apart, cad is 0
+    # If completely far apart, the overlap is 0
     mob = np.array([
         [100.0, 0.0, 0.0],
         [200.0, 0.0, 0.0],
         [300.0, 0.0, 0.0]
     ])
-    cad_far = compute_cad_score_approx(ref, mob, contact_dist=8.0)
-    assert cad_far == 0.0
+    overlap_far = compute_contact_overlap(ref, mob, contact_dist=8.0)
+    assert overlap_far == 0.0
 
 def test_kabsch():
     ref = np.array([

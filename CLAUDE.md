@@ -39,7 +39,7 @@ The package has two layers: a **Python library** and a **Streamlit frontend**.
   - `perform_sequence_alignment()` / `get_aligned_atoms_by_alignment()` — sequence-guided alignment path
   - `sequence_independent_alignment_joined_v2()` — sequence-free shape/window alignment
   - `pick_best_overall()` — selects best result across all strategies using a **coverage-weighted score** (`n_pairs / (1 + (rmsd/3Å)²)`), so a strategy matching only a few residues at low RMSD cannot beat one that superimposes the whole protein
-  - `compute_gdt_ts()`, `compute_cad_score_approx()` — scoring functions
+  - `compute_gdt_ts(dists, n_total)` — single-superposition GDT_TS over ALL matched pairs, normalized by the reference selection length (`n_total`; CASP semantics — never by an inlier subset). `compute_contact_overlap()` — Cα contact-map Jaccard (formerly mislabeled `compute_cad_score_approx`, kept as a deprecated alias)
   - `progressive_align_ensemble()` — multi-structure ensemble alignment
   - `_sliding_window_mean()` — numba JIT-compiled sliding-window mean (used for hinge detection)
   - `_detect_hinges()` — returns split indices from a per-residue RMSD array; used by flexible mode
@@ -82,7 +82,11 @@ The package has two layers: a **Python library** and a **Streamlit frontend**.
 
 - **`structure.py`** — `StructureBase` wraps `gemmi.Structure` with chain selection and subdomain range support (e.g., `"A:10-150"`).
 
-- **`metrics.py`** — Standalone metric functions: `compute_d0()` (TM-score normalization distance, clamped to ≥0.5 Å), `calculate_tm_score()`, `calculate_lddt()`, and `calculate_tm_pvalue()` (approximate Gumbel-model significance; random-pair TM≈0.17 → p≈1).
+- **`metrics.py`** — Standalone, dependency-free metric functions: `compute_d0()` (TM-score normalization distance, clamped to ≥0.5 Å), `calculate_tm_score()` (TM of a *given* superposition), `tm_optimal_superposition()` (TM-maximizing superposition for a fixed correspondence, TMscore-program style — this is what `AlignmentResult.get_tm_score()` reports, validated against TM-align via `tmtools`), `calculate_lddt()` (lDDT-Cα, chunked, wired into `summary_stats()["lddt_ca"]`), and `calculate_tm_pvalue()` (Xu & Zhang 2010 EVD, μ=0.1512/σ=0.0242; golden value P(TM≥0.5)=5.5e-7).
+
+- **`interface.py`** — DockQ-family interface metrics, all constants from the published sources (see module docstring): `compute_dockq()` (fnat 5 Å heavy-atom contacts / iRMSD over native 10 Å interface backbone / LRMSD after receptor superposition / DockQ formula + CAPRI class; residue correspondence by per-chain sequence alignment; fnat-maximizing permutation search over sequence-identical chains for homomultimers; validated against the official `DockQ` package in `tests/test_golden_crossvalidation.py`), `epitope_metrics()` (epitope/paratope precision/recall/F1/Jaccard at 4.5 Å), `evaluate_antibody_complex()` (H+L merged as receptor + site diagnostics), `compute_pdockq()` (Bryant 2022 sigmoid on interface pLDDT × log10 contacts, reference-free).
+
+- **`evaluate.py`** — `evaluate_models(ref, models, ...)` ranks N predicted models against a reference: fold metrics (TM/RMSD/GDT/lDDT-Cα/coverage) + optional DockQ columns (`receptor_chains`/`ligand_chains`) + epitope F1 (`antibody_chains`/`antigen_chains`) + pDockQ. Returns `ModelEvaluation` (`.table` DataFrame ranked by DockQ else TM, `.best`, `.report()`, `.details`). Failing models warn and appear with NaNs, never silently dropped. CLI: `pdb_align REF --models M1 M2 ... [--receptor-chains/--ligand-chains | --antibody-chains/--antigen-chains]`.
 
 - **`exceptions.py`** — Custom exceptions: `ParsingError`, `ChainNotFoundError`.
 

@@ -1,3 +1,16 @@
+"""Standalone structure-comparison metrics (pure numpy, no gemmi/BioPython).
+
+References
+----------
+- TM-score: Zhang & Skolnick, Proteins 2004, 57:702-710.
+- TM-score significance (EVD parameters): Xu & Zhang, Bioinformatics 2010,
+  26:889-895 ("How significant is a protein structure similarity with
+  TM-score = 0.5?").
+- lDDT: Mariani, Biasini, Barbato & Schwede, Bioinformatics 2013,
+  29:2722-2728.
+"""
+import math
+
 import numpy as np
 
 # Minimum d0 used by TM-align. The raw d0 formula goes to zero (and even
@@ -24,12 +37,16 @@ def compute_d0(length: int) -> float:
 def calculate_tm_score(ref_coords: np.ndarray, mob_coords: np.ndarray, length: int) -> float:
     """
     Calculates the TM-score for two sets of aligned coordinates.
-    
+
+    Note: this evaluates the TM-score of the *given* superposition. The
+    reported TM-score of an alignment should be the maximum over
+    superpositions — see :func:`tm_optimal_superposition`.
+
     Args:
         ref_coords: Reference coordinates (N, 3).
         mob_coords: Mobile coordinates aligned to reference (N, 3).
         length: The length of the target protein (usually reference length).
-        
+
     Returns:
         TM-score (float between 0 and 1).
     """
@@ -40,81 +57,176 @@ def calculate_tm_score(ref_coords: np.ndarray, mob_coords: np.ndarray, length: i
 
     dists = np.linalg.norm(ref_coords - mob_coords, axis=1)
     score = np.sum(1 / (1 + (dists / d0)**2)) / length
-    
+
     return float(score)
 
-def calculate_lddt(ref_coords: np.ndarray, mob_coords: np.ndarray, threshold: float = 15.0) -> float:
+
+def _kabsch_np(P: np.ndarray, Q: np.ndarray):
+    """Minimal Kabsch superposition (local copy so metrics stays dependency-free).
+
+    Returns (R, t) such that R @ Q + t best fits P in the least-squares sense.
     """
-    Calculates the lDDT (Local Distance Difference Test) score.
-    
+    cP = P.mean(axis=0)
+    cQ = Q.mean(axis=0)
+    H = (Q - cQ).T @ (P - cP)
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1.0
+        R = Vt.T @ U.T
+    t = cP - R @ cQ
+    return R, t
+
+
+def tm_optimal_superposition(ref_coords: np.ndarray, mob_coords: np.ndarray,
+                             length: int, max_iter: int = 20):
+    """
+    TM-score-maximizing superposition for a *fixed* residue correspondence.
+
+    TM-align/TM-score report the TM-score of the superposition that maximizes
+    it, not of the RMSD-optimal (Kabsch) superposition; evaluating TM on the
+    Kabsch frame systematically underestimates it whenever flexible tails or
+    hinges drag the least-squares fit. This implements the standard TM-score
+    heuristic: seed superpositions from contiguous fragments (full length,
+    halves, quarters), then iteratively re-superpose on the residue subset
+    within a distance cutoff, growing the cutoff when too few residues
+    qualify, and keep the superposition with the highest TM-score.
+
+    Args:
+        ref_coords: (N, 3) reference CA coordinates.
+        mob_coords: (N, 3) mobile CA coordinates in any frame (the optimal
+            rigid transform is re-derived internally).
+        length: normalization length L for the TM-score (reference length).
+        max_iter: refinement iterations per seed.
+
+    Returns:
+        (tm_score, R, t): the maximal TM-score and its superposition, with
+        ``R @ mob + t`` in the reference frame.
+    """
+    P = np.asarray(ref_coords, dtype=float)
+    Q = np.asarray(mob_coords, dtype=float)
+    N = len(P)
+    if N == 0 or N != len(Q) or length <= 0:
+        return 0.0, np.eye(3), np.zeros(3)
+    if N < 3:
+        t = P.mean(axis=0) - Q.mean(axis=0)
+        d = np.linalg.norm(P - (Q + t), axis=1)
+        d0 = compute_d0(length)
+        return float(np.sum(1.0 / (1.0 + (d / d0) ** 2)) / length), np.eye(3), t
+
+    d0 = compute_d0(length)
+    d0_sq = d0 * d0
+
+    def tm_of(R, t):
+        d_sq = np.sum((P - ((R @ Q.T).T + t)) ** 2, axis=1)
+        return float(np.sum(1.0 / (1.0 + d_sq / d0_sq)) / length), d_sq
+
+    # Seed fragments: full chain, halves, quarters (TMscore-program style).
+    seeds = [(0, N)]
+    for frac in (2, 4):
+        flen = N // frac
+        if flen >= 4:
+            step = max(1, flen)
+            for start in range(0, N - flen + 1, step):
+                seeds.append((start, start + flen))
+
+    best_tm, best_R, best_t = -1.0, np.eye(3), np.zeros(3)
+    d_search = max(d0, 1.0)
+    for (s, e) in seeds:
+        R, t = _kabsch_np(P[s:e], Q[s:e])
+        tm, d_sq = tm_of(R, t)
+        if tm > best_tm:
+            best_tm, best_R, best_t = tm, R, t
+        prev_sel = None
+        for _ in range(max_iter):
+            cut = d_search
+            sel = d_sq < cut * cut
+            # grow the cutoff until enough residues qualify
+            while sel.sum() < 3 and cut < 50.0:
+                cut += 0.5
+                sel = d_sq < cut * cut
+            if sel.sum() < 3:
+                break
+            if prev_sel is not None and np.array_equal(sel, prev_sel):
+                break
+            prev_sel = sel
+            R, t = _kabsch_np(P[sel], Q[sel])
+            tm, d_sq = tm_of(R, t)
+            if tm > best_tm:
+                best_tm, best_R, best_t = tm, R, t
+    return best_tm, best_R, best_t
+
+
+def calculate_lddt(ref_coords: np.ndarray, mob_coords: np.ndarray,
+                   threshold: float = 15.0, chunk: int = 512) -> float:
+    """
+    lDDT-Ca (Local Distance Difference Test on the given coordinate set).
+
+    Superposition-free: compares the two internal distance matrices over all
+    pairs whose *reference* distance is below ``threshold`` (15 A inclusion
+    radius, as in Mariani et al. 2013), scoring the fraction preserved within
+    0.5/1/2/4 A. Computed in row chunks so large complexes do not allocate
+    full N x N matrices. When called with CA coordinates of matched residues
+    this is the lDDT-Ca of the *matched* region; unmatched residues are not
+    penalized (report coverage alongside).
+
     Args:
         ref_coords: Reference coordinates (N, 3).
-        mob_coords: Mobile coordinates aligned to reference (N, 3).
-        threshold: Distance inclusion threshold (default 15.0 A).
-        
+        mob_coords: Model coordinates (N, 3), any frame.
+        threshold: Inclusion radius on reference distances (default 15.0 A).
+        chunk: Row-block size for the chunked computation.
+
     Returns:
-        lDDT score (float between 0 and 1).
+        lDDT score in [0, 1].
     """
     if len(ref_coords) != len(mob_coords) or len(ref_coords) == 0:
         return 0.0
-        
-    n_atoms = len(ref_coords)
-    if n_atoms <= 1:
+
+    n = len(ref_coords)
+    if n <= 1:
         return 0.0
 
-    # Calculate all pairwise distances
-    ref_dists = np.linalg.norm(ref_coords[:, None, :] - ref_coords[None, :, :], axis=-1)
-    mob_dists = np.linalg.norm(mob_coords[:, None, :] - mob_coords[None, :, :], axis=-1)
-    
-    # Create mask for pairs within threshold (excluding self-pairs)
-    mask = (ref_dists < threshold) & (np.arange(n_atoms)[:, None] != np.arange(n_atoms)[None, :])
-    
-    if not np.any(mask):
+    P = np.asarray(ref_coords, dtype=float)
+    Q = np.asarray(mob_coords, dtype=float)
+    preserved = 0
+    total = 0
+    idx = np.arange(n)
+    for s in range(0, n, chunk):
+        e = min(n, s + chunk)
+        ref_d = np.linalg.norm(P[s:e, None, :] - P[None, :, :], axis=-1)
+        mob_d = np.linalg.norm(Q[s:e, None, :] - Q[None, :, :], axis=-1)
+        mask = (ref_d < threshold) & (idx[s:e, None] != idx[None, :])
+        if not mask.any():
+            continue
+        diffs = np.abs(ref_d - mob_d)[mask]
+        for tol in (0.5, 1.0, 2.0, 4.0):
+            preserved += int(np.sum(diffs < tol))
+        total += int(mask.sum())
+
+    if total == 0:
         return 0.0
-        
-    # Calculate difference in distances
-    diffs = np.abs(ref_dists - mob_dists)
-    
-    # Calculate fractions of distances preserved within thresholds: 0.5, 1.0, 2.0, 4.0
-    preserved_05 = np.sum((diffs < 0.5) & mask)
-    preserved_10 = np.sum((diffs < 1.0) & mask)
-    preserved_20 = np.sum((diffs < 2.0) & mask)
-    preserved_40 = np.sum((diffs < 4.0) & mask)
-    
-    total_pairs = np.sum(mask)
-    
-    lddt = (preserved_05 + preserved_10 + preserved_20 + preserved_40) / (4 * total_pairs)
-    
-    return float(lddt)
+    return float(preserved / (4 * total))
 
-import math
 
-# Parameters of the random-pair TM-score distribution.
-#
-# TM-score's d0 normalization was designed so that the TM-score of a pair of
-# unrelated ("random") structures has a mean of ~0.17 that is essentially
-# independent of chain length (Zhang & Skolnick, Proteins 2004, 57:702-710).
-# Empirically that random-pair distribution is right-skewed and well described
-# by an extreme-value (Gumbel) distribution with a spread of roughly 0.05.
-_TM_RANDOM_MEAN = 0.17
-_TM_RANDOM_STD = 0.05
-_EULER_GAMMA = 0.5772156649015329
+# Extreme-value distribution of the TM-score of random (unrelated) structure
+# pairs, fitted by Xu & Zhang (Bioinformatics 2010, 26:889-895) on 7.2e7
+# gapless comparisons of non-homologous PDB domains:
+#     F(x) = exp(-exp(-(x - mu)/sigma)),  mu = 0.1512, sigma = 0.0242,
+# length-independent by TM-score's construction. The paper's stated golden
+# value P(TM >= 0.5) = 5.5e-7 follows directly from these parameters.
+_TM_EVD_MU = 0.1512
+_TM_EVD_SIGMA = 0.0242
 
 
 def calculate_tm_pvalue(tm_score: float, length: int) -> float:
     """
-    Approximate p-value for an observed TM-score.
+    P-value of an observed TM-score under the random-pair null model.
 
     Estimates P(TM_random >= tm_score): the probability that a pair of
-    *unrelated* structures would reach at least this TM-score by chance. Small
-    values indicate significant structural similarity.
-
-    The random-pair TM-score distribution is modelled as a Gumbel (extreme
-    value) distribution with mean ~0.17 and std ~0.05, which is approximately
-    length-independent by TM-score's construction. This is an *approximation*
-    intended to give a correctly-behaved significance signal (random matches
-    score near 1, strong matches near 0); it is not a reproduction of any
-    specific tool's exact p-value.
+    *unrelated* structures reaches at least this TM-score by chance, using
+    the extreme-value distribution fitted by Xu & Zhang (Bioinformatics 2010,
+    26:889-895): mu = 0.1512, sigma = 0.0242, length-independent. At
+    TM-score = 0.5 this gives 5.5e-7, matching the published value.
 
     Parameters
     ----------
@@ -131,11 +243,7 @@ def calculate_tm_pvalue(tm_score: float, length: int) -> float:
     if tm_score >= 1.0:
         return 0.0
 
-    # Gumbel scale/location from the target mean and std.
-    beta = _TM_RANDOM_STD * math.sqrt(6.0) / math.pi
-    mu = _TM_RANDOM_MEAN - beta * _EULER_GAMMA
-
-    # Upper-tail probability: P(X >= x) = 1 - exp(-exp(-(x-mu)/beta)).
-    z = (tm_score - mu) / beta
+    # Upper-tail probability: P(X >= x) = 1 - exp(-exp(-(x-mu)/sigma)).
+    z = (tm_score - _TM_EVD_MU) / _TM_EVD_SIGMA
     survival = -math.expm1(-math.exp(-z))
     return float(min(1.0, max(0.0, survival)))
