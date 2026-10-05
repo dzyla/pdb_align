@@ -1,35 +1,44 @@
-import os
-import gemmi
-import io
-import math
-import json
-import tempfile
-import datetime
-import zipfile
-from dataclasses import dataclass
-from typing import List, Tuple, Optional, Union, Dict, Any
+"""Low-level structure handling, residue selection, pairing and geometry.
 
-import numpy as np
-import pandas as pd
+Design rule that the rest of the package depends on
+---------------------------------------------------
+**One selection, one sequence.** :func:`select_residues` is the only place
+that decides which residues take part in a comparison. It returns a
+:class:`Selection` whose ``sequence`` and ``residues`` are the same residues in
+the same order, so ``len(sequence) == len(residues)`` always holds. Sequence
+alignment therefore maps onto coordinates by *index*, never by re-scanning for
+a matching one-letter code.
+
+This is not a stylistic preference. When the sequence was extracted
+independently of the coordinate list (as it was before), any filter applied to
+one and not the other — a residue-range selector, a B-factor cutoff, a
+pLDDT cutoff — silently shifted the pairing. Two identical copies of 1UBQ with
+two residues filtered out of one side produced 24 pairs, four of them joining
+different residues, and an RMSD of 5.62 A between a structure and itself.
+
+Residue naming follows gemmi's CCD-backed tables, so modified residues
+(selenomethionine, phosphoserine, methylated lysines, ...) resolve to their
+parent one-letter code instead of vanishing from the sequence.
+"""
+from __future__ import annotations
+
 import logging
+import math
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+
+import gemmi
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# BioPython
-from Bio.PDB import (
-    PDBParser, MMCIFParser, PDBIO, Select,
-    Structure, Atom, Superimposer
-)
-from Bio.PDB.Polypeptide import protein_letters_3to1, standard_aa_names, is_aa
-from Bio.Seq import Seq
-from Bio.SeqRecord import SeqRecord
-from Bio.Align import PairwiseAligner
-from Bio.Align import substitution_matrices
-from Bio.PDB import Structure as _Structure
-
 try:
-    from numba import jit
-except ImportError:
+    from numba import jit, prange
+    _HAVE_NUMBA = True
+except ImportError:  # pragma: no cover - exercised only without numba
+    _HAVE_NUMBA = False
+
     def jit(*args, **kwargs):
         def decorator(func):
             return func
@@ -37,74 +46,340 @@ except ImportError:
             return args[0]
         return decorator
 
-VALID_AA_3 = set(standard_aa_names)
+    def prange(*args):
+        return range(*args)
 
-# Curated map of common modified/non-standard residues to their parent
-# standard residue's one-letter code. Only parent letters are used (never
-# 'X' or lowercase) so downstream BLOSUM62 sequence alignments stay valid.
-# Without this, phosphorylated/methylated residues silently vanish from the
-# extracted sequences and create phantom alignment gaps.
-MODIFIED_AA_3TO1 = {
-    "MSE": "M",  # selenomethionine
-    "SEP": "S",  # phosphoserine
-    "TPO": "T",  # phosphothreonine
-    "PTR": "Y",  # phosphotyrosine
-    "HYP": "P",  # hydroxyproline
-    "MLY": "K",  # N-dimethyllysine
-    "M3L": "K",  # N-trimethyllysine
-    "ALY": "K",  # N-acetyllysine
-    "KCX": "K",  # carboxylysine
-    "PYL": "K",  # pyrrolysine (parent K)
-    "CSO": "C",  # S-hydroxycysteine
-    "OCS": "C",  # cysteine sulfonic acid
-    "CME": "C",  # S,S-(2-hydroxyethyl)thiocysteine
-    "CSX": "C",  # S-oxycysteine
-    "SEC": "C",  # selenocysteine (parent C; 'U' is not in BLOSUM62)
-    "PCA": "E",  # pyroglutamate
-    "CGU": "E",  # gamma-carboxyglutamate
-    "FME": "M",  # N-formylmethionine
-    "HIC": "H",  # 4-methylhistidine
-    "MLZ": "K",  # N-methyllysine
-}
 
-def _aa_dict() -> Dict[str, str]:
-    d = {k: protein_letters_3to1[k] for k in VALID_AA_3}
-    d.update(MODIFIED_AA_3TO1)
-    return d
-AA_DICT = _aa_dict()
+# ---------------------------------------------------------------------------
+# residue identity
+# ---------------------------------------------------------------------------
 
-def extract_sequences_and_lengths(struct: gemmi.Structure, fname: str):
-    seqs: Dict[str, SeqRecord] = {}
-    lens: Dict[str, int] = {}
+# Amino acids whose standard one-letter code is absent from BLOSUM62; mapped to
+# the chemically closest coded parent so sequence alignment stays well defined.
+_UNCODED_PARENT = {"U": "C", "O": "K"}
+
+# Largest selection (residues x residues) the sequence-free path will attempt
+# before refusing; the distance-matrix algorithms are inherently O(N^2) in
+# memory and failing with an explanation beats being killed by the OOM reaper.
+MAX_SEQFREE_RESIDUES = 20000
+
+
+@lru_cache(maxsize=4096)
+def residue_letter(resname: str) -> Optional[str]:
+    """One-letter code for a protein residue, or ``None`` if it is not one.
+
+    Uses gemmi's chemical-component tables, which return the *parent* code in
+    lower case for modified residues (``MSE`` -> ``m`` -> ``M``). Non-amino
+    acids (waters, ligands, nucleotides) return ``None``. ``UNK`` maps to
+    ``X``, which BLOSUM62 scores, so unknown residues keep their place in the
+    chain instead of opening a phantom gap.
+    """
+    info = gemmi.find_tabulated_residue(resname)
+    if info is None or not info.is_amino_acid():
+        return None
+    code = (info.one_letter_code or "").strip()
+    if not code:
+        return None
+    upper = code.upper()
+    return _UNCODED_PARENT.get(upper, upper)
+
+
+def is_protein_residue(resname: str) -> bool:
+    return residue_letter(resname) is not None
+
+
+@lru_cache(maxsize=1)
+def blosum62():
+    """BLOSUM62 substitution matrix (loaded once; the load is not cheap)."""
+    from Bio.Align import substitution_matrices
+    return substitution_matrices.load("BLOSUM62")
+
+
+# ---------------------------------------------------------------------------
+# selection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ResidueSel:
+    """One selected residue: identity, CA, and its heavy atoms by name."""
+    chain_id: str
+    seqid: int
+    icode: str
+    name: str
+    letter: str
+    ca: np.ndarray
+    b_iso: float
+    atoms: Dict[str, np.ndarray] = field(default_factory=dict)
+
+    @property
+    def key(self) -> Tuple[str, int, str]:
+        return (self.chain_id, self.seqid, self.icode)
+
+    @property
+    def label(self) -> str:
+        return f"{self.chain_id}:{self.seqid}{self.icode}"
+
+
+@dataclass
+class Selection:
+    """A set of residues plus the sequence that *exactly* describes them."""
+    residues: List[ResidueSel]
+    sequence: str
+    chain_order: List[str]
+    lens: Dict[str, int]
+    source: str = ""
+
+    def __post_init__(self):
+        if len(self.sequence) != len(self.residues):
+            raise AssertionError(
+                "Selection invariant violated: sequence length "
+                f"{len(self.sequence)} != {len(self.residues)} residues")
+
+    def __len__(self) -> int:
+        return len(self.residues)
+
+    @property
+    def n_residues(self) -> int:
+        return len(self.residues)
+
+    @property
+    def ca_coords(self) -> np.ndarray:
+        if not self.residues:
+            return np.empty((0, 3))
+        return np.vstack([r.ca for r in self.residues])
+
+    @property
+    def chain_ids(self) -> List[str]:
+        return [r.chain_id for r in self.residues]
+
+    def chain_start_indices(self) -> List[int]:
+        """Indices at which a new chain begins (always includes 0 if non-empty).
+
+        Used to stop per-residue analyses (hinge detection, contiguous-region
+        flagging) from running across a chain boundary as if it were sequence.
+        """
+        starts: List[int] = []
+        prev = None
+        for i, r in enumerate(self.residues):
+            if r.chain_id != prev:
+                starts.append(i)
+                prev = r.chain_id
+        return starts
+
+    def sub(self, indices: Sequence[int]) -> "Selection":
+        residues = [self.residues[i] for i in indices]
+        lens: Dict[str, int] = {}
+        for r in residues:
+            lens[r.chain_id] = lens.get(r.chain_id, 0) + 1
+        order = [c for c in self.chain_order if c in lens]
+        return Selection(residues=residues,
+                         sequence="".join(r.letter for r in residues),
+                         chain_order=order, lens=lens, source=self.source)
+
+
+def _parse_chain_selector(selector: str) -> Tuple[str, Optional[int], Optional[int]]:
+    """``"A"`` -> (A, None, None); ``"A:10-150"`` -> (A, 10, 150); ``"A:42"`` -> (A, 42, 42)."""
+    text = str(selector)
+    if ":" not in text:
+        return text, None, None
+    chain_id, _, range_str = text.partition(":")
+    range_str = range_str.strip()
+    if not range_str:
+        return chain_id, None, None
+    if "-" in range_str.lstrip("-"):
+        lo, _, hi = range_str.partition("-")
+        try:
+            start = int(lo) if lo.strip() else None
+            end = int(hi) if hi.strip() else None
+        except ValueError:
+            raise ValueError(
+                f"Invalid residue range in chain selector {selector!r}; "
+                "expected 'CHAIN:start-end' with integer bounds.") from None
+        return chain_id, start, end
     try:
-        model = struct[0]
-    except Exception:
-        return {}, {}
-    for chain in model:
-        seq = []
-        ca_count = 0
+        only = int(range_str)
+    except ValueError:
+        raise ValueError(
+            f"Invalid residue range in chain selector {selector!r}; "
+            "expected 'CHAIN:start-end' with integer bounds.") from None
+    return chain_id, only, only
+
+
+def _chain_ids(struct: gemmi.Structure) -> List[str]:
+    return [ch.name for ch in struct[0]]
+
+
+def _resolve_selectors(struct: gemmi.Structure,
+                       sel: Optional[Sequence[Union[str, int]]]) -> Optional[List[str]]:
+    """Normalise a chain selection to a list of selector strings.
+
+    Integers are 1-based chain indices. Chain names are validated against the
+    structure; residue ranges are preserved verbatim for
+    :func:`select_residues` to apply.
+    """
+    if sel is None:
+        return None
+    ids = _chain_ids(struct)
+    out: List[str] = []
+    for item in sel:
+        if isinstance(item, (int, np.integer)) and not isinstance(item, bool):
+            idx = int(item)
+            if not 1 <= idx <= len(ids):
+                raise ValueError(f"Chain index {idx} out of range 1..{len(ids)}")
+            out.append(ids[idx - 1])
+        else:
+            cid, _, _ = _parse_chain_selector(item)
+            if cid not in ids:
+                raise ValueError(
+                    f"Chain {cid!r} (from {item!r}) not in {ids}")
+            out.append(str(item))
+    seen = set()
+    return [c for c in out if not (c in seen or seen.add(c))]
+
+
+def _icode_of(res: gemmi.Residue) -> str:
+    icode = res.seqid.icode or ""
+    return icode.strip() if icode.strip() != "" else ""
+
+
+def select_residues(
+    struct: gemmi.Structure,
+    selectors: Optional[Sequence[Union[str, int]]] = None,
+    min_b_factor: float = 0.0,
+    min_plddt: float = 0.0,
+    source: str = "",
+    with_atoms: bool = True,
+) -> Selection:
+    """Select protein residues and build the matching sequence in one pass.
+
+    Parameters
+    ----------
+    selectors
+        Chain names, 1-based chain indices, or ``"CHAIN:start-end"`` residue
+        ranges. ``None`` selects every chain.
+    min_b_factor, min_plddt
+        Lower bounds on the CA ``b_iso``. Both are lower bounds on the same
+        column, so the effective cutoff is the larger; see
+        :meth:`pdb_align.PDBAligner.align` for why ``min_plddt`` is applied
+        only to predicted structures.
+    with_atoms
+        Collect every heavy atom per residue (needed for ``atoms="backbone"``
+        / ``"all_heavy"``). ``False`` keeps CA only, which is cheaper.
+
+    Raises
+    ------
+    ValueError
+        If a named chain is absent, a residue range selects nothing, or the
+        selection ends up empty. Silence here would mean comparing something
+        other than what the caller asked for.
+    """
+    if len(struct) == 0:
+        raise ValueError(f"Structure {source or struct.name!r} has no models.")
+    model = struct[0]
+    available = [ch.name for ch in model]
+
+    ranges: Dict[str, List[Tuple[Optional[int], Optional[int]]]] = {}
+    order: List[str] = []
+    if selectors is None:
+        order = list(available)
+        ranges = {c: [] for c in available}
+    else:
+        for item in selectors:
+            if isinstance(item, (int, np.integer)) and not isinstance(item, bool):
+                idx = int(item)
+                if not 1 <= idx <= len(available):
+                    raise ValueError(
+                        f"Chain index {idx} out of range 1..{len(available)} "
+                        f"in {source or 'structure'}")
+                cid, start, end = available[idx - 1], None, None
+            else:
+                cid, start, end = _parse_chain_selector(item)
+            if cid not in available:
+                raise ValueError(
+                    f"Chain {cid!r} not found in {source or 'structure'} "
+                    f"(available: {available})")
+            if cid not in ranges:
+                ranges[cid] = []
+                order.append(cid)
+            if start is not None or end is not None:
+                ranges[cid].append((start, end))
+
+    cutoff = max(float(min_b_factor), float(min_plddt))
+    residues: List[ResidueSel] = []
+    lens: Dict[str, int] = {}
+    chain_order: List[str] = []
+    dropped_by_cutoff = 0
+
+    for cid in order:
+        chain = model.find_chain(cid)
+        if chain is None:
+            continue
+        bounds = ranges.get(cid, [])
+        n_in_range = 0
         for res in chain:
-            resname = res.name
-            if resname in AA_DICT:
-                has_ca = False
-                for atom in res:
-                    if atom.name == "CA":
-                        has_ca = True
-                        break
-                # Only residues carrying a CA participate in alignment; keeping
-                # CA-less residues in the sequence would desynchronise the
-                # alignment-to-residue mapping downstream.
-                if has_ca:
-                    seq.append(AA_DICT[resname])
-                    ca_count += 1
-        if seq:
-            seqs[chain.name] = SeqRecord(
-                Seq("".join(seq)),
-                id=f"{fname}_{chain.name}",
-                description=f"Chain {chain.name}",
-            )
-            lens[chain.name] = int(ca_count)
-    return seqs, lens
+            letter = residue_letter(res.name)
+            if letter is None:
+                continue
+            seqid = int(res.seqid.num)
+            if bounds:
+                if not any((lo is None or seqid >= lo) and (hi is None or seqid <= hi)
+                           for lo, hi in bounds):
+                    continue
+            n_in_range += 1
+            ca = None
+            atoms: Dict[str, np.ndarray] = {}
+            for atom in res:
+                if atom.element == gemmi.Element("H"):
+                    continue
+                name = atom.name
+                if name == "CA" and ca is None:
+                    ca = atom
+                if with_atoms and name not in atoms:
+                    atoms[name] = np.array(atom.pos.tolist(), dtype=float)
+            # Residues without a CA cannot anchor a superposition or a
+            # sequence position; keeping them would desynchronise the two.
+            if ca is None:
+                continue
+            if cutoff > 0.0 and ca.b_iso < cutoff:
+                dropped_by_cutoff += 1
+                continue
+            coord = np.array(ca.pos.tolist(), dtype=float)
+            if not with_atoms:
+                atoms = {"CA": coord}
+            residues.append(ResidueSel(
+                chain_id=cid, seqid=seqid, icode=_icode_of(res), name=res.name,
+                letter=letter, ca=coord, b_iso=float(ca.b_iso), atoms=atoms))
+            lens[cid] = lens.get(cid, 0) + 1
+            if cid not in chain_order:
+                chain_order.append(cid)
+        if bounds and n_in_range == 0:
+            rng = ", ".join(f"{lo}-{hi}" for lo, hi in bounds)
+            raise ValueError(
+                f"Residue range {cid}:{rng} selected no residues in "
+                f"{source or 'structure'}; chain {cid} covers "
+                f"{_chain_residue_span(chain)}.")
+
+    if not residues:
+        detail = (f" ({dropped_by_cutoff} residues were removed by the "
+                  f"B-factor/pLDDT cutoff of {cutoff:g})" if dropped_by_cutoff else "")
+        raise ValueError(
+            f"Selection {list(selectors) if selectors else 'all chains'} "
+            f"matched no protein residues with a CA atom in "
+            f"{source or 'structure'}{detail}.")
+
+    return Selection(residues=residues,
+                     sequence="".join(r.letter for r in residues),
+                     chain_order=chain_order, lens=lens, source=source)
+
+
+def _chain_residue_span(chain: gemmi.Chain) -> str:
+    nums = [int(r.seqid.num) for r in chain if residue_letter(r.name) is not None]
+    return f"residues {min(nums)}-{max(nums)}" if nums else "no protein residues"
+
+
+# ---------------------------------------------------------------------------
+# back-compatible views over a Selection
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ResidueInfo:
@@ -115,220 +390,201 @@ class ResidueInfo:
     resname: str
     coord: np.ndarray
 
-@dataclass
-class AlignSummary:
-    method: str
-    rmsd: float
-    inliers: int
-    total_pairs: int
-    iterations: int
 
-@dataclass
-class AlignmentResultSF:
-    rotation: np.ndarray
-    translation: np.ndarray
-    rmsd: float
-    iterations: int
-    kept_pairs: int
-    method: str
-    pairs: List[Tuple[int,int]]
-    ref_subset_infos: List[ResidueInfo]
-    mob_subset_infos: List[ResidueInfo]
-    ref_subset_ca_coords: np.ndarray
-    mob_subset_ca_coords_aligned: np.ndarray
-    mob_all_infos: List[ResidueInfo]
-    mob_all_ca_coords_aligned: np.ndarray
-    summaries: Dict[str, AlignSummary]
-    shift_matrix: Optional[np.ndarray] = None
-    shift_scores: Optional[np.ndarray] = None
-    active_mask: Optional[np.ndarray] = None
-    gdt_ts: Optional[float] = None
-    contact_overlap: Optional[float] = None
+def selection_to_infos(sel: Selection) -> List[ResidueInfo]:
+    return [ResidueInfo(idx=i, chain_id=r.chain_id, resseq=r.seqid, icode=r.icode,
+                        resname=r.name, coord=r.ca)
+            for i, r in enumerate(sel.residues)]
 
-    @property
-    def cad_score(self) -> Optional[float]:
-        """Deprecated alias for :attr:`contact_overlap` (it was never CAD)."""
-        return self.contact_overlap
+
+def extract_sequences_and_lengths(struct: gemmi.Structure, fname: str = ""):
+    """Per-chain sequences and CA counts (one entry per chain with residues).
+
+    Kept as a convenience for chain-level work (similarity matrices, chain
+    matching). Anything that pairs residues with coordinates must use
+    :func:`select_residues` instead, so the two can never diverge.
+    """
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    seqs: Dict[str, SeqRecord] = {}
+    lens: Dict[str, int] = {}
+    if len(struct) == 0:
+        return {}, {}
+    for chain in struct[0]:
+        try:
+            sel = select_residues(struct, [chain.name], source=fname, with_atoms=False)
+        except ValueError:
+            continue
+        if not sel.residues:
+            continue
+        seqs[chain.name] = SeqRecord(Seq(sel.sequence),
+                                     id=f"{fname}_{chain.name}",
+                                     description=f"Chain {chain.name}")
+        lens[chain.name] = sel.n_residues
+    return seqs, lens
+
+
+def _extract_ca_infos(struct: gemmi.Structure, chain_filter=None,
+                      min_b_factor: float = 0.0, min_plddt: float = 0.0,
+                      source: str = "") -> List[ResidueInfo]:
+    """CA-level residue records for a selection (thin view over Selection)."""
+    sel = select_residues(struct, chain_filter, min_b_factor=min_b_factor,
+                          min_plddt=min_plddt, source=source, with_atoms=False)
+    return selection_to_infos(sel)
+
+
+# ---------------------------------------------------------------------------
+# metrics computed here (single-superposition GDT, contact-map overlap)
+# ---------------------------------------------------------------------------
 
 GDT_CUTOFFS = (1.0, 2.0, 4.0, 8.0)
+
 
 def compute_gdt_ts(dists: np.ndarray, n_total: Optional[int] = None,
                    cutoffs: Tuple[float, ...] = GDT_CUTOFFS) -> float:
     """GDT_TS of a single superposition.
 
     ``dists`` must be the distances of ALL matched residue pairs under the
-    final superposition (never an inlier subset — normalizing by survivors
-    of outlier rejection inflates the score). ``n_total`` is the number of
-    residues in the reference selection; CASP-style, residues that could not
-    be aligned count as failures at every cutoff. When ``n_total`` is None
-    the matched-pair count is used (coverage is then NOT penalized — label
-    such values accordingly).
+    final superposition (never an inlier subset — normalizing by survivors of
+    outlier rejection inflates the score). ``n_total`` is the number of
+    residues in the reference selection; CASP-style, residues that could not be
+    aligned count as failures at every cutoff. When ``n_total`` is None the
+    matched-pair count is used (coverage is then NOT penalized — label such
+    values accordingly).
 
-    Note: CASP's GDT_TS additionally maximizes each cutoff's fraction over
-    many superpositions (LGA); this single-superposition value is a lower
-    bound on that.
+    Note: CASP's GDT_TS additionally maximizes each cutoff's fraction over many
+    superpositions (LGA); this single-superposition value is a lower bound.
     """
-    if len(dists) == 0: return 0.0
-    denom = int(n_total) if n_total else len(dists)
-    if denom <= 0: return 0.0
-    fractions = [np.sum(dists <= c) / denom for c in cutoffs]
+    dists = np.asarray(dists, dtype=float)
+    if dists.size == 0:
+        return 0.0
+    denom = int(n_total) if n_total else dists.size
+    if denom <= 0:
+        return 0.0
+    fractions = [np.count_nonzero(dists <= c) / denom for c in cutoffs]
     return float(np.mean(fractions)) * 100.0
 
-def compute_contact_overlap(ref_coords: np.ndarray, mob_coords: np.ndarray, contact_dist: float = 8.0) -> float:
-    """Jaccard index of the two C-alpha contact maps (contact_dist cutoff,
-    self and sequence-adjacent pairs excluded). Superposition-invariant.
 
-    This is a contact-map overlap metric, NOT the CAD-score of Olechnovic &
-    Venclovas (which is defined on Voronoi contact *areas* over heavy atoms).
+def compute_contact_overlap(ref_coords: np.ndarray, mob_coords: np.ndarray,
+                            contact_dist: float = 8.0, chunk: int = 1024) -> float:
+    """Jaccard index of the two CA contact maps (self and i,i+1 pairs excluded).
+
+    Superposition-invariant. Computed in row blocks so a large complex does not
+    allocate several N x N matrices (at N = 6000 the unchunked version peaked
+    near 900 MB).
+
+    This is a contact-map overlap, NOT the CAD-score of Olechnovic & Venclovas,
+    which is defined on Voronoi contact *areas* over heavy atoms.
     """
-    if len(ref_coords) == 0: return 0.0
-    d_ref = _pairwise_dists(ref_coords)
-    d_mob = _pairwise_dists(mob_coords)
-    # Mask out self-contacts and adjacent residues
-    N = len(ref_coords)
-    mask = np.ones((N, N), dtype=bool)
-    np.fill_diagonal(mask, False)
-    for i in range(N-1):
-        mask[i, i+1] = False
-        mask[i+1, i] = False
-
-    c_ref = (d_ref <= contact_dist) & mask
-    c_mob = (d_mob <= contact_dist) & mask
-
-    # Jaccard index of contacts
-    intersection = np.sum(c_ref & c_mob)
-    union = np.sum(c_ref | c_mob)
+    P = np.asarray(ref_coords, dtype=float)
+    Q = np.asarray(mob_coords, dtype=float)
+    n = len(P)
+    if n == 0 or len(Q) != n:
+        return 0.0
+    cut2 = contact_dist * contact_dist
+    intersection = 0
+    union = 0
+    idx = np.arange(n)
+    for s in range(0, n, chunk):
+        e = min(n, s + chunk)
+        rows = idx[s:e, None]
+        d2_ref = np.sum((P[s:e, None, :] - P[None, :, :]) ** 2, axis=-1)
+        d2_mob = np.sum((Q[s:e, None, :] - Q[None, :, :]) ** 2, axis=-1)
+        valid = np.abs(rows - idx[None, :]) > 1
+        c_ref = (d2_ref <= cut2) & valid
+        c_mob = (d2_mob <= cut2) & valid
+        intersection += int(np.count_nonzero(c_ref & c_mob))
+        union += int(np.count_nonzero(c_ref | c_mob))
     return float(intersection / union) if union > 0 else 0.0
 
-def compute_cad_score_approx(ref_coords: np.ndarray, mob_coords: np.ndarray, contact_dist: float = 8.0) -> float:
-    """Deprecated: this never computed CAD-score. Use compute_contact_overlap."""
-    import warnings as _warnings
-    _warnings.warn(
-        "compute_cad_score_approx is a contact-map Jaccard index, not CAD-score; "
-        "it has been renamed to compute_contact_overlap.",
-        DeprecationWarning, stacklevel=2)
-    return compute_contact_overlap(ref_coords, mob_coords, contact_dist)
 
-def _parse_path(path: str) -> gemmi.Structure:
-    return gemmi.read_structure(path)
+# ---------------------------------------------------------------------------
+# geometry
+# ---------------------------------------------------------------------------
 
-def _chain_ids(struct: gemmi.Structure) -> List[str]:
-    return [ch.name for ch in struct[0]]
-
-def _parse_chain_selector(selector: str) -> Tuple[str, Optional[int], Optional[int]]:
-    if ":" in selector:
-        parts = selector.split(":")
-        chain_id = parts[0]
-        range_str = parts[1]
-        if "-" in range_str:
-            bounds = range_str.split("-")
-            return chain_id, int(bounds[0]) if bounds[0] else None, int(bounds[1]) if bounds[1] else None
-        else:
-            return chain_id, int(range_str), int(range_str)
-    return selector, None, None
-
-def _resolve_selectors(struct:_Structure.Structure, sel: Optional[List[Union[str,int]]]) -> Optional[List[str]]:
-    if sel is None: return None
-    ids = _chain_ids(struct)
-    out=[]
-    for x in sel:
-        if isinstance(x,int):
-            if not (1<=x<=len(ids)): raise ValueError(f"Chain index {x} out of range 1..{len(ids)}")
-            out.append(ids[x-1])
-        else:
-            # x could be "A:10-150". Check if the pure chain is in ids.
-            cid, _, _ = _parse_chain_selector(x)
-            if cid not in ids: raise ValueError(f"Chain '{cid}' (from '{x}') not in {ids}")
-            out.append(x)
-    seen=set(); uniq=[c for c in out if not (c in seen or seen.add(c))]
-    return uniq
-
-def _extract_ca_infos(
-    struct: gemmi.Structure, chain_filter: Optional[List[str]], min_b_factor: float = 0.0, min_plddt: float = 0.0
-) -> List[ResidueInfo]:
-    model = struct[0]
-    infos = []
-    idx = 0
-
-    # Parse bounds
-    bounds_map = {}
-    valid_chain_ids = set()
-    if chain_filter is not None:
-        for c in chain_filter:
-            cid, start, end = _parse_chain_selector(c)
-            valid_chain_ids.add(cid)
-            if cid not in bounds_map:
-                bounds_map[cid] = []
-            if start is not None or end is not None:
-                bounds_map[cid].append((start, end))
-
-    for chain in model:
-        if chain_filter is not None and chain.name not in valid_chain_ids:
-            continue
-
-        c_bounds = bounds_map.get(chain.name, [])
-
-        for res in chain:
-            if res.name not in AA_DICT:
-                continue
-
-            resseq = res.seqid.num
-            icode = res.seqid.icode if hasattr(res.seqid, 'has_icode') and res.seqid.has_icode() else ""
-            if not icode and hasattr(res.seqid, 'icode') and res.seqid.icode != ' ':
-                icode = res.seqid.icode
-
-            # Sub-domain filtering
-            if c_bounds:
-                in_bounds = False
-                for start, end in c_bounds:
-                    if (start is None or resseq >= start) and (
-                        end is None or resseq <= end
-                    ):
-                        in_bounds = True
-                        break
-                if not in_bounds:
-                    continue
-
-            ca = None
-            for atom in res:
-                if atom.name == "CA":
-                    ca = atom
-                    break
-
-            if ca is None:
-                continue
-
-            # min_b_factor and min_plddt are both lower bounds on the B-factor
-            # column (AlphaFold stores pLDDT there), so the effective cutoff is
-            # simply the larger of the two.
-            min_biso = max(min_b_factor, min_plddt)
-            if min_biso > 0.0 and ca.b_iso < min_biso:
-                continue
-
-            coord = np.array(ca.pos.tolist(), dtype=float)
-            infos.append(
-                ResidueInfo(
-                    idx=idx,
-                    chain_id=chain.name,
-                    resseq=int(resseq),
-                    icode=icode.strip() if hasattr(icode, 'strip') else "",
-                    resname=res.name,
-                    coord=coord,
-                )
-            )
-            idx += 1
-
-    if not infos:
-        raise ValueError(f"No C-alpha atoms found for selected chains.")
-    return infos
 def _pairwise_dists(coords: np.ndarray) -> np.ndarray:
-    x=coords; x2=np.sum(x*x, axis=1, keepdims=True)
-    d2=x2+x2.T-2.0*np.dot(x,x.T); np.maximum(d2,0.0,out=d2)
+    x = np.asarray(coords, dtype=float)
+    x2 = np.sum(x * x, axis=1, keepdims=True)
+    d2 = x2 + x2.T - 2.0 * (x @ x.T)
+    np.maximum(d2, 0.0, out=d2)
     return np.sqrt(d2, out=d2)
+
+
+def _kabsch(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Least-squares superposition: returns (R, t, rmsd) with ``R @ Q + t ~ P``."""
+    P = np.asarray(P, dtype=float)
+    Q = np.asarray(Q, dtype=float)
+    if P.shape != Q.shape or P.ndim != 2 or P.shape[1] != 3:
+        raise ValueError("Kabsch expects matched (K, 3) coordinate arrays")
+    K = P.shape[0]
+    if K == 0:
+        raise ValueError("Kabsch needs at least one point")
+    if K < 3:
+        cP = P.mean(axis=0)
+        cQ = Q.mean(axis=0)
+        R = np.eye(3)
+        t = cP - cQ
+        rmsd = float(np.sqrt(np.mean(np.sum((P - (Q + t)) ** 2, axis=1))))
+        return R, t, rmsd
+    cP = P.mean(axis=0)
+    cQ = Q.mean(axis=0)
+    H = (Q - cQ).T @ (P - cP)
+    U, _S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1.0
+        R = Vt.T @ U.T
+    t = cP - R @ cQ
+    rmsd = float(np.sqrt(np.mean(np.sum((P - ((R @ Q.T).T + t)) ** 2, axis=1))))
+    return R, t, rmsd
+
+
+def _transform(coords: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    return (R @ np.asarray(coords, dtype=float).T).T + t
+
+
+def _iterative_kabsch(P: np.ndarray, Q: np.ndarray, recycles: int,
+                      keep_fraction: float):
+    """Kabsch with optional iterative outlier rejection.
+
+    Returns ``(R, t, rmsd, mask)`` where ``mask`` marks the pairs that survived.
+    """
+    R, t, rmsd = _kabsch(P, Q)
+    N = P.shape[0]
+    min_keep = max(3, int(round(N * keep_fraction)))
+    mask = np.ones(N, dtype=bool)
+
+    for _ in range(recycles):
+        d = np.linalg.norm(P - ((R @ Q.T).T + t), axis=1)
+        active_d = d[mask]
+        current = float(np.sqrt(np.mean(active_d ** 2))) if active_d.size else 0.0
+        cut = max(2.0, 1.5 * current)
+        new_mask = (d <= cut) & mask
+        if new_mask.sum() < min_keep:
+            active = np.where(mask)[0]
+            if len(active) <= min_keep:
+                new_mask = mask
+            else:
+                best = active[np.argsort(d[active])][:min_keep]
+                new_mask = np.zeros(N, dtype=bool)
+                new_mask[best] = True
+        if np.array_equal(mask, new_mask):
+            break
+        mask = new_mask
+        if mask.sum() < 3:
+            break
+        R, t, rmsd = _kabsch(P[mask], Q[mask])
+
+    return R, t, rmsd, mask
+
+
+# ---------------------------------------------------------------------------
+# hinge detection
+# ---------------------------------------------------------------------------
 
 @jit(nopython=True, cache=True)
 def _sliding_window_mean(arr: np.ndarray, window: int) -> np.ndarray:
-    """Compute per-element sliding-window mean. JIT-compiled for speed."""
+    """Per-element sliding-window mean (edge windows are truncated)."""
     N = len(arr)
     half = window // 2
     out = np.zeros(N)
@@ -344,28 +600,15 @@ def _sliding_window_mean(arr: np.ndarray, window: int) -> np.ndarray:
     return out
 
 
-def _detect_hinges(
-    per_residue_rmsd: np.ndarray,
-    window: int = 15,
-    threshold: float = 3.0,
-    min_segment: int = 30,
-) -> List[int]:
-    """
-    Return 0-based split indices for a per-residue RMSD array.
-
-    A "split at index s" means the first segment is [0..s-1] and the next
-    begins at [s..]. Consecutive above-threshold positions are merged into one
-    hinge; the split is placed at the midpoint of the hinge region.
-    Splits that would produce segments shorter than *min_segment* are dropped.
-    """
+def _detect_hinges_1d(per_residue_rmsd: np.ndarray, window: int, threshold: float,
+                      min_segment: int) -> List[int]:
     N = len(per_residue_rmsd)
     if N < 2 * min_segment:
         return []
-
-    smoothed = _sliding_window_mean(per_residue_rmsd.astype(float), window)
+    smoothed = _sliding_window_mean(np.ascontiguousarray(per_residue_rmsd,
+                                                         dtype=float), window)
     hinge_mask = smoothed > threshold
 
-    # Identify contiguous hinge regions, pick midpoint of each as the split
     splits: List[int] = []
     in_hinge = False
     hinge_start = 0
@@ -379,7 +622,6 @@ def _detect_hinges(
     if in_hinge:
         splits.append((hinge_start + N) // 2)
 
-    # Drop splits that leave segments shorter than min_segment
     filtered: List[int] = []
     prev = 0
     for s in splits:
@@ -388,353 +630,653 @@ def _detect_hinges(
             prev = s
     while filtered and (N - filtered[-1]) < min_segment:
         filtered.pop()
-
     return filtered
 
 
-def _kabsch(P:np.ndarray, Q:np.ndarray)->Tuple[np.ndarray,np.ndarray,float]:
-    if P.shape != Q.shape or P.shape[1]!=3: raise ValueError("Kabsch expects matched (K,3)")
-    K=P.shape[0]
-    if K<3:
-        cP=P.mean(axis=0); cQ=Q.mean(axis=0); R=np.eye(3); t=cP - cQ
-        rmsd=float(np.sqrt(np.mean(np.sum((P-(Q+t))**2, axis=1)))); return R,t,rmsd
-    cP=P.mean(axis=0); cQ=Q.mean(axis=0)
-    P0=P-cP; Q0=Q-cQ; H=Q0.T@P0
-    U,S,Vt=np.linalg.svd(H); R=Vt.T@U.T
-    if np.linalg.det(R)<0: Vt[-1,:]*=-1.0; R=Vt.T@U.T
-    t=cP - R@cQ
-    Q_aln=(R@Q.T).T + t
-    rmsd=float(np.sqrt(np.mean(np.sum((P-Q_aln)**2, axis=1))))
-    return R,t,rmsd
+def _detect_hinges(per_residue_rmsd: np.ndarray, window: int = 15,
+                   threshold: float = 3.0, min_segment: int = 30,
+                   chain_starts: Optional[Sequence[int]] = None) -> List[int]:
+    """0-based split indices for a per-residue RMSD array.
 
-def _iterative_kabsch(P: np.ndarray, Q: np.ndarray, recycles: int, keep_fraction: float) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
-    R, t, rmsd = _kabsch(P, Q)
-    N = P.shape[0]
-    min_keep = max(3, int(round(N * keep_fraction)))
-    mask = np.ones(N, dtype=bool)
+    A "split at index s" means the preceding segment is ``[..s-1]`` and a new
+    one begins at ``s``. Consecutive above-threshold positions merge into one
+    hinge whose midpoint becomes the split; splits that would leave a segment
+    shorter than *min_segment* are dropped.
 
-    for _ in range(recycles):
-        Q_aln = (R @ Q.T).T + t
-        d = np.linalg.norm(P - Q_aln, axis=1)
+    ``chain_starts`` lists the indices at which a new chain begins. Those
+    indices are always splits, and hinge detection runs inside each chain
+    independently — a chain boundary is not a hinge, and a "domain" that spans
+    one is not a rigid body. Without this, fitting such a pseudo-domain mixes
+    two independent rigid motions and reports a meaningless per-domain RMSD.
+    """
+    arr = np.asarray(per_residue_rmsd, dtype=float)
+    N = len(arr)
+    if N == 0:
+        return []
+    starts = sorted({0, *(int(s) for s in (chain_starts or []) if 0 < int(s) < N)})
+    boundaries = starts + [N]
+    splits: List[int] = [s for s in starts if s > 0]
+    for lo, hi in zip(boundaries[:-1], boundaries[1:]):
+        inner = _detect_hinges_1d(arr[lo:hi], window, threshold, min_segment)
+        splits.extend(lo + s for s in inner)
+    return sorted(set(splits))
 
-        # Only consider currently active pairs
-        active_d = d[mask]
-        current_rmsd = float(np.sqrt(np.mean(active_d**2))) if len(active_d) > 0 else 0.0
 
-        cut = max(2.0, 1.5 * current_rmsd)
-        
-        # Determine which pairs are good enough to keep
-        new_mask = (d <= cut) & mask
+# ---------------------------------------------------------------------------
+# sequence-free pairing kernels
+# ---------------------------------------------------------------------------
 
-        # If we dropped below min_keep, forcibly keep the best min_keep distances (respecting previous mask)
-        if new_mask.sum() < min_keep:
-            # Sort the distances of the *previously active* set
-            active_indices = np.where(mask)[0]
-            if len(active_indices) <= min_keep:
-                new_mask = mask # Can't drop anything
-            else:
-                sorted_by_dist = active_indices[np.argsort(d[active_indices])]
-                new_mask = np.zeros(N, dtype=bool)
-                new_mask[sorted_by_dist[:min_keep]] = True
+@jit(nopython=True, cache=True, parallel=True, fastmath=True)
+def _window_pairs_jit(A: np.ndarray, B: np.ndarray, aN: int, bN: int):
+    """Best diagonal offset of A inside B by L1 distance-matrix agreement.
 
-        if np.array_equal(mask, new_mask):
-            break
-
-        mask = new_mask
-        if mask.sum() < 3:
-            break
-        
-        R, t, rmsd = _kabsch(P[mask], Q[mask])
-
-    return R, t, rmsd, mask
-
-def _transform(coords:np.ndarray, R:np.ndarray, t:np.ndarray)->np.ndarray:
-    return (R@coords.T).T + t
-
-def _robust_inlier_mask(d:np.ndarray, hard_cut:float, q_keep:float)->np.ndarray:
-    if d.size==0: return np.zeros(0, dtype=bool)
-    qthr=float(np.quantile(d, q_keep)); return (d <= max(hard_cut, qthr))
-
-@jit(nopython=True)
-def _window_pairs_jit(A: np.ndarray, B: np.ndarray, aN: int, bN: int) -> Tuple[float, int, np.ndarray]:
-    best_score = -np.inf
-    best_offset = -1
-    scores = np.zeros(bN-aN+1)
-    for offset in range(bN-aN+1):
-        subB = B[offset:offset+aN, offset:offset+aN]
-        score = -np.sum(np.abs(A - subB))
-        scores[offset] = score
-        if score > best_score:
-            best_score = score
-            best_offset = offset
+    Explicit loops rather than ``np.sum(np.abs(A - B[o:o+aN, o:o+aN]))``: the
+    vectorised form allocated an aN x aN temporary per offset inside the JIT,
+    which dominated the runtime. Offsets are independent, so they run in
+    parallel.
+    """
+    n_off = bN - aN + 1
+    scores = np.zeros(n_off)
+    for offset in prange(n_off):
+        total = 0.0
+        for i in range(aN):
+            bi = offset + i
+            for j in range(aN):
+                total -= abs(A[i, j] - B[bi, offset + j])
+        scores[offset] = total
+    best_offset = 0
+    best_score = scores[0]
+    for o in range(1, n_off):
+        if scores[o] > best_score:
+            best_score = scores[o]
+            best_offset = o
     return best_score, best_offset, scores
 
-def _window_pairs(D1:np.ndarray, D2:np.ndarray)->Tuple[List[Tuple[int,int]], np.ndarray]:
-    n1,n2=D1.shape[0], D2.shape[0]
-    if n1==0 or n2==0: return [], np.array([])
-    swapped=False; A,B,aN,bN=D1,D2,n1,n2
-    if aN>bN: A,B,aN,bN=D2,D1,n2,n1; swapped=True
-    best_score, best_offset, scores = _window_pairs_jit(A, B, aN, bN)
-    if best_offset<0: return [], scores
-    if swapped: return [(best_offset+i, i) for i in range(aN)], scores
-    else: return [(i, best_offset+i) for i in range(aN)], scores
 
-def _radial_histograms(D:np.ndarray, nbins:int=24, rmax_mode:str="p98"):
-    N=D.shape[0]
-    if N==0: return np.zeros((0,nbins)), np.linspace(0,1,nbins+1)
-    vals=D[np.triu_indices(N,k=1)]
-    if vals.size==0: rmax=1.0
+def _window_pairs(D1: np.ndarray, D2: np.ndarray) -> Tuple[List[Tuple[int, int]], np.ndarray]:
+    n1, n2 = D1.shape[0], D2.shape[0]
+    if n1 == 0 or n2 == 0:
+        return [], np.array([])
+    swapped = False
+    A, B, aN, bN = D1, D2, n1, n2
+    if aN > bN:
+        A, B, aN, bN = D2, D1, n2, n1
+        swapped = True
+    _best_score, best_offset, scores = _window_pairs_jit(
+        np.ascontiguousarray(A), np.ascontiguousarray(B), aN, bN)
+    if best_offset < 0:
+        return [], scores
+    if swapped:
+        return [(best_offset + i, i) for i in range(aN)], scores
+    return [(i, best_offset + i) for i in range(aN)], scores
+
+
+def _radial_histograms(D: np.ndarray, nbins: int = 24, rmax_mode: str = "p98"):
+    """Row-wise normalised histograms of each residue's distances to all others.
+
+    Fully vectorised (one ``bincount`` over the digitised matrix) — the former
+    per-row ``np.histogram`` loop cost 0.15 s at N = 2000.
+    """
+    N = D.shape[0]
+    if N == 0:
+        return np.zeros((0, nbins)), np.linspace(0, 1, nbins + 1)
+    vals = D[np.triu_indices(N, k=1)]
+    if vals.size == 0:
+        rmax = 1.0
     else:
-        rmax=float(np.quantile(vals,0.98)) if rmax_mode!="max" else float(np.max(vals))
-        rmax=max(rmax,1.0)
-    edges=np.linspace(0.0,rmax,nbins+1)
-    H=np.zeros((N,nbins), dtype=np.float64)
-    for i in range(N):
-        row=D[i,:]; row=row[row>0.0]
-        hist,_=np.histogram(row, bins=edges); s=hist.sum()
-        H[i,:]=hist/s if s>0 else hist
-    return H,edges
+        rmax = float(np.max(vals)) if rmax_mode == "max" else float(np.quantile(vals, 0.98))
+        rmax = max(rmax, 1.0)
+    edges = np.linspace(0.0, rmax, nbins + 1)
+    # Digitise into [0, nbins-1]; distances beyond rmax fall in the last bin,
+    # matching np.histogram's closed right edge for the final bin only.
+    binned = np.clip(np.searchsorted(edges, D, side="right") - 1, 0, nbins - 1)
+    keep = D > 0.0
+    rows = np.repeat(np.arange(N), N).reshape(N, N)
+    flat = (rows[keep] * nbins + binned[keep]).ravel()
+    counts = np.bincount(flat, minlength=N * nbins).reshape(N, nbins).astype(float)
+    # Entries at exactly rmax are counted by np.histogram in the last bin and
+    # beyond-rmax entries are dropped; replicate by masking those explicitly.
+    beyond = (D > rmax) & keep
+    if beyond.any():
+        br = rows[beyond]
+        counts[:, nbins - 1] -= np.bincount(br, minlength=N).astype(float)
+    totals = counts.sum(axis=1, keepdims=True)
+    np.divide(counts, np.where(totals > 0, totals, 1.0), out=counts)
+    return counts, edges
 
-@jit(nopython=True)
+
+@jit(nopython=True, cache=True, parallel=True, fastmath=True)
 def _chi2_distance_jit(X: np.ndarray, Y: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     N = X.shape[0]
     M = Y.shape[0]
     K = X.shape[1]
     res = np.zeros((N, M))
-    for i in range(N):
+    for i in prange(N):
         for j in range(M):
             s = 0.0
             for k in range(K):
-                num = (X[i, k] - Y[j, k])**2
+                num = (X[i, k] - Y[j, k]) ** 2
                 den = X[i, k] + Y[j, k] + eps
                 s += num / den
             res[i, j] = 0.5 * s
     return res
 
-def _chi2_distance(X:np.ndarray, Y:np.ndarray, eps:float=1e-12)->np.ndarray:
-    return _chi2_distance_jit(X, Y, eps)
 
-@jit(nopython=True)
-def _banded_dp_maxscore_jit(S: np.ndarray, gap: float, band: int) -> Tuple[np.ndarray, float]:
+def _chi2_distance(X: np.ndarray, Y: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    return _chi2_distance_jit(np.ascontiguousarray(X, dtype=float),
+                              np.ascontiguousarray(Y, dtype=float), eps)
+
+
+@jit(nopython=True, cache=True)
+def _banded_dp_maxscore_jit(S: np.ndarray, gap: float, band: int):
+    """Needleman-Wunsch restricted to a diagonal band, banded storage.
+
+    Row ``i`` only stores columns ``[i-band, i+band]``, so memory is
+    O(N * band) instead of O(N * M) — the full matrix defeated the point of
+    banding (40 MB at 2000 x 2200).
+    """
     N, M = S.shape
+    width = 2 * band + 2
     neg = -1e18
-    dp = np.full((N+1, M+1), neg)
-    bt = np.zeros((N+1, M+1), dtype=np.int8)
-    dp[0, 0] = 0.0
-    for i in range(0, N+1):
-        jmin = max(0, i-band)
-        jmax = min(M, i+band)
-        if i > 0:
-            j0 = max(0, i-band)
-            if dp[i-1, j0] > neg:
-                val = dp[i-1, j0] - gap
-                if val > dp[i, j0]:
-                    dp[i, j0] = val
-                    bt[i, j0] = 2
-        for j in range(jmin, jmax+1):
-            if i == 0 and j == 0: continue
+    dp = np.full((N + 1, width), neg)
+    bt = np.zeros((N + 1, width), dtype=np.int8)
+
+    def_off = band  # column j of row i lives at j - i + band
+
+    dp[0, def_off] = 0.0
+    for j in range(1, min(M, band) + 1):
+        k = j - 0 + def_off
+        if 0 <= k < width:
+            dp[0, k] = dp[0, k - 1] - gap
+            bt[0, k] = 3
+
+    for i in range(1, N + 1):
+        jmin = max(0, i - band)
+        jmax = min(M, i + band)
+        for j in range(jmin, jmax + 1):
+            k = j - i + def_off
             best = neg
             move = 0
-            if i > 0 and j > 0:
-                cand = dp[i-1, j-1] + S[i-1, j-1]
-                if cand > best:
-                    best = cand
-                    move = 1
-            if i > 0:
-                cand = dp[i-1, j] - gap
+            if j > 0:
+                kd = (j - 1) - (i - 1) + def_off
+                if 0 <= kd < width and dp[i - 1, kd] > neg:
+                    cand = dp[i - 1, kd] + S[i - 1, j - 1]
+                    if cand > best:
+                        best = cand
+                        move = 1
+            ku = j - (i - 1) + def_off
+            if 0 <= ku < width and dp[i - 1, ku] > neg:
+                cand = dp[i - 1, ku] - gap
                 if cand > best:
                     best = cand
                     move = 2
             if j > 0:
-                cand = dp[i, j-1] - gap
-                if cand > best:
-                    best = cand
-                    move = 3
-            dp[i, j] = best
-            bt[i, j] = move
-    return bt, dp[N, M]
+                kl = k - 1
+                if 0 <= kl < width and dp[i, kl] > neg:
+                    cand = dp[i, kl] - gap
+                    if cand > best:
+                        best = cand
+                        move = 3
+            dp[i, k] = best
+            bt[i, k] = move
 
-def _banded_dp_maxscore(S:np.ndarray, gap:float, band:int):
-    N,M=S.shape
-    if N==0 or M==0: return [], 0.0
-    bt, max_score = _banded_dp_maxscore_jit(S, gap, band)
-    i,j=N,M; pairs=[]
-    while i>0 or j>0:
-        move=bt[i,j]
-        if move==1: pairs.append((i-1,j-1)); i-=1; j-=1
-        elif move==2: i-=1
-        elif move==3: j-=1
-        else: break
+    kN = M - N + def_off
+    final = dp[N, kN] if 0 <= kN < width else neg
+    return bt, final, def_off
+
+
+def _banded_dp_maxscore(S: np.ndarray, gap: float, band: int):
+    N, M = S.shape
+    if N == 0 or M == 0:
+        return [], 0.0
+    band = int(max(band, abs(N - M) + 1))
+    bt, max_score, off = _banded_dp_maxscore_jit(
+        np.ascontiguousarray(S, dtype=float), float(gap), band)
+    width = bt.shape[1]
+    i, j = N, M
+    pairs: List[Tuple[int, int]] = []
+    while i > 0 or j > 0:
+        k = j - i + off
+        if not (0 <= k < width):
+            break
+        move = bt[i, k]
+        if move == 1:
+            pairs.append((i - 1, j - 1))
+            i -= 1
+            j -= 1
+        elif move == 2:
+            i -= 1
+        elif move == 3:
+            j -= 1
+        else:
+            break
     pairs.reverse()
     return pairs, float(max_score)
 
-def _shape_pairs(coords1:np.ndarray, coords2:np.ndarray, nbins:int=24, gap_penalty:float=2.0, band_frac:float=0.20)->Tuple[List[Tuple[int,int]], np.ndarray, np.ndarray]:
-    D1=_pairwise_dists(coords1); D2=_pairwise_dists(coords2)
-    H1,_=_radial_histograms(D1, nbins=nbins, rmax_mode="p98")
-    H2,_=_radial_histograms(D2, nbins=nbins, rmax_mode="p98")
-    C=_chi2_distance(H1,H2); S=-C
-    N,M=S.shape; band=max(3, int(band_frac*max(N,M)))
-    pairs,_=_banded_dp_maxscore(S, gap=gap_penalty, band=band)
-    return pairs, S, C
 
-class _AllAtomsSelect(Select):
-    def __init__(self, R:np.ndarray, t:np.ndarray, keep_heteroatoms:bool=True):
-        super().__init__(); self.R=R; self.t=t; self.keep_heteroatoms=keep_heteroatoms
-    def accept_residue(self, residue)->bool:
-        if not self.keep_heteroatoms and residue.id[0] != ' ':
-            return False
-        return True
-    def accept_atom(self, atom:Atom.Atom)->bool:
-        coord=atom.get_coord().astype(float); atom.set_coord((self.R@coord)+self.t); return True
+def _shape_pairs(coords1: np.ndarray, coords2: np.ndarray, nbins: int = 24,
+                 gap_penalty: float = 2.0, band_frac: float = 0.20):
+    D1 = _pairwise_dists(coords1)
+    D2 = _pairwise_dists(coords2)
+    H1, _ = _radial_histograms(D1, nbins=nbins, rmax_mode="p98")
+    H2, _ = _radial_histograms(D2, nbins=nbins, rmax_mode="p98")
+    S = -_chi2_distance(H1, H2)
+    N, M = S.shape
+    band = max(3, int(band_frac * max(N, M)))
+    pairs, _ = _banded_dp_maxscore(S, gap=gap_penalty, band=band)
+    return pairs, S, -S
+
+
+# ---------------------------------------------------------------------------
+# sequence alignment and index-based pairing
+# ---------------------------------------------------------------------------
+
+class PairwiseAlignment:
+    """Two gapped strings plus the raw score (the only thing callers need)."""
+
+    __slots__ = ("seqA", "seqB", "score")
+
+    def __init__(self, seqA: str, seqB: str, score: float):
+        self.seqA = seqA
+        self.seqB = seqB
+        self.score = score
+
+    @property
+    def n_identical(self) -> int:
+        return sum(1 for a, b in zip(self.seqA, self.seqB) if a == b and a != "-")
+
+    @property
+    def n_aligned(self) -> int:
+        return sum(1 for a, b in zip(self.seqA, self.seqB) if a != "-" and b != "-")
+
+    def identity(self, normalize: str = "aligned") -> float:
+        """Percent identity. ``normalize``: 'aligned' (over aligned columns),
+        'shorter' (over the shorter sequence) or 'alignment' (over all columns,
+        terminal gaps included)."""
+        n_id = self.n_identical
+        if normalize == "alignment":
+            denom = len(self.seqA)
+        elif normalize == "shorter":
+            la = sum(1 for c in self.seqA if c != "-")
+            lb = sum(1 for c in self.seqB if c != "-")
+            denom = min(la, lb)
+        else:
+            denom = self.n_aligned
+        return 100.0 * n_id / denom if denom else 0.0
+
+
+def _build_aligner(gap_open: float, gap_extend: float, mode: str = "global",
+                   free_end_gaps: bool = True):
+    from Bio.Align import PairwiseAligner
+    aligner = PairwiseAligner()
+    aligner.substitution_matrix = blosum62()
+    aligner.open_gap_score = gap_open
+    aligner.extend_gap_score = gap_extend
+    aligner.mode = mode
+    if free_end_gaps and mode == "global":
+        # Semi-global: a domain or a truncated construct should align inside a
+        # longer chain without paying for the overhang.
+        aligner.target_end_gap_score = 0.0
+        aligner.query_end_gap_score = 0.0
+    return aligner
+
+
+def perform_sequence_alignment(seq1: str, seq2: str, gap_open: float = -10.0,
+                               gap_extend: float = -0.5,
+                               free_end_gaps: bool = True) -> Optional[PairwiseAlignment]:
+    """Semi-global BLOSUM62 alignment of two sequences.
+
+    Returns ``None`` only when an input is empty; a genuine alignment failure
+    raises, because silently returning ``None`` sends callers down a fallback
+    path with no explanation.
+    """
+    if not seq1 or not seq2:
+        return None
+    aligner = _build_aligner(gap_open, gap_extend, free_end_gaps=free_end_gaps)
+    alignments = aligner.align(seq1, seq2)
+    if not alignments:
+        return None
+    best = alignments[0]
+    ia, ib = best.indices
+    out_a: List[str] = []
+    out_b: List[str] = []
+    for k in range(len(ia)):
+        out_a.append(seq1[ia[k]] if ia[k] != -1 else "-")
+        out_b.append(seq2[ib[k]] if ib[k] != -1 else "-")
+    return PairwiseAlignment("".join(out_a), "".join(out_b), float(best.score))
+
+
+def pairs_from_alignment(alignment: Optional[PairwiseAlignment]) -> List[Tuple[int, int]]:
+    """Index pairs ``(i, j)`` into the two *selections* the alignment came from.
+
+    Pairing is positional: the k-th non-gap character of ``seqA`` is residue k
+    of the reference selection. No residue-name matching, no resynchronisation
+    — the selection guarantees the correspondence.
+    """
+    if alignment is None:
+        return []
+    pairs: List[Tuple[int, int]] = []
+    i = j = 0
+    for a, b in zip(alignment.seqA, alignment.seqB):
+        if a != "-" and b != "-":
+            pairs.append((i, j))
+        if a != "-":
+            i += 1
+        if b != "-":
+            j += 1
+    return pairs
+
+
+BACKBONE_ATOM_NAMES = ("N", "CA", "C", "O")
+
+
+class AtomRef:
+    """A matched atom, carrying enough identity to label and group it.
+
+    ``res_index`` is the position of the residue inside its Selection, which is
+    what lets per-atom superposition results collapse back to per-residue
+    reporting without guessing.
+    """
+
+    __slots__ = ("coord", "name", "chain_name", "res_seq", "res_icode",
+                 "resname", "res_index")
+
+    def __init__(self, coord, name, chain_name, res_seq, res_icode, resname,
+                 res_index):
+        self.coord = coord
+        self.name = name
+        self.chain_name = chain_name
+        self.res_seq = res_seq
+        self.res_icode = res_icode
+        self.resname = resname
+        self.res_index = res_index
+
+    def get_coord(self):
+        return self.coord
+
+    def get_name(self):
+        return self.name
+
+    @property
+    def label(self) -> str:
+        ic = str(self.res_icode).strip()
+        return f"{self.chain_name}:{self.res_seq}{ic}" if ic else \
+            f"{self.chain_name}:{self.res_seq}"
+
+    @property
+    def residue_key(self):
+        return (self.chain_name, self.res_seq, str(self.res_icode).strip())
+
+
+def _atom_names_for(mode: str, like: bool) -> Optional[Tuple[str, ...]]:
+    """Atom names to pair, given the requested mode and whether the two
+    residues are of the same type.
+
+    Side chains of different residue types share atom names without sharing
+    chemistry (an ALA CB and a TRP CB point into different environments), so
+    unlike pairs contribute backbone only. The sequence-free path already did
+    this; the sequence-guided path did not, which made ``atoms="all_heavy"``
+    quietly fit chemically unrelated atoms onto each other.
+    """
+    if mode == "CA":
+        return ("CA",)
+    if mode == "backbone":
+        return BACKBONE_ATOM_NAMES
+    if mode == "all_heavy":
+        return None if like else BACKBONE_ATOM_NAMES
+    raise ValueError(f"atoms must be 'CA', 'backbone' or 'all_heavy', got {mode!r}")
+
+
+def paired_atoms(ref_sel: Selection, mob_sel: Selection,
+                 pairs: Sequence[Tuple[int, int]], atoms: str = "CA"):
+    """Matched atom lists for residue index pairs, honouring the atom mode."""
+    ref_out: List[AtomRef] = []
+    mob_out: List[AtomRef] = []
+    for i, j in pairs:
+        r = ref_sel.residues[i]
+        m = mob_sel.residues[j]
+        names = _atom_names_for(atoms, r.name == m.name)
+        candidates = names if names is not None else tuple(r.atoms.keys())
+        for name in candidates:
+            rc = r.atoms.get(name)
+            mc = m.atoms.get(name)
+            if rc is None or mc is None:
+                continue
+            ref_out.append(AtomRef(rc, name, r.chain_id, r.seqid, r.icode, r.name, i))
+            mob_out.append(AtomRef(mc, name, m.chain_id, m.seqid, m.icode, m.name, j))
+    return ref_out, mob_out
+
+
+def superimpose_atoms(ref_atoms: Sequence[AtomRef], mob_atoms: Sequence[AtomRef],
+                      recycles: int = 0, keep_fraction: float = 1.0,
+                      n_total: Optional[int] = None) -> Optional[dict]:
+    """Superpose matched atoms and report at residue level.
+
+    The returned ``per_residue_rmsd`` has one entry per *residue* (the RMS over
+    that residue's matched atoms), so ``atoms="backbone"``/``"all_heavy"`` no
+    longer inflate residue counts, coverage or the per-residue plot.
+
+    ``n_total`` is the reference selection's residue count, used to normalize
+    GDT_TS with CASP semantics (unaligned residues fail every cutoff).
+    """
+    if not ref_atoms or not mob_atoms or len(ref_atoms) != len(mob_atoms):
+        return None
+    ref_coords = np.array([a.coord for a in ref_atoms], dtype=float)
+    mob_coords = np.array([a.coord for a in mob_atoms], dtype=float)
+
+    R, t, rmsd, mask = _iterative_kabsch(ref_coords, mob_coords, recycles, keep_fraction)
+    mob_aligned = _transform(mob_coords, R, t)
+    sq = np.sum((ref_coords - mob_aligned) ** 2, axis=1)
+
+    # Collapse atom-level deviations onto residues, preserving first-seen order.
+    # Grouped on the residue *key* (chain, number, insertion code), not on the
+    # index inside a Selection: the multi-chain path builds one selection per
+    # chain, so indices restart at 0 for every chain and collapsing on them
+    # merged chain A's residue 0 with chain B's (574 residues became 146).
+    res_order: List[tuple] = []
+    seen: Dict[tuple, int] = {}
+    for a in ref_atoms:
+        key = a.residue_key
+        if key not in seen:
+            seen[key] = len(res_order)
+            res_order.append(key)
+    n_res = len(res_order)
+    sums = np.zeros(n_res)
+    counts = np.zeros(n_res)
+    ca_ref = np.full((n_res, 3), np.nan)
+    ca_mob = np.full((n_res, 3), np.nan)
+    labels: List[str] = [""] * n_res
+    chains: List[str] = [""] * n_res
+    keys: List[tuple] = [()] * n_res
+    mob_labels: List[str] = [""] * n_res
+    mob_chains: List[str] = [""] * n_res
+    mob_keys: List[tuple] = [()] * n_res
+    for k, a in enumerate(ref_atoms):
+        slot = seen[a.residue_key]
+        sums[slot] += sq[k]
+        counts[slot] += 1
+        if not labels[slot]:
+            labels[slot] = a.label
+            chains[slot] = a.chain_name
+            keys[slot] = a.residue_key
+            b = mob_atoms[k]
+            mob_labels[slot] = b.label
+            mob_chains[slot] = b.chain_name
+            mob_keys[slot] = b.residue_key
+        if a.name == "CA":
+            ca_ref[slot] = ref_coords[k]
+            ca_mob[slot] = mob_aligned[k]
+    per_residue = np.sqrt(sums / np.maximum(counts, 1.0))
+
+    has_ca = ~np.isnan(ca_ref[:, 0])
+    if has_ca.any():
+        ca_dists = np.linalg.norm(ca_ref[has_ca] - ca_mob[has_ca], axis=1)
+    else:
+        ca_dists = per_residue
+    gdt_ts = compute_gdt_ts(ca_dists, n_total=n_total)
+
+    active_ref = [a for k, a in enumerate(ref_atoms) if mask[k]]
+    active_mob = [a for k, a in enumerate(mob_atoms) if mask[k]]
+
+    return dict(rmsd=float(rmsd), rotation=R, translation=t,
+                ref_coords=ref_coords, mob_coords_transformed=mob_aligned,
+                per_residue_rmsd=per_residue, residue_labels=labels,
+                residue_chains=chains, residue_keys=keys,
+                residue_order=res_order,
+                mob_residue_labels=mob_labels, mob_residue_chains=mob_chains,
+                mob_residue_keys=mob_keys,
+                ca_ref=ca_ref[has_ca], ca_mob=ca_mob[has_ca],
+                n_residues=n_res,
+                active_ref_atoms=active_ref, active_mob_atoms=active_mob,
+                mask=mask, gdt_ts=gdt_ts)
+
+
+# ---------------------------------------------------------------------------
+# sequence-free alignment
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AlignSummary:
+    method: str
+    rmsd: float
+    inliers: int
+    total_pairs: int
+    iterations: int
+
+
+@dataclass
+class AlignmentResultSF:
+    rotation: np.ndarray
+    translation: np.ndarray
+    rmsd: float
+    iterations: int
+    kept_pairs: int
+    method: str
+    pairs: List[Tuple[int, int]]
+    ref_subset_infos: List[ResidueInfo]
+    mob_subset_infos: List[ResidueInfo]
+    ref_subset_ca_coords: np.ndarray
+    mob_subset_ca_coords_aligned: np.ndarray
+    summaries: Dict[str, AlignSummary]
+    shift_matrix: Optional[np.ndarray] = None
+    shift_scores: Optional[np.ndarray] = None
+    active_mask: Optional[np.ndarray] = None
+    gdt_ts: Optional[float] = None
+    ref_selection: Optional[Selection] = None
+    mob_selection: Optional[Selection] = None
+
 
 def sequence_independent_alignment_joined_v2(
-    file_ref: str, file_mob: str,
-    chains_ref: Optional[List[Union[str,int]]]=None,
-    chains_mob: Optional[List[Union[str,int]]]=None,
-    method:str="auto",
-    shape_nbins:int=24, shape_gap_penalty:float=2.0, shape_band_frac:float=0.20,
-    inlier_rmsd_cut:float=3.0, inlier_quantile:float=0.85, 
+    file_ref: Union[str, gemmi.Structure],
+    file_mob: Union[str, gemmi.Structure],
+    chains_ref: Optional[Sequence[Union[str, int]]] = None,
+    chains_mob: Optional[Sequence[Union[str, int]]] = None,
+    method: str = "auto",
+    shape_nbins: int = 24, shape_gap_penalty: float = 2.0,
+    shape_band_frac: float = 0.20,
     recycles: int = 0, keep_fraction: float = 1.0,
-    atoms: str = "CA", min_b_factor: float = 0.0, min_plddt: float = 0.0
-)->AlignmentResultSF:
-    logger.info(f"Running sequence_independent_alignment_joined_v2: ref={file_ref}, mob={file_mob}, method={method}")
-    ref_struct=_parse_path(file_ref); mob_struct=_parse_path(file_mob)
-    ref_ids=_resolve_selectors(ref_struct, chains_ref)
-    mob_ids=_resolve_selectors(mob_struct, chains_mob)
-    if (ref_ids is None) or (mob_ids is None):
-        raise ValueError("Specify chains_ref and chains_mob for sequence-independent alignment.")
+    atoms: str = "CA", min_b_factor: float = 0.0, min_plddt: float = 0.0,
+    ref_selection: Optional[Selection] = None,
+    mob_selection: Optional[Selection] = None,
+) -> AlignmentResultSF:
+    """Superpose two structures without using their sequences.
 
-    # We must ALWAYS run the structure DP matrix on C-alphas to keep size (N) = number of residues.
-    ref_infos=_extract_ca_infos(ref_struct, ref_ids, min_b_factor, min_plddt)
-    mob_infos=_extract_ca_infos(mob_struct, mob_ids, min_b_factor, min_plddt)
-    ref_subset=np.vstack([ri.coord for ri in ref_infos])
-    mob_subset=np.vstack([mi.coord for mi in mob_infos])
-    D1=_pairwise_dists(ref_subset); D2=_pairwise_dists(mob_subset)
+    Accepts parsed structures (or pre-built selections) as well as paths, so
+    callers that already hold a structure do not pay for a second parse — the
+    old path-only signature re-read both files from disk on every call, which
+    re-parsed the reference once per model of an ensemble.
+    """
+    if ref_selection is None:
+        ref_struct = _as_structure(file_ref)
+        ref_selection = select_residues(
+            ref_struct, chains_ref, min_b_factor=min_b_factor,
+            min_plddt=min_plddt, source=_name_of(file_ref))
+    if mob_selection is None:
+        mob_struct = _as_structure(file_mob)
+        mob_selection = select_residues(
+            mob_struct, chains_mob, min_b_factor=min_b_factor,
+            min_plddt=min_plddt, source=_name_of(file_mob))
 
-    summaries={}; candidates={}
+    n_ref, n_mob = ref_selection.n_residues, mob_selection.n_residues
+    if max(n_ref, n_mob) > MAX_SEQFREE_RESIDUES:
+        raise ValueError(
+            f"Sequence-free alignment needs O(N^2) distance matrices and this "
+            f"selection has {max(n_ref, n_mob)} residues (limit "
+            f"{MAX_SEQFREE_RESIDUES}). Use mode='seq_guided', or restrict the "
+            f"selection with chain/residue-range selectors.")
+
+    ref_infos = selection_to_infos(ref_selection)
+    mob_infos = selection_to_infos(mob_selection)
+    ref_subset = ref_selection.ca_coords
+    mob_subset = mob_selection.ca_coords
+
+    summaries: Dict[str, AlignSummary] = {}
+    candidates: Dict[str, dict] = {}
     shift_matrix = None
     shift_scores = None
 
-    # shape
-    if method in ("shape","auto"):
-        pairs_s, S, C = _shape_pairs(ref_subset, mob_subset, nbins=shape_nbins, gap_penalty=shape_gap_penalty, band_frac=shape_band_frac)
+    if method in ("shape", "auto"):
+        pairs_s, S, _C = _shape_pairs(ref_subset, mob_subset, nbins=shape_nbins,
+                                      gap_penalty=shape_gap_penalty,
+                                      band_frac=shape_band_frac)
         shift_matrix = S
-        R_s,t_s,rmsd_s = np.eye(3), np.zeros(3), float("inf")
+        R_s, t_s, rmsd_s = np.eye(3), np.zeros(3), float("inf")
         mask_s = np.ones(len(pairs_s), dtype=bool)
-        if len(pairs_s)>=3:
-            P=np.vstack([ref_subset[i] for (i,j) in pairs_s]); Q=np.vstack([mob_subset[j] for (i,j) in pairs_s])
+        if len(pairs_s) >= 3:
+            P = ref_subset[[i for i, _ in pairs_s]]
+            Q = mob_subset[[j for _, j in pairs_s]]
             R_s, t_s, rmsd_s, mask_s = _iterative_kabsch(P, Q, recycles, keep_fraction)
-        active_len_s = int(np.sum(mask_s))
-        summaries["shape"]=AlignSummary("shape", float(rmsd_s), active_len_s, len(pairs_s), 1+recycles)
-        candidates["shape"]=dict(pairs=pairs_s, rmsd=rmsd_s, R=R_s, t=t_s, mask=mask_s)
+        summaries["shape"] = AlignSummary("shape", float(rmsd_s), int(np.sum(mask_s)),
+                                          len(pairs_s), 1 + recycles)
+        candidates["shape"] = dict(pairs=pairs_s, rmsd=rmsd_s, R=R_s, t=t_s, mask=mask_s)
 
-    # window
-    if method in ("window","auto"):
-        pairs_w, scores = _window_pairs(D1,D2)
+    if method in ("window", "auto"):
+        pairs_w, scores = _window_pairs(_pairwise_dists(ref_subset),
+                                        _pairwise_dists(mob_subset))
         shift_scores = scores
-        R_w,t_w,rmsd_w = np.eye(3), np.zeros(3), float("inf")
+        R_w, t_w, rmsd_w = np.eye(3), np.zeros(3), float("inf")
         mask_w = np.ones(len(pairs_w), dtype=bool)
-        if len(pairs_w)>=3:
-            P=np.vstack([ref_subset[i] for (i,j) in pairs_w]); Q=np.vstack([mob_subset[j] for (i,j) in pairs_w])
+        if len(pairs_w) >= 3:
+            P = ref_subset[[i for i, _ in pairs_w]]
+            Q = mob_subset[[j for _, j in pairs_w]]
             R_w, t_w, rmsd_w, mask_w = _iterative_kabsch(P, Q, recycles, keep_fraction)
-        active_len_w = int(np.sum(mask_w))
-        summaries["window"]=AlignSummary("window", float(rmsd_w), active_len_w, len(pairs_w), 1+recycles)
-        candidates["window"]=dict(pairs=pairs_w, rmsd=rmsd_w, R=R_w, t=t_w, mask=mask_w)
+        summaries["window"] = AlignSummary("window", float(rmsd_w), int(np.sum(mask_w)),
+                                           len(pairs_w), 1 + recycles)
+        candidates["window"] = dict(pairs=pairs_w, rmsd=rmsd_w, R=R_w, t=t_w, mask=mask_w)
 
-    # choose by coverage-weighted score (same philosophy as pick_best_overall):
-    # a strategy matching a few residues at low RMSD must not beat one that
-    # superimposes many residues well.
-    if method=="shape": chosen="shape"
-    elif method=="window": chosen="window"
+    if not candidates:
+        raise ValueError(f"Unknown sequence-free method {method!r}")
+    if method in ("shape", "window"):
+        chosen = method
     else:
-        chosen=_select_seqfree_method({k: summaries[k] for k in candidates})
+        chosen = _select_seqfree_method({k: summaries[k] for k in candidates})
 
-    R=candidates[chosen]["R"]; t=candidates[chosen]["t"]
-    final_pairs=candidates[chosen]["pairs"]; final_rmsd=float(candidates[chosen]["rmsd"])
+    R = candidates[chosen]["R"]
+    t = candidates[chosen]["t"]
+    final_pairs = candidates[chosen]["pairs"]
+    final_rmsd = float(candidates[chosen]["rmsd"])
     final_mask = candidates[chosen]["mask"]
 
-    # If the user requested backbone or all_heavy, we recalculate the final Kabsch superposition on the extended atoms
-    if atoms != "CA":
-        # We only use active pairs to compute the Kabsch alignment if extended atoms are requested
-        seqfree_res_pairs = [(ref_infos[i], mob_infos[j]) for idx, (i, j) in enumerate(final_pairs) if final_mask[idx]]
+    # Refit on the requested atom set using the inlier residue pairs.
+    if atoms != "CA" and len(final_pairs):
+        inlier_pairs = [p for k, p in enumerate(final_pairs) if final_mask[k]]
+        ref_atoms_l, mob_atoms_l = paired_atoms(ref_selection, mob_selection,
+                                                inlier_pairs, atoms=atoms)
+        if len(ref_atoms_l) >= 3:
+            R, t, final_rmsd = _kabsch(
+                np.array([a.coord for a in ref_atoms_l]),
+                np.array([a.coord for a in mob_atoms_l]))
 
-        if atoms == "backbone":
-            target_atoms = {"N", "CA", "C", "O"}
-        else:
-            target_atoms = None # All non-hydrogen
-
-        final_ref_atoms = []
-        final_mob_atoms = []
-
-        ref_model = ref_struct[0]
-        mob_model = mob_struct[0]
-
-        for (ri, mi) in seqfree_res_pairs:
-            r_res = None
-            m_res = None
-
-            # Find matching residue in reference
-            try:
-                r_chain = ref_model[ri.chain_id]
-                for res in r_chain:
-                    if res.seqid.num == ri.resseq and (res.seqid.icode == ri.icode or (not res.seqid.icode and not ri.icode)):
-                        r_res = res
-                        break
-            except Exception:
-                pass
-
-            # Find matching residue in mobile
-            try:
-                m_chain = mob_model[mi.chain_id]
-                for res in m_chain:
-                    if res.seqid.num == mi.resseq and (res.seqid.icode == mi.icode or (not res.seqid.icode and not mi.icode)):
-                        m_res = res
-                        break
-            except Exception:
-                pass
-
-            if not r_res or not m_res:
-                continue
-
-            # Sequence-free pairing can match residues of different types;
-            # pairing side-chain atoms by name across unlike residues (e.g.
-            # an ALA CB against an ARG CB pointing elsewhere entirely) is
-            # chemically meaningless, so unlike pairs contribute backbone only.
-            pair_targets = target_atoms
-            if r_res.name != m_res.name and target_atoms is None:
-                pair_targets = {"N", "CA", "C", "O"}
-
-            for atA in r_res:
-                if atA.element.name == "H": continue
-                if pair_targets is not None and atA.name not in pair_targets: continue
-                for atB in m_res:
-                    if atB.name == atA.name:
-                        final_ref_atoms.append(np.array(atA.pos.tolist(), dtype=float))
-                        final_mob_atoms.append(np.array(atB.pos.tolist(), dtype=float))
-                        break
-
-        if final_ref_atoms and final_mob_atoms and len(final_ref_atoms) == len(final_mob_atoms):
-            ref_c = np.vstack(final_ref_atoms)
-            mob_c = np.vstack(final_mob_atoms)
-            R, t, final_rmsd = _kabsch(ref_c, mob_c)
-
-    mob_all_infos=_extract_ca_infos(mob_struct, chain_filter=None, min_b_factor=min_b_factor, min_plddt=min_plddt)
-    mob_all_ca=np.vstack([mi.coord for mi in mob_all_infos]); mob_all_ca_aligned=_transform(mob_all_ca, R, t)
-    
     mob_subset_aligned = _transform(mob_subset, R, t)
-    # GDT_TS over ALL matched pairs (never the inlier subset), normalized by
-    # the reference selection's residue count so unaligned residues count as
-    # failures (CASP semantics). Contact overlap over the matched region.
-    all_ref_idx = [i for (i, j) in final_pairs]
-    all_mob_idx = [j for (i, j) in final_pairs]
+    gdt_ts = 0.0
+    if final_pairs:
+        dists = np.linalg.norm(
+            ref_subset[[i for i, _ in final_pairs]]
+            - mob_subset_aligned[[j for _, j in final_pairs]], axis=1)
+        gdt_ts = compute_gdt_ts(dists, n_total=n_ref)
 
-    gdt_ts, contact_overlap = 0.0, 0.0
-    if len(all_ref_idx) > 0:
-        dists = np.linalg.norm(ref_subset[all_ref_idx] - mob_subset_aligned[all_mob_idx], axis=1)
-        gdt_ts = compute_gdt_ts(dists, n_total=len(ref_infos))
-        contact_overlap = compute_contact_overlap(ref_subset[all_ref_idx], mob_subset_aligned[all_mob_idx])
-
-    logger.info(f"Seq-free alignment ({chosen}) finished. RMSD = {final_rmsd:.3f}, GDT_TS = {gdt_ts:.2f}")
+    logger.info("Seq-free alignment (%s): RMSD = %.3f, GDT_TS = %.2f",
+                chosen, final_rmsd, gdt_ts)
 
     return AlignmentResultSF(
         rotation=R, translation=t, rmsd=final_rmsd, iterations=1,
@@ -742,332 +1284,100 @@ def sequence_independent_alignment_joined_v2(
         ref_subset_infos=ref_infos, mob_subset_infos=mob_infos,
         ref_subset_ca_coords=ref_subset,
         mob_subset_ca_coords_aligned=mob_subset_aligned,
-        mob_all_infos=mob_all_infos, mob_all_ca_coords_aligned=mob_all_ca_aligned,
         summaries=summaries,
         shift_matrix=shift_matrix if chosen == "shape" else None,
         shift_scores=shift_scores if chosen == "window" else None,
-        active_mask=final_mask, gdt_ts=gdt_ts, contact_overlap=contact_overlap
-    )
+        active_mask=final_mask, gdt_ts=gdt_ts,
+        ref_selection=ref_selection, mob_selection=mob_selection)
 
-def perform_sequence_alignment(seq1:str, seq2:str, gap_open:float, gap_extend:float):
-    if not seq1 or not seq2: return None
-    try:
-        blosum62=substitution_matrices.load("BLOSUM62")
-        aligner = PairwiseAligner()
-        aligner.substitution_matrix = blosum62
-        aligner.open_gap_score = gap_open
-        aligner.extend_gap_score = gap_extend
-        aligner.mode = 'global'
-        # Semi-global alignment to allow individual chains to map to multi-chain references freely
-        try:
-            aligner.target_end_gap_score = 0.0
-            aligner.query_end_gap_score = 0.0
-        except Exception:
-            pass
-        alns = aligner.align(seq1, seq2)
-        if not alns: return None
-        a = alns[0]
 
-        # For PairwiseAligner, formatting can vary based on exact match vs mismatch
-        # It's safer to extract it from the alignment path indices
-        seqA_aln = ""
-        seqB_aln = ""
-        # The coordinates are provided as lists of start/end indices
-        # a.coordinates gives the path
-        if hasattr(a, "indices"):
-            ref_idx = a.indices[0]
-            mob_idx = a.indices[1]
+def _as_structure(x: Union[str, gemmi.Structure]) -> gemmi.Structure:
+    if isinstance(x, gemmi.Structure):
+        return x
+    return _parse_path(str(x))
 
-            p1, p2 = 0, 0
-            for i in range(len(ref_idx)):
-                if ref_idx[i] != -1 and mob_idx[i] != -1:
-                    seqA_aln += seq1[ref_idx[i]]
-                    seqB_aln += seq2[mob_idx[i]]
-                elif ref_idx[i] != -1:
-                    seqA_aln += seq1[ref_idx[i]]
-                    seqB_aln += "-"
-                elif mob_idx[i] != -1:
-                    seqA_aln += "-"
-                    seqB_aln += seq2[mob_idx[i]]
-            seqA = seqA_aln
-            seqB = seqB_aln
-        else:
-            # Fallback for Biopython > 1.80
-            seqA = str(a[0])
-            seqB = str(a[1])
 
-        class Wrap:
-            def __init__(self, seqA, seqB, score):
-                self.seqA = seqA
-                self.seqB = seqB
-                self.score = score
-        return Wrap(seqA, seqB, a.score)
-    except Exception as e:
-        logger.warning("Sequence alignment failed: %s", e, exc_info=True)
-        return None
+def _name_of(x: Union[str, gemmi.Structure]) -> str:
+    import os
+    if isinstance(x, gemmi.Structure):
+        return x.name or "structure"
+    return os.path.basename(str(x))
 
-def get_aligned_atoms_by_alignment(ref_struct: gemmi.Structure, ref_chains, mob_struct: gemmi.Structure, mob_chains, alignment, atoms: str = "CA", min_b_factor: float = 0.0, min_plddt: float = 0.0):
-    if not alignment: return [], []
-    seqA, seqB = alignment.seqA, alignment.seqB
 
-    if atoms == "backbone":
-        target_atoms = {"N", "CA", "C", "O"}
-    elif atoms == "all_heavy":
-        target_atoms = None # All non-hydrogen
-    else:
-        target_atoms = {"CA"}
+def _parse_path(path: str) -> gemmi.Structure:
+    st = gemmi.read_structure(str(path))
+    st.setup_entities()
+    return st
 
-    class ResidueWrapper:
-        def __init__(self, res, cid):
-            self.res = res
-            self._chain_id = cid
-        
-        def __iter__(self):
-            return iter(self.res)
-            
-        def __getattr__(self, attr):
-            return getattr(self.res, attr)
 
-    def get_res_list(struct, chains):
-        residues=[]
-        model=struct[0]
-        bounds_map = {}
-        for c in chains:
-            cid, start, end = _parse_chain_selector(c)
-            if cid not in bounds_map: bounds_map[cid] = []
-            if start is not None or end is not None: bounds_map[cid].append((start, end))
+# ---------------------------------------------------------------------------
+# chain-level sequence comparison
+# ---------------------------------------------------------------------------
 
-        for ch in chains:
-            cid, _, _ = _parse_chain_selector(ch)
-            chain = model.find_chain(cid)
-            if chain:
-                c_bounds = bounds_map.get(cid, [])
-                for res in chain:
-                    if res.name in AA_DICT:
-                        resseq = res.seqid.num
+@lru_cache(maxsize=8192)
+def _pair_identity(seq_a: str, seq_b: str) -> Tuple[float, float, float]:
+    """(% identity over aligned columns, % over shorter chain, mean BLOSUM62).
 
-                        if c_bounds:
-                            in_bounds = False
-                            for (start, end) in c_bounds:
-                                if (start is None or resseq >= start) and (end is None or resseq <= end):
-                                    in_bounds = True
-                                    break
-                            if not in_bounds:
-                                continue
-
-                        # Require a CA in every mode: the alignment sequence is
-                        # built from CA-bearing residues only, so including a
-                        # CA-less residue here would desynchronise the residue
-                        # list from the sequence and mis-pair downstream.
-                        has_ca = False
-                        for atom in res:
-                            if atom.name == "CA":
-                                has_ca = True
-                                break
-                        if not has_ca:
-                            continue
-
-                        # Filter by B-factor for CA atoms if requested
-                        if min_b_factor > 0.0:
-                            b_factor_ok = False
-                            for atom in res:
-                                if atom.name == "CA" and atom.b_iso >= min_b_factor:
-                                    b_factor_ok = True
-                                    break
-                            if not b_factor_ok:
-                                continue
-                        
-                        # Filter by pLDDT
-                        if min_plddt > 0.0:
-                            plddt_ok = False
-                            for atom in res:
-                                if atom.name == "CA" and atom.b_iso >= min_plddt:
-                                    plddt_ok = True
-                                    break
-                            if not plddt_ok:
-                                continue
-
-                        # Wrap the immutable C++ object to attach the chain ID dynamically
-                        residues.append(ResidueWrapper(res, cid))
-        return residues
-
-    ref_res=get_res_list(ref_struct, ref_chains); mob_res=get_res_list(mob_struct, mob_chains)
-    ref_idx=0; mob_idx=0; ref_atoms=[]; mob_atoms=[]
-
-    class PseudoResidue:
-        def __init__(self, resname, res_seq, res_icode=' '):
-            self.resname = resname
-            self._id = (' ', res_seq, res_icode)
-        def get_resname(self): return self.resname
-        def get_id(self): return self._id
-
-    class PseudoAtom:
-        def __init__(self, coord, name, chain_name, res_seq, res_icode, resname="UNK"):
-            self.coord = coord
-            self.name = name
-            self.chain_name = chain_name
-            self.res_seq = res_seq
-            self.res_icode = res_icode
-            self.parent = PseudoResidue(resname, res_seq, res_icode)
-        def get_coord(self):
-            return self.coord
-        def get_name(self):
-            return self.name
-        def get_parent(self):
-            return self.parent
-
-    for a,b in zip(seqA, seqB):
-        r_match=None; m_match=None
-        if a!='-':
-            while ref_idx<len(ref_res):
-                r=ref_res[ref_idx]
-                if AA_DICT.get(r.name)==a:
-                    r_match=r; ref_idx+=1; break
-                ref_idx+=1
-        if b!='-':
-            while mob_idx<len(mob_res):
-                m=mob_res[mob_idx]
-                if AA_DICT.get(m.name)==b:
-                    m_match=m; mob_idx+=1; break
-                mob_idx+=1
-
-        if r_match is not None and m_match is not None:
-            r_parent_chain = r_match._chain_id if hasattr(r_match, '_chain_id') else "A"
-            m_parent_chain = m_match._chain_id if hasattr(m_match, '_chain_id') else "A"
-            for atA in r_match:
-                if atA.element.name == "H": continue
-                if target_atoms is not None and atA.name not in target_atoms: continue
-                for atB in m_match:
-                    if atB.name == atA.name:
-                        ref_atoms.append(PseudoAtom(np.array(atA.pos.tolist(), dtype=float), atA.name, r_parent_chain, r_match.seqid.num, r_match.seqid.icode if hasattr(r_match.seqid, 'has_icode') and r_match.seqid.has_icode() else "", r_match.name))
-                        mob_atoms.append(PseudoAtom(np.array(atB.pos.tolist(), dtype=float), atB.name, m_parent_chain, m_match.seqid.num, m_match.seqid.icode if hasattr(m_match.seqid, 'has_icode') and m_match.seqid.has_icode() else "", m_match.name))
-                        break
-
-    return ref_atoms, mob_atoms
-
-def superimpose_atoms(ref_atoms, mob_atoms, recycles: int = 0, keep_fraction: float = 1.0,
-                      n_total: Optional[int] = None):
-    """Kabsch superposition of matched atom lists.
-
-    ``n_total`` is the reference selection's residue count used to normalize
-    GDT_TS (CASP semantics: unaligned residues fail every cutoff). When None,
-    GDT is normalized by the matched CA count (coverage not penalized).
+    Memoised on the sequence pair: a homomultimer repeats the same comparison
+    once per chain pair (576 identical alignments for a 24-mer).
     """
-    if not ref_atoms or not mob_atoms or len(ref_atoms)!=len(mob_atoms): return None
-    ref_coords=np.array([a.get_coord() for a in ref_atoms])
-    mob_coords=np.array([a.get_coord() for a in mob_atoms])
+    if not seq_a or not seq_b:
+        return 0.0, 0.0, 0.0
+    if seq_a == seq_b:
+        mat = blosum62()
+        mean_score = float(np.mean([mat[(c, c)] for c in seq_a])) if seq_a else 0.0
+        return 100.0, 100.0, mean_score
+    aln = perform_sequence_alignment(seq_a, seq_b, -10.0, -0.5)
+    if aln is None:
+        return 0.0, 0.0, 0.0
+    mat = blosum62()
+    total = 0.0
+    n = 0
+    for a, b in zip(aln.seqA, aln.seqB):
+        if a != "-" and b != "-":
+            try:
+                total += float(mat[(a, b)])
+            except (KeyError, IndexError):
+                pass
+            n += 1
+    return (aln.identity("aligned"), aln.identity("shorter"),
+            total / n if n else 0.0)
 
-    R, t, rmsd, mask = _iterative_kabsch(ref_coords, mob_coords, recycles, keep_fraction)
-    
-    mob_aligned=_transform(mob_coords, R, t)
-    per_res=np.sqrt(np.sum((ref_coords - mob_aligned)**2, axis=1))
 
-    # We return the active mask as well
-    res_labels=[]
-    active_ref_atoms = []
-    active_mob_atoms = []
-    
-    for i, a in enumerate(ref_atoms):
-        chain = a.chain_name
-        lbl = f"{chain}:{a.res_seq}{a.res_icode.strip()}" if str(a.res_icode).strip() else f"{chain}:{a.res_seq}"
-        res_labels.append(lbl)
-        if mask[i]:
-            active_ref_atoms.append(a)
-            active_mob_atoms.append(mob_atoms[i])
+def compute_chain_similarity_matrix(seqsA, seqsB, normalize: str = "shorter"):
+    """Pairwise chain identity and mean-BLOSUM62 matrices as DataFrames.
 
-    # GDT_TS on CA atoms over ALL matched pairs (never the inlier subset),
-    # normalized by the reference residue count when available.
-    gdt_ts, contact_overlap = 0.0, 0.0
-    ca_idx = [i for i, a in enumerate(ref_atoms)
-              if getattr(a, "get_name", lambda: "CA")() == "CA"]
-    if not ca_idx:
-        ca_idx = list(range(len(ref_atoms)))
-    if ca_idx:
-        ca_dists = per_res[ca_idx]
-        gdt_ts = compute_gdt_ts(ca_dists, n_total=n_total)
-        contact_overlap = compute_contact_overlap(
-            ref_coords[ca_idx], mob_aligned[ca_idx])
-        logger.info(f"Superimpose resulted in RMSD = {rmsd:.3f}, GDT_TS = {gdt_ts:.2f}")
+    ``normalize="shorter"`` (the default) divides identities by the shorter
+    chain's length. The previous normalisation — alignment length including
+    terminal gaps — reported a perfectly matching 120-residue domain against
+    its 600-residue parent chain as 20% identical, which is a sequence-length
+    ratio dressed up as an identity and wrecked chain matching for truncated
+    constructs, Fv fragments and single-domain models.
+    """
+    import pandas as pd
+    chainsA = list(seqsA.keys())
+    chainsB = list(seqsB.keys())
+    if not chainsA or not chainsB:
+        return pd.DataFrame(), pd.DataFrame()
+    id_mat = np.full((len(chainsA), len(chainsB)), np.nan)
+    sc_mat = np.full((len(chainsA), len(chainsB)), np.nan)
+    col = 0 if normalize == "aligned" else 1
+    for i, chA in enumerate(chainsA):
+        sA = str(seqsA[chA].seq)
+        for j, chB in enumerate(chainsB):
+            sB = str(seqsB[chB].seq)
+            if not sA or not sB:
+                continue
+            stats = _pair_identity(sA, sB)
+            id_mat[i, j] = stats[col]
+            sc_mat[i, j] = stats[2]
+    return (pd.DataFrame(id_mat, index=chainsA, columns=chainsB),
+            pd.DataFrame(sc_mat, index=chainsA, columns=chainsB))
 
-    return dict(rmsd=float(rmsd), rotation=R, translation=t,
-                ref_coords=ref_coords, mob_coords_transformed=mob_aligned,
-                per_residue_rmsd=per_res, residue_labels=res_labels,
-                active_ref_atoms=active_ref_atoms, active_mob_atoms=active_mob_atoms,
-                mask=mask, gdt_ts=gdt_ts, contact_overlap=contact_overlap,
-                cad_score=contact_overlap)  # cad_score: deprecated alias key
 
-def compute_chain_similarity_matrix(seqsA, seqsB)->Tuple[pd.DataFrame,pd.DataFrame]:
-    chainsA=list(seqsA.keys()); chainsB=list(seqsB.keys())
-    if not chainsA or not chainsB: return pd.DataFrame(), pd.DataFrame()
-    blosum62=substitution_matrices.load("BLOSUM62")
-    id_mat=np.zeros((len(chainsA), len(chainsB))) * np.nan
-    sc_mat=np.zeros((len(chainsA), len(chainsB))) * np.nan
-    for i,chA in enumerate(chainsA):
-        sA=str(seqsA[chA].seq)
-        for j,chB in enumerate(chainsB):
-            sB=str(seqsB[chB].seq)
-            if not sA or not sB: continue
-
-            aligner = PairwiseAligner()
-            aligner.mode = 'global'
-            aligner.substitution_matrix = blosum62
-            aligner.open_gap_score = -10.0
-            aligner.extend_gap_score = -0.5
-
-            alns = aligner.align(sA, sB)
-            if not alns: continue
-            a = alns[0]
-
-            if hasattr(a, "indices"):
-                ref_idx = a.indices[0]
-                mob_idx = a.indices[1]
-                seqA_aln = ""
-                seqB_aln = ""
-                for k in range(len(ref_idx)):
-                    if ref_idx[k] != -1 and mob_idx[k] != -1:
-                        seqA_aln += sA[ref_idx[k]]
-                        seqB_aln += sB[mob_idx[k]]
-                    elif ref_idx[k] != -1:
-                        seqA_aln += sA[ref_idx[k]]
-                        seqB_aln += "-"
-                    elif mob_idx[k] != -1:
-                        seqA_aln += "-"
-                        seqB_aln += sB[mob_idx[k]]
-            else:
-                seqA_aln = str(a[0])
-                seqB_aln = str(a[1])
-
-            matches=sum(1 for aa,bb in zip(seqA_aln, seqB_aln) if aa==bb and aa!='-')
-            ident=100.0 * matches / max(1, len(seqA_aln)); id_mat[i,j]=ident
-            sc=0.0; L=0
-            for aa,bb in zip(seqA_aln,seqB_aln):
-                if aa!='-' and bb!='-':
-                    sc += blosum62.get((aa,bb), blosum62.get((bb,aa),0.0)); L+=1
-            sc_mat[i,j]= sc / max(1,L)
-    return pd.DataFrame(id_mat, index=chainsA, columns=chainsB), pd.DataFrame(sc_mat, index=chainsA, columns=chainsB)
-
-def structure_based_alignment_strings(ref_infos: List[ResidueInfo], mob_infos: List[ResidueInfo],
-                                      pairs: List[Tuple[int,int]]) -> Tuple[str,str,str]:
-    if not pairs: return "", "", ""
-    def letter(info: ResidueInfo) -> str: return AA_DICT.get(info.resname, "X")
-    outA,outB=[],[]
-    i_prev,j_prev=pairs[0]
-    outA.append(letter(ref_infos[i_prev])); outB.append(letter(mob_infos[j_prev]))
-    for (i,j) in pairs[1:]:
-        di, dj = i - i_prev, j - j_prev
-        while di>1 or dj>1:
-            if di>dj: outA.append(letter(ref_infos[i_prev+1])); outB.append("-"); i_prev+=1; di-=1
-            elif dj>di: outA.append("-"); outB.append(letter(mob_infos[j_prev+1])); j_prev+=1; dj-=1
-            else: outA.append(letter(ref_infos[i_prev+1])); outB.append(letter(mob_infos[j_prev+1])); i_prev+=1; j_prev+=1; di-=1; dj-=1
-        outA.append(letter(ref_infos[i])); outB.append(letter(mob_infos[j])); i_prev,j_prev=i,j
-    blosum62=substitution_matrices.load("BLOSUM62")
-    match=[]
-    for a,b in zip(outA,outB):
-        if a==b and a!='-': match.append("|")
-        elif a!='-' and b!='-' and (blosum62.get((a,b), blosum62.get((b,a),0))>0): match.append(":")
-        elif a=='-' or b=='-': match.append(" ")
-        else: match.append(".")
-    return "".join(outA), "".join(outB), "".join(match)
+# ---------------------------------------------------------------------------
+# candidate selection
+# ---------------------------------------------------------------------------
 
 # Length scale (A) for the coverage-weighted selection score. Deviations much
 # smaller than this barely change the score; larger ones are penalised.
@@ -1075,13 +1385,11 @@ _SELECTION_RMSD_SCALE = 3.0
 
 
 def _coverage_score(rmsd: float, pairs: int) -> float:
-    """
-    Coverage-weighted quality score used to rank alignment candidates.
+    """``n_pairs / (1 + (rmsd / 3 A)^2)`` — higher is better.
 
-    ``score = n_pairs / (1 + (rmsd / R0)^2)`` — higher is better. This rewards
-    aligning more residues while still penalising deviation, so a strategy that
-    matches only a few residues at near-zero RMSD cannot beat one that
-    superimposes the whole protein well. When coverage is equal it reduces to
+    Rewards aligning more residues while still penalising deviation, so a
+    strategy matching a handful of residues at near-zero RMSD cannot beat one
+    that superimposes the whole protein well. At equal coverage it reduces to
     preferring the lower RMSD.
     """
     if not np.isfinite(rmsd) or pairs <= 0:
@@ -1089,123 +1397,78 @@ def _coverage_score(rmsd: float, pairs: int) -> float:
     return pairs / (1.0 + (rmsd / _SELECTION_RMSD_SCALE) ** 2)
 
 
-def _select_seqfree_method(summaries: Dict[str, "AlignSummary"]) -> str:
-    """
-    Pick the best sequence-free strategy (shape vs window) by coverage-weighted
-    score. Higher score wins; ties fall back to the lower RMSD. ``inliers`` is
-    the active (kept) pair count after outlier rejection.
-    """
-    return max(
-        summaries.keys(),
-        key=lambda m: (_coverage_score(summaries[m].rmsd, summaries[m].inliers),
-                       -summaries[m].rmsd),
-    )
+def _select_seqfree_method(summaries: Dict[str, AlignSummary]) -> str:
+    return max(summaries.keys(),
+               key=lambda m: (_coverage_score(summaries[m].rmsd, summaries[m].inliers),
+                              -summaries[m].rmsd))
 
 
-def pick_best_overall(seqguided, seqfree, min_pairs:int=3):
-    cands=[]
+def pick_best_overall(seqguided, seqfree, min_pairs: int = 3):
+    """Choose between the sequence-guided and sequence-free candidates."""
+    cands = []
     if seqguided is not None:
-        # Count residues (CA atoms), not atoms: with atoms="backbone"/"all_heavy"
-        # ref_atoms holds several atoms per residue, which would otherwise inflate
-        # the coverage term and bias selection toward the seq-guided candidate.
-        ref_atoms = seqguided["ref_atoms"]
-        n_res = sum(1 for a in ref_atoms if getattr(a, "get_name", lambda: "CA")() == "CA")
-        if n_res == 0:
-            n_res = len(ref_atoms)
-        cands.append(dict(name="Sequence-guided", rmsd=float(seqguided["si"]["rmsd"]), pairs=n_res, kind="seqguided"))
+        si = seqguided["si"]
+        n_res = si.get("n_residues")
+        if not n_res:
+            # Count residues, not atoms: with atoms="backbone"/"all_heavy" the
+            # atom list holds several entries per residue, which would inflate
+            # the coverage term and bias the choice toward the seq-guided side.
+            ref_atoms = seqguided.get("ref_atoms") or []
+            n_res = sum(1 for a in ref_atoms
+                        if getattr(a, "get_name", lambda: "CA")() == "CA") \
+                or len(ref_atoms)
+        cands.append(dict(name="Sequence-guided", rmsd=float(si["rmsd"]),
+                          pairs=int(n_res), kind="seqguided"))
     if seqfree is not None:
-        cands.append(dict(name=f"Sequence-free ({seqfree.method})", rmsd=float(seqfree.rmsd), pairs=int(seqfree.kept_pairs), kind="seqfree"))
-    if not cands: return None, "No candidates available."
+        cands.append(dict(name=f"Sequence-free ({seqfree.method})",
+                          rmsd=float(seqfree.rmsd), pairs=int(seqfree.kept_pairs),
+                          kind="seqfree"))
+    if not cands:
+        return None, "No candidates available."
 
     for c in cands:
         c["score"] = _coverage_score(c["rmsd"], c["pairs"])
 
-    valid=[c for c in cands if np.isfinite(c["rmsd"]) and c["pairs"]>=min_pairs]
-    if not valid: valid=[c for c in cands if np.isfinite(c["rmsd"])]
+    valid = [c for c in cands if np.isfinite(c["rmsd"]) and c["pairs"] >= min_pairs]
     if not valid:
-        best=min(cands, key=lambda c: (math.isfinite(c["rmsd"])==False, c["rmsd"]))
+        valid = [c for c in cands if np.isfinite(c["rmsd"])]
+    if not valid:
+        best = min(cands, key=lambda c: (not math.isfinite(c["rmsd"]), c["rmsd"]))
         return best, "Chose the only available candidate."
-    # Highest coverage-weighted score wins; ties fall back to lower RMSD.
-    best=max(valid, key=lambda c: (c["score"], -c["rmsd"]))
-    others=[c for c in valid if c is not best]
+    best = max(valid, key=lambda c: (c["score"], -c["rmsd"]))
+    others = [c for c in valid if c is not best]
     if others:
-        alt=max(others, key=lambda c: (c["score"], -c["rmsd"]))
-        reason=(f"Higher coverage-weighted score ({best['score']:.1f}: "
-                f"{best['pairs']} pairs @ {best['rmsd']:.2f} Å) vs {alt['name']} "
-                f"({alt['score']:.1f}: {alt['pairs']} pairs @ {alt['rmsd']:.2f} Å).")
+        alt = max(others, key=lambda c: (c["score"], -c["rmsd"]))
+        reason = (f"Higher coverage-weighted score ({best['score']:.1f}: "
+                  f"{best['pairs']} pairs @ {best['rmsd']:.2f} Å) vs {alt['name']} "
+                  f"({alt['score']:.1f}: {alt['pairs']} pairs @ {alt['rmsd']:.2f} Å).")
     else:
-        reason="Single valid candidate."
+        reason = "Single valid candidate."
     return best, reason
 
-def progressive_align_ensemble(
-    files: List[str], 
-    chains_list: Optional[List[Optional[List[Union[str,int]]]]] = None,
-    method: str = "shape", 
-    recycles: int = 0, keep_fraction: float = 1.0, min_plddt: float = 0.0
-) -> Dict[str, Any]:
-    """
-    Computes a progressive ensemble alignment by picking a central "medoid" structure 
-    and aligning all others to it to achieve a Multiple Structure Alignment (MSA).
-    Returns mapping parameters and overall RMSD metrics.
-    """
-    if len(files) < 2:
-        return {"error": "Need at least 2 structures for ensemble alignment"}
-    
-    if chains_list is None:
-        chains_list = [None] * len(files)
-        
-    logger.info(f"Starting progressive ensemble alignment for {len(files)} structures")
-    
-    # 1. Pairwise shape/window alignments to target the Medoid
-    N = len(files)
-    pairwise_rmsds = np.zeros((N, N))
-    
-    # For a full medoid we need N*(N-1)/2, but for speed we can approximate.
-    # To be robust, if N<=10 we do all pairs. If larger, we pick the first file as reference.
-    if N <= 10:
-        for i in range(N):
-            for j in range(i+1, N):
-                res = sequence_independent_alignment_joined_v2(
-                    files[i], files[j], chains_ref=chains_list[i], chains_mob=chains_list[j],
-                    method=method, recycles=recycles, keep_fraction=keep_fraction, min_plddt=min_plddt
-                )
-                pairwise_rmsds[i, j] = res.rmsd
-                pairwise_rmsds[j, i] = res.rmsd
-        
-        avg_rmsds = np.sum(pairwise_rmsds, axis=1) / (N - 1)
-        medoid_idx = int(np.argmin(avg_rmsds))
-    else:
-        medoid_idx = 0
-        
-    logger.info(f"Selected structure {medoid_idx} ({files[medoid_idx]}) as the Medoid.")
-    
-    aligned_results = []
-    medoid_file = files[medoid_idx]
-    
-    for i in range(N):
-        if i == medoid_idx:
-            # Identity matrix for medoid
-            aligned_results.append({
-                "mob_index": i, "file": files[i], 
-                "R": np.eye(3), "t": np.zeros(3), "rmsd": 0.0, "is_medoid": True
-            })
-            continue
-            
-        res = sequence_independent_alignment_joined_v2(
-            medoid_file, files[i], chains_ref=chains_list[medoid_idx], chains_mob=chains_list[i],
-            method=method, recycles=recycles, keep_fraction=keep_fraction, min_plddt=min_plddt
-        )
-        logger.info(f"Aligned {files[i]} to Medoid, RMSD: {res.rmsd:.3f}")
-        
-        aligned_results.append({
-            "mob_index": i, "file": files[i], 
-            "R": res.rotation, "t": res.translation, "rmsd": res.rmsd, "gdt_ts": res.gdt_ts, "is_medoid": False
-        })
-        
-    return {
-        "medoid_idx": medoid_idx,
-        "medoid_file": medoid_file,
-        "results": aligned_results,
-        "avg_ensemble_rmsd": float(np.mean([r["rmsd"] for r in aligned_results if r["rmsd"] > 0]))
-    }
 
+# ---------------------------------------------------------------------------
+# legacy shim
+# ---------------------------------------------------------------------------
+
+def get_aligned_atoms_by_alignment(ref_struct, ref_chains, mob_struct, mob_chains,
+                                   alignment, atoms: str = "CA",
+                                   min_b_factor: float = 0.0, min_plddt: float = 0.0):
+    """Deprecated. Build selections and use :func:`paired_atoms` instead.
+
+    Retained for external callers. It re-derives both selections, so an
+    alignment produced from *different* selections than the ones implied by the
+    arguments would mis-pair; the selection-based API makes that impossible,
+    which is why it is the one the package uses internally.
+    """
+    import warnings
+    warnings.warn(
+        "get_aligned_atoms_by_alignment() is deprecated; build a Selection with "
+        "select_residues() and pair with pairs_from_alignment()/paired_atoms(), "
+        "which cannot desynchronise the sequence from the coordinates.",
+        DeprecationWarning, stacklevel=2)
+    ref_sel = select_residues(ref_struct, ref_chains, min_b_factor=min_b_factor,
+                              min_plddt=min_plddt)
+    mob_sel = select_residues(mob_struct, mob_chains, min_b_factor=min_b_factor,
+                              min_plddt=min_plddt)
+    return paired_atoms(ref_sel, mob_sel, pairs_from_alignment(alignment), atoms=atoms)

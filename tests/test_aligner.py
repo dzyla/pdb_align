@@ -116,8 +116,14 @@ END
     assert result.domains is None
 
 
-def test_alignment_result_flexible_rmsd_weighted_average():
-    """AlignmentResult.rmsd returns weighted average when domains are set."""
+def test_alignment_result_flexible_rmsd_combines_in_quadrature():
+    """With domains set, .rmsd is the RMSD over all domain residues.
+
+    RMSDs are root-mean-square quantities: combining 1.0 A over 50 residues
+    with 3.0 A over 50 gives sqrt((1+9)/2) = 2.236 A, not the arithmetic mean
+    2.0 A, which understates the deviation.
+    """
+    import math
     import numpy as np
 
     chosen = {"seqguided": None, "seqfree": None, "name": "flexible", "reason": "test"}
@@ -131,8 +137,7 @@ def test_alignment_result_flexible_rmsd_weighted_average():
         ref_lens={"A": 100}, mob_lens={"A": 100},
         domains=[dr1, dr2],
     )
-    # Weighted average: (1.0*50 + 3.0*50) / 100 = 2.0
-    assert result.rmsd == pytest.approx(2.0)
+    assert result.rmsd == pytest.approx(math.sqrt((1.0 + 9.0) / 2.0))
 
 
 def test_flexible_alignment_produces_domains(tmp_path):

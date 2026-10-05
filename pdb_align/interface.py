@@ -39,7 +39,7 @@ import numpy as np
 import gemmi
 
 from .core import (
-    AA_DICT, _kabsch, perform_sequence_alignment,
+    residue_letter, _kabsch, perform_sequence_alignment, pairs_from_alignment,
 )
 
 # --- published constants (see module docstring for sources) -----------------
@@ -111,7 +111,8 @@ def _chain_residues(struct: gemmi.Structure, chain_names: Sequence[str]) -> Dict
         if chain.name not in out:
             continue
         for res in chain:
-            if res.name not in AA_DICT:
+            letter = residue_letter(res.name)
+            if letter is None:
                 continue
             heavy = {}
             plddt = None
@@ -127,7 +128,7 @@ def _chain_residues(struct: gemmi.Structure, chain_names: Sequence[str]) -> Dict
             icode = res.seqid.icode if res.seqid.icode and res.seqid.icode != " " else ""
             out[chain.name].append(_Res(
                 chain=chain.name, seqid=int(res.seqid.num), icode=icode.strip(),
-                name=res.name, letter=AA_DICT[res.name], heavy=heavy, plddt=plddt))
+                name=res.name, letter=letter, heavy=heavy, plddt=plddt))
     return out
 
 
@@ -148,15 +149,7 @@ def _pair_residues(ref_res: List[_Res], mob_res: List[_Res],
     aln = perform_sequence_alignment(seq_a, seq_b, -10.0, -0.5)
     if aln is None:
         return []
-    pairs = []
-    i = j = 0
-    for a, b in zip(aln.seqA, aln.seqB):
-        if a != "-" and b != "-":
-            pairs.append((i, j))
-        if a != "-":
-            i += 1
-        if b != "-":
-            j += 1
+    pairs = pairs_from_alignment(aln)
     if _cache is not None:
         _cache[(ref_res[0].chain, mob_res[0].chain)] = pairs
     return pairs

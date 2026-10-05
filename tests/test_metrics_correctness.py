@@ -116,11 +116,31 @@ def test_lddt_identity_is_one():
     assert calculate_lddt(P, P.copy()) == pytest.approx(1.0)
 
 
-# --- contact overlap rename ----------------------------------------------------
+# --- contact overlap ------------------------------------------------------------
 
-def test_contact_overlap_alias_warns():
-    from pdb_align.core import compute_cad_score_approx
-    P = _line(10)
-    with pytest.warns(DeprecationWarning):
-        v = compute_cad_score_approx(P, P.copy())
-    assert v == pytest.approx(compute_contact_overlap(P, P.copy()))
+def test_contact_overlap_chunking_does_not_change_the_result():
+    """The chunked implementation exists to bound memory (900 MB at N=6000),
+    so it must agree with the single-block result exactly."""
+    rng = np.random.default_rng(11)
+    P = np.cumsum(rng.normal(size=(400, 3)) * 2.0, axis=0)
+    Q = P + rng.normal(size=(400, 3)) * 0.5
+    full = compute_contact_overlap(P, Q, chunk=10_000)
+    chunked = compute_contact_overlap(P, Q, chunk=37)
+    assert chunked == pytest.approx(full, abs=1e-12)
+
+
+def test_contact_overlap_ignores_self_and_sequence_neighbour_pairs():
+    """Only i,i+1 contacts exist in a short straight chain, and those carry no
+    structural information, so the comparison has nothing to score (0.0) rather
+    than a free 1.0 from trivially-satisfied pairs."""
+    P = _line(2)  # the only pair is i, i+1, which is excluded
+    assert compute_contact_overlap(P, P.copy()) == 0.0
+
+
+def test_contact_overlap_is_superposition_invariant():
+    """It compares internal contact maps, so a rigid move must not change it."""
+    rng = np.random.default_rng(3)
+    P = np.cumsum(rng.normal(size=(60, 3)) * 2.0, axis=0)
+    moved = P @ np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]) \
+        + np.array([120.0, -40.0, 7.0])
+    assert compute_contact_overlap(P, moved) == pytest.approx(1.0)

@@ -5,11 +5,10 @@ import numpy as np
 from pdb_align.core import (
     compute_gdt_ts,
     compute_contact_overlap,
-    progressive_align_ensemble,
     _extract_ca_infos,
     _parse_path,
     _kabsch,
-    _detect_hinges
+    _detect_hinges,
 )
 
 def test_compute_gdt_ts():
@@ -61,11 +60,6 @@ def test_kabsch():
     R, t, rmsd = _kabsch(ref, mob)
     assert np.isclose(rmsd, 0.0, atol=1e-6)
     
-def test_progressive_align_error():
-    res = progressive_align_ensemble(["file.pdb"])
-    assert "error" in res
-
-
 def test_detect_hinges_flat_no_hinges():
     """Uniform low RMSD → no hinge detected."""
     rmsd = np.ones(120) * 0.5

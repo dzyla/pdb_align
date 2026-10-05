@@ -7,32 +7,51 @@ def _seqrec(seq):
     return SimpleNamespace(seq=seq)
 
 
-def test_heteromer_pairs_by_best_identity(monkeypatch):
-    import pdb_align.chains as ch
-    import pandas as pd
-    # ref A~mob Y (identical), ref B~mob X (identical); file order is crossed.
-    ref_seqs = {"A": _seqrec("AAAAKKKK"), "B": _seqrec("DDDDEEEE")}
-    mob_seqs = {"X": _seqrec("DDDDEEEE"), "Y": _seqrec("AAAAKKKK")}
-    id_mat = pd.DataFrame([[0.0, 100.0], [100.0, 0.0]],
-                          index=["A", "B"], columns=["X", "Y"])
-    monkeypatch.setattr(ch, "compute_chain_similarity_matrix",
-                        lambda a, b: (id_mat, id_mat))
+# Two unrelated 40-mers; real BLOSUM62 identities, no mocking of the matrix.
+_SEQ1 = "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSG"
+_SEQ2 = "GSHMLEDPRVWQDFLSRAKEIVAGNCYTWPDGVKLHFNEAMSRYLTPDQQ"
+
+
+def test_heteromer_pairs_by_sequence_identity_not_file_order():
+    """File order is crossed, so only sequence can give the correspondence."""
+    ref_seqs = {"A": _seqrec(_SEQ1), "B": _seqrec(_SEQ2)}
+    mob_seqs = {"X": _seqrec(_SEQ2), "Y": _seqrec(_SEQ1)}
     mapping = match_chains(ref_seqs, mob_seqs, None, None, ["A", "B"], ["X", "Y"])
-    pairs = {(p[0], p[1]) for p in mapping.pairs}
-    assert pairs == {("A", "Y"), ("B", "X")}
+    assert {(p[0], p[1]) for p in mapping.pairs} == {("A", "Y"), ("B", "X")}
 
 
-def test_unmatched_chains_reported(monkeypatch):
-    import pdb_align.chains as ch
-    import pandas as pd
-    ref_seqs = {"A": _seqrec("AAAAKKKK")}
-    mob_seqs = {"X": _seqrec("AAAAKKKK"), "Z": _seqrec("WWWWWWWW")}
-    id_mat = pd.DataFrame([[100.0, 0.0]], index=["A"], columns=["X", "Z"])
-    monkeypatch.setattr(ch, "compute_chain_similarity_matrix",
-                        lambda a, b: (id_mat, id_mat))
+def test_unmatched_chains_reported():
+    ref_seqs = {"A": _seqrec(_SEQ1)}
+    mob_seqs = {"X": _seqrec(_SEQ1), "Z": _seqrec(_SEQ2)}
     mapping = match_chains(ref_seqs, mob_seqs, None, None, ["A"], ["X", "Z"])
-    assert mapping.pairs[0][0] == "A" and mapping.pairs[0][1] == "X"
+    assert (mapping.pairs[0][0], mapping.pairs[0][1]) == ("A", "X")
     assert "Z" in mapping.unmatched_mob
+
+
+def test_identity_is_normalised_by_the_shorter_chain():
+    """A domain that matches its parent chain perfectly is 100% identical to it.
+
+    Normalising by alignment length (including terminal gaps) turned a perfect
+    50-residue match inside a 200-residue chain into "25% identity" — a length
+    ratio wearing an identity's name, which broke chain matching for truncated
+    constructs, Fv fragments and single-domain models.
+    """
+    from pdb_align.core import compute_chain_similarity_matrix
+    full = _SEQ1 + _SEQ2 + _SEQ1 + _SEQ2
+    domain = _SEQ2
+    id_mat, _ = compute_chain_similarity_matrix({"A": _seqrec(full)},
+                                                {"d": _seqrec(domain)})
+    assert float(id_mat.iloc[0, 0]) > 95.0
+
+
+def test_weak_correspondence_is_warned_about():
+    """A mapping at chance-level identity must not be presented as a fact."""
+    import pytest
+    ref_seqs = {"A": _seqrec(_SEQ1)}
+    mob_seqs = {"X": _seqrec(_SEQ2)}
+    with pytest.warns(UserWarning, match="weak sequence identity"):
+        mapping = match_chains(ref_seqs, mob_seqs, None, None, ["A"], ["X"])
+    assert mapping.warnings
 
 
 def test_homodimer_swapped_chains_refined_by_geometry():
