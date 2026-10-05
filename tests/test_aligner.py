@@ -1,11 +1,12 @@
 # tests/test_aligner.py
 import os
-import pytest
 from unittest.mock import patch
+
 import gemmi
+import pytest
 
 import pdb_align
-from pdb_align.aligner import PDBAligner, AlignmentResult, DomainResult
+from pdb_align.aligner import AlignmentResult, DomainResult, PDBAligner
 
 
 def test_structure_cache_set_reference(tmp_path):
@@ -124,6 +125,7 @@ def test_alignment_result_flexible_rmsd_combines_in_quadrature():
     2.0 A, which understates the deviation.
     """
     import math
+
     import numpy as np
 
     chosen = {"seqguided": None, "seqfree": None, "name": "flexible", "reason": "test"}
@@ -142,8 +144,9 @@ def test_alignment_result_flexible_rmsd_combines_in_quadrature():
 
 def test_flexible_alignment_produces_domains(tmp_path):
     """mode='flexible' should return an AlignmentResult with .domains populated."""
-    import numpy as np
     import math
+
+    import numpy as np
 
     # Reference: 60-residue straight chain along X
     ref_lines = []
@@ -267,6 +270,7 @@ def test_ensemble_result_plot_pca_returns_figure():
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
     from pdb_align.aligner import EnsembleResult
     results = [_make_mock_result([float(i)] * 10) for i in range(6)]
     labels = [f"m{i}" for i in range(6)]
@@ -281,14 +285,16 @@ def test_ensemble_result_plot_pca_fallback_without_cluster():
     """plot_pca with color_by='cluster' but no prior cluster() → warns and falls back to rmsd."""
     import matplotlib
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     import warnings
+
+    import matplotlib.pyplot as plt
+
     from pdb_align.aligner import EnsembleResult
     results = [_make_mock_result([float(i)] * 10) for i in range(4)]
     ens = EnsembleResult(results=results, labels=[f"m{i}" for i in range(4)])
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        fig = ens.plot_pca(color_by="cluster")
+        _fig = ens.plot_pca(color_by="cluster")
         assert any("cluster" in str(warning.message).lower() for warning in w)
     plt.close("all")
 
@@ -297,6 +303,7 @@ def test_ensemble_result_plot_dendrogram_returns_figure():
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
     from pdb_align.aligner import EnsembleResult
     results = [_make_mock_result([float(i)] * 10) for i in range(4)]
     labels = [f"m{i}" for i in range(4)]

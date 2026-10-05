@@ -1,24 +1,41 @@
 """pdb_align — high-performance protein structure alignment and model assessment."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
-from .aligner import PDBAligner, AlignmentResult, AlignmentFailedError, EnsembleResult, DomainResult, LoadedResult, inspect_structure
-from .exceptions import ParsingError, ChainNotFoundError
-from .chains import match_chains, align_multichain, ChainMapping
-from .plotstyle import apply_nature_style
-from .interpretation import AlignmentQuality, FlaggedRegion
-from .interface import (
-    compute_dockq, DockQResult, dockq_formula, capri_class,
-    epitope_metrics, SiteComparison,
-    evaluate_antibody_complex, ImmuneComplexResult,
-    compute_pdockq, PDockQResult,
+from .aligner import (
+    AlignmentFailedError,
+    AlignmentResult,
+    DomainResult,
+    EnsembleResult,
+    LoadedResult,
+    PDBAligner,
+    inspect_structure,
 )
-from .evaluate import evaluate_models, ModelEvaluation
+from .cdr import CDRAnnotation, CDRResult, annotate_cdrs, cdr_rmsd
+from .chains import ChainMapping, align_multichain, match_chains
 from .confidence import (
-    load_confidence, find_confidence_files, ModelConfidence,
-    compute_pdockq2, PDockQ2Result,
+    ModelConfidence,
+    PDockQ2Result,
+    compute_pdockq2,
+    find_confidence_files,
+    load_confidence,
 )
-from .cdr import annotate_cdrs, cdr_rmsd, CDRResult, CDRAnnotation
+from .evaluate import ModelEvaluation, evaluate_models
+from .exceptions import ChainNotFoundError, ParsingError
+from .interface import (
+    DockQResult,
+    ImmuneComplexResult,
+    PDockQResult,
+    SiteComparison,
+    capri_class,
+    compute_dockq,
+    compute_pdockq,
+    dockq_formula,
+    epitope_metrics,
+    evaluate_antibody_complex,
+)
+from .interpretation import AlignmentQuality, FlaggedRegion
+from .plotstyle import apply_nature_style
 
 __all__ = [
     "align",

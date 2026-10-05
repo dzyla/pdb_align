@@ -1,0 +1,154 @@
+cff-version: 1.2.0
+title: "pdb_align: protein structure alignment and prediction-model assessment"
+message: >-
+  If you use this software in work you publish, please cite it, and cite the
+  original papers for whichever metrics you report (listed under references
+  below and in docs/METHODS.md).
+type: software
+authors:
+  - family-names: Zyla
+    given-names: Dawid
+    affiliation: University of Colorado Anschutz Medical Campus
+version: 0.4.0
+license: AGPL-3.0-or-later
+repository-code: "https://github.com/dzyla/pdb_align"
+keywords:
+  - structural biology
+  - protein structure alignment
+  - TM-score
+  - lDDT
+  - DockQ
+  - AlphaFold
+  - epitope mapping
+abstract: >-
+  pdb_align compares protein structures and scores predicted models against
+  experimental references. It provides sequence-guided and sequence-free
+  superposition, automatic multi-chain correspondence, flexible (multi-domain)
+  alignment, and the standard assessment metrics — TM-score, GDT_TS, lDDT-Ca,
+  DockQ with its CAPRI classes, epitope/paratope agreement, pDockQ and pDockQ2
+  — as a Python API, a command-line tool and a web front-end. Metric
+  implementations are cross-validated against the reference programs (DockQ,
+  TM-align) in the test suite, and each reported number states what it was
+  normalized by.
+references:
+  - type: article
+    authors:
+      - family-names: Zhang
+        given-names: Yang
+      - family-names: Skolnick
+        given-names: Jeffrey
+    title: "Scoring function for automated assessment of protein structure template quality"
+    journal: Proteins
+    volume: 57
+    issue: 4
+    start: 702
+    end: 710
+    year: 2004
+    doi: 10.1002/prot.20264
+  - type: article
+    authors:
+      - family-names: Xu
+        given-names: Jinrui
+      - family-names: Zhang
+        given-names: Yang
+    title: "How significant is a protein structure similarity with TM-score = 0.5?"
+    journal: Bioinformatics
+    volume: 26
+    issue: 7
+    start: 889
+    end: 895
+    year: 2010
+    doi: 10.1093/bioinformatics/btq066
+  - type: article
+    authors:
+      - family-names: Mariani
+        given-names: Valerio
+      - family-names: Biasini
+        given-names: Marco
+      - family-names: Barbato
+        given-names: Alessandro
+      - family-names: Schwede
+        given-names: Torsten
+    title: "lDDT: a local superposition-free score for comparing protein structures and models using distance difference tests"
+    journal: Bioinformatics
+    volume: 29
+    issue: 21
+    start: 2722
+    end: 2728
+    year: 2013
+    doi: 10.1093/bioinformatics/btt473
+  - type: article
+    authors:
+      - family-names: Basu
+        given-names: Sankar
+      - family-names: Wallner
+        given-names: Björn
+    title: "DockQ: a quality measure for protein-protein docking models"
+    journal: PLoS ONE
+    volume: 11
+    issue: 8
+    start: e0161879
+    year: 2016
+    doi: 10.1371/journal.pone.0161879
+  - type: article
+    authors:
+      - family-names: Bryant
+        given-names: Patrick
+      - family-names: Pozzati
+        given-names: Gabriele
+      - family-names: Elofsson
+        given-names: Arne
+    title: "Improved prediction of protein-protein interactions using AlphaFold2"
+    journal: Nature Communications
+    volume: 13
+    start: 1265
+    year: 2022
+    doi: 10.1038/s41467-022-28865-w
+  - type: article
+    authors:
+      - family-names: Zhu
+        given-names: Wensi
+      - family-names: Shenoy
+        given-names: Aditi
+      - family-names: Kundrotas
+        given-names: Petras
+      - family-names: Elofsson
+        given-names: Arne
+    title: "Evaluation of AlphaFold-Multimer prediction on multi-chain protein complexes"
+    journal: Bioinformatics
+    volume: 39
+    issue: 7
+    start: btad424
+    year: 2023
+    doi: 10.1093/bioinformatics/btad424
+  - type: article
+    authors:
+      - family-names: Zemla
+        given-names: Adam
+    title: "LGA: a method for finding 3D similarities in protein structures"
+    journal: Nucleic Acids Research
+    volume: 31
+    issue: 13
+    start: 3370
+    end: 3374
+    year: 2003
+    doi: 10.1093/nar/gkg571
+  - type: article
+    authors:
+      - family-names: Lefranc
+        given-names: Marie-Paule
+    title: "IMGT unique numbering for immunoglobulin and T cell receptor variable domains and Ig superfamily V-like domains"
+    journal: Developmental and Comparative Immunology
+    volume: 27
+    issue: 1
+    start: 55
+    end: 77
+    year: 2003
+    doi: 10.1016/S0145-305X(02)00039-3
+  - type: software
+    authors:
+      - family-names: Wojdyr
+        given-names: Marcin
+    title: "GEMMI: a library for structural biology"
+    year: 2022
+    doi: 10.21105/joss.04200

@@ -6,8 +6,8 @@ B-factor column carries meaning (e.g. AlphaFold pLDDT), so callers can opt to
 preserve the original values instead.
 """
 import gemmi
-import pdb_align
 
+import pdb_align
 
 _PDB = """\
 ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00 50.00           C

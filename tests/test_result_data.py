@@ -1,5 +1,7 @@
 import json
+
 import pytest
+
 import pdb_align
 
 REF = "tests/data/ref.pdb"

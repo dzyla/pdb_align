@@ -7,8 +7,8 @@ the arithmetic of a metric while saying nothing about whether it responds to
 real geometry. The helix also gives side-chain atoms (CB) directions that
 differ between residues, which is what contact-based metrics actually count.
 """
-import numpy as np
 import gemmi
+import numpy as np
 
 SPACING = 3.8
 

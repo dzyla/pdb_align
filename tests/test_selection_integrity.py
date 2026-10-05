@@ -17,8 +17,11 @@ import pytest
 
 import pdb_align
 from pdb_align.core import (
-    residue_letter, select_residues, pairs_from_alignment, paired_atoms,
+    paired_atoms,
+    pairs_from_alignment,
     perform_sequence_alignment,
+    residue_letter,
+    select_residues,
 )
 
 REF = "tests/data/1ubq.pdb"

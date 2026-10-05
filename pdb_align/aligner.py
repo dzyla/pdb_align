@@ -1,11 +1,13 @@
+import io
+import itertools
+import logging
 import math
 import os
-import io
-import logging
 import tempfile
 import warnings
-from typing import Optional, List, Union
 from dataclasses import dataclass
+from typing import List, Optional, Union
+
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
@@ -13,14 +15,25 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 from .core import (
-    Selection, extract_sequences_and_lengths, _parse_chain_selector, _parse_path,
-    pairs_from_alignment, paired_atoms, perform_sequence_alignment,
-    pick_best_overall, select_residues, sequence_independent_alignment_joined_v2,
-    superimpose_atoms, compute_chain_similarity_matrix, compute_contact_overlap,
-    _detect_hinges, _kabsch,
+    Selection,
+    _detect_hinges,
+    _kabsch,
+    _parse_chain_selector,
+    _parse_path,
+    compute_chain_similarity_matrix,
+    compute_contact_overlap,
+    extract_sequences_and_lengths,
+    paired_atoms,
+    pairs_from_alignment,
+    perform_sequence_alignment,
+    pick_best_overall,
+    select_residues,
+    sequence_independent_alignment_joined_v2,
+    superimpose_atoms,
 )
-from .exceptions import ParsingError, ChainNotFoundError
-from .metrics import compute_d0, tm_optimal_superposition, calculate_lddt
+from .exceptions import ChainNotFoundError
+from .metrics import calculate_lddt, tm_optimal_superposition
+
 
 class AlignmentFailedError(ValueError):
     """Raised when the alignment cannot produce a usable result.
@@ -526,8 +539,8 @@ class AlignmentResult:
 
     def _write_pymol_script(self, path, aligned_name, ref_name):
         lines = [
-            f"# pdb_align: reference (grey) + mobile coloured by per-residue "
-            f"deviation (B-factor column, 0-5 A)",
+            "# pdb_align: reference (grey) + mobile coloured by per-residue "
+            "deviation (B-factor column, 0-5 A)",
             f"load {ref_name}, ref",
             f"load {aligned_name}, mob",
             "hide everything",
@@ -565,9 +578,9 @@ class AlignmentResult:
         ``fmt="zip"`` writes a ``.zip``; ``fmt="dir"`` a folder. Returns the path.
         """
         import os
+        import shutil
         import tempfile
         import zipfile
-        import shutil
         components = include or ["aligned", "reference", "rmsd_csv", "plots",
                                  "pymol", "chimerax", "report"]
         # The viewer scripts load the reference *and* the aligned mobile; the
@@ -660,11 +673,11 @@ class AlignmentResult:
             mob_aln = ""
             from Bio.PDB.Polypeptide import protein_letters_3to1
             def to_1l(resname): return protein_letters_3to1.get(resname, 'X')
-            ref_idx_to_info = {i: info for i, info in enumerate(ref_subset)}
-            mob_idx_to_info = {i: info for i, info in enumerate(mob_subset)}
+            ref_idx_to_info = dict(enumerate(ref_subset))
+            mob_idx_to_info = dict(enumerate(mob_subset))
             matched_ref = {r for r, m in pairs}
             matched_mob = {m for r, m in pairs}
-            pair_dict = {r: m for r, m in pairs}
+            pair_dict = dict(pairs)
             r_idx, m_idx = 0, 0
             while r_idx < len(ref_subset) or m_idx < len(mob_subset):
                 if r_idx in matched_ref and m_idx in matched_mob and pair_dict.get(r_idx) == m_idx:
@@ -726,8 +739,10 @@ class AlignmentResult:
         id2p = mob_id.ljust(pad)
         mp = "Match".ljust(pad)
         from Bio.Align import substitution_matrices
-        try: blosum62 = substitution_matrices.load("BLOSUM62")
-        except: blosum62 = {}
+        try:
+            blosum62 = substitution_matrices.load("BLOSUM62")
+        except Exception:
+            blosum62 = {}
         match = ""
         for a, b in zip(seqA, seqB):
             if a == b and a != '-': match += "|"
@@ -752,8 +767,8 @@ class AlignmentResult:
         emitting one row per atom (as before) multiplied the residue count by
         ~4 or ~8 and pushed the reported coverage to 792%.
         """
-        import pandas as pd
         import numpy as np
+        import pandas as pd
         labels, chains, distances = [], [], []
         if self._chosen["seqguided"]:
             si = self._chosen["seqguided"]["si"]
@@ -814,7 +829,9 @@ class AlignmentResult:
         ImportError on a core install.
         """
         import contextlib
+
         import matplotlib.pyplot as plt
+
         from . import plotstyle
         try:
             df = self.get_rmsd_df(on=on)
@@ -856,12 +873,13 @@ class AlignmentResult:
                 fig.savefig(filename, bbox_inches='tight')
                 plt.close(fig)
 
-    def plot_summary(self, filename: str = None, show: bool = False):
+    def plot_summary(self, filename: Optional[str] = None, show: bool = False):
         """Compact multi-panel Nature-style summary: per-residue RMSD + per-chain bar + scores."""
         import matplotlib
         if not show:
             matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+
         from . import plotstyle
         df = self.get_rmsd_df()
         stats = self.summary_stats()
@@ -899,9 +917,6 @@ class AlignmentResult:
         Generates a .pml script for PyMOL to easily visualize the alignment.
         This assumes you have saved the aligned mobile structure using `save_aligned_pdb`.
         """
-        ref_basename = os.path.basename(self.ref_file)
-        mob_basename = os.path.basename(self.mob_file)
-
         script = f"""# PyMOL Script for visualizing alignment
 # Load structures
 load {self.ref_file}, reference
@@ -1015,7 +1030,9 @@ view
 
     def save(self, path: str):
         """Persist all computed data to a versioned .npz (no gemmi needed to reload)."""
-        import numpy as np, json
+        import json
+
+        import numpy as np
         df = self.get_rmsd_df()
         per_chain = self.per_chain
         meta = self.summary_stats()
@@ -1053,7 +1070,10 @@ class LoadedResult:
 
     @classmethod
     def _from_npz(cls, path):
-        import numpy as np, json, pandas as pd
+        import json
+
+        import numpy as np
+        import pandas as pd
         z = np.load(path, allow_pickle=True)
         meta = json.loads(str(z["meta_json"]))
         if meta.get("_save_version") != AlignmentResult._SAVE_VERSION:
@@ -1158,7 +1178,7 @@ class EnsembleResult:
                 pairwise[j, i] = d
         return pd.DataFrame(pairwise, index=self.labels, columns=self.labels)
 
-    def cluster(self, n_clusters: int = None) -> np.ndarray:
+    def cluster(self, n_clusters: Optional[int] = None) -> np.ndarray:
         """
         K-means clustering on per-residue RMSD vectors.
 
@@ -1192,7 +1212,7 @@ class EnsembleResult:
         self._cluster_labels = km.fit_predict(mat)
         return self._cluster_labels
 
-    def plot_pca(self, color_by: str = "cluster", save_path: str = None):
+    def plot_pca(self, color_by: str = "cluster", save_path: Optional[str] = None):
         """
         2D PCA of per-residue RMSD vectors, one point per model.
 
@@ -1241,7 +1261,7 @@ class EnsembleResult:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         return fig
 
-    def plot_dendrogram(self, save_path: str = None):
+    def plot_dendrogram(self, save_path: Optional[str] = None):
         """Hierarchical clustering dendrogram using Ward linkage on per-residue RMSD vectors."""
         import matplotlib.pyplot as plt
         from scipy.cluster.hierarchy import dendrogram, linkage
@@ -1264,9 +1284,9 @@ class EnsembleResult:
         ``fmt="zip"`` writes a ``.zip``; ``fmt="dir"`` a folder. Returns the path.
         """
         import os
+        import shutil
         import tempfile
         import zipfile
-        import shutil
         workdir = tempfile.mkdtemp(prefix="pdb_align_ens_")
         try:
             self.summary().to_csv(os.path.join(workdir, "summary.csv"), index=False)
@@ -1656,7 +1676,8 @@ class PDBAligner:
                 print(f"  Chain {ch}: {self.mob_lens.get(ch, 0)} aa")
             if self.ref_file:
                 print("\nSimilarity Matrix:")
-                id_mat, sc_mat = compute_chain_similarity_matrix(self.ref_seqs, self.mob_seqs)
+                id_mat, _sc_mat = compute_chain_similarity_matrix(
+                    self.ref_seqs, self.mob_seqs)
                 ref_chains = list(self.ref_seqs.keys())
                 mob_chains = list(self.mob_seqs.keys())
                 for i, r_ch in enumerate(ref_chains):
@@ -1837,7 +1858,7 @@ class PDBAligner:
         # Multi-chain dispatch: only when both sides really have several chains.
         if mode in ("auto", "Auto (best RMSD)") and \
                 len(ref_sel.chain_order) > 1 and len(mob_sel.chain_order) > 1:
-            from .chains import match_chains, align_multichain, _chain_selections
+            from .chains import align_multichain, match_chains
             mapping = match_chains(self.ref_seqs, self.mob_seqs,
                                    self.ref_struct, self.mob_struct,
                                    ref_sel.chain_order, mob_sel.chain_order)
@@ -2002,8 +2023,8 @@ class PDBAligner:
                                 threshold=hinge_threshold,
                                 min_segment=domain_min_residues,
                                 chain_starts=chain_starts)
-        boundaries = sorted(set([0, *splits, len(ca_rmsd)]))
-        segments = [(s, e) for s, e in zip(boundaries[:-1], boundaries[1:])
+        boundaries = sorted({0, *splits, len(ca_rmsd)})
+        segments = [(s, e) for s, e in itertools.pairwise(boundaries)
                     if e - s >= 3 and len(set(chains[s:e])) == 1]
         segments = self._merge_rigid_segments(segments, chains, ca_ref, ca_mob,
                                               hinge_threshold)
@@ -2048,7 +2069,6 @@ class PDBAligner:
         return merged
 
     def _multichain_to_result(self, mc, ref_sel, mob_sel):
-        from .core import compute_gdt_ts
 
         ref_atoms = mc.ref_infos
         mob_atoms = mc.mob_infos
@@ -2087,26 +2107,27 @@ class PDBAligner:
         """
         Identifies which candidate chain in the currently loaded mobile structure
         is physically closest to the specified binder chains.
-        
+
         This is useful for multimeric complexes (like AlphaFold predictions) where
         a binder might stochastically attach to any of the symmetric chains.
         """
         if not self.mob_struct or not self.mob_file:
             raise ValueError("Mobile structure must be loaded before finding the binder target.")
-            
+
         import numpy as np
         from scipy.spatial.distance import cdist
+
         from .core import _extract_ca_infos
-        
+
         # Get coordinates for the binder chains
         binder_infos = _extract_ca_infos(self.mob_struct, chain_filter=binder_chains)
         if not binder_infos:
             raise ValueError(f"Could not extract CA atoms for binder chains {binder_chains} in {os.path.basename(self.mob_file)}")
         binder_coords = np.array([info.coord for info in binder_infos])
-        
+
         min_dist = float('inf')
         best_chain = None
-        
+
         # Check distance to each candidate chain
         for candidate in candidate_chains:
             candidate_infos = _extract_ca_infos(self.mob_struct, chain_filter=[candidate])
@@ -2114,32 +2135,32 @@ class PDBAligner:
                 if self.verbose:
                     print(f"Warning: Candidate chain {candidate} not found or has no CA atoms.")
                 continue
-                
+
             candidate_coords = np.array([info.coord for info in candidate_infos])
-            
+
             # Calculate all pairwise distances between binder CA atoms and candidate CA atoms
             distances = cdist(binder_coords, candidate_coords)
-            
+
             # Find the minimum distance
             current_min = np.min(distances)
-            
+
             if self.verbose:
                 print(f"  Minimum distance to chain {candidate}: {current_min:.2f} Å")
-                
+
             if current_min < min_dist:
                 min_dist = current_min
                 best_chain = candidate
-                
+
         if best_chain is None:
             raise ValueError(f"Could not find any valid candidate chains from {candidate_chains} in {os.path.basename(self.mob_file)}")
-            
+
         if self.verbose:
             print(f"Selected chain {best_chain} as the target for binder {binder_chains} (distance: {min_dist:.2f} Å)")
-            
+
         return best_chain
 
-    def align_with_binder(self, binder_chains: List[str], candidate_chains: List[str], 
-                          mode: str = "auto", seq_gap_open: float = -10, seq_gap_extend: float = -0.5, 
+    def align_with_binder(self, binder_chains: List[str], candidate_chains: List[str],
+                          mode: str = "auto", seq_gap_open: float = -10, seq_gap_extend: float = -0.5,
                           atoms: str = "CA", **kwargs) -> AlignmentResult:
         """
         Calculates the target chain that the binder is bound to, sets it as the active mobile chain,
@@ -2147,7 +2168,7 @@ class PDBAligner:
         """
         if self.verbose:
             print(f"Looking for target chain among {candidate_chains} bound by {binder_chains}...")
-            
+
         best_chain = self.find_binder_target_chain(binder_chains, candidate_chains)
         self.set_mobile_chains([best_chain])
 
@@ -2398,7 +2419,7 @@ class PDBAligner:
         from Bio.Align import substitution_matrices
         try:
             blosum62 = substitution_matrices.load("BLOSUM62")
-        except:
+        except Exception:
             blosum62 = {}
 
         match = ""

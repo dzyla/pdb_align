@@ -18,13 +18,18 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .core import (
-    Selection, _coverage_score, _kabsch, compute_chain_similarity_matrix,
-    paired_atoms, pairs_from_alignment, perform_sequence_alignment,
+    Selection,
+    _coverage_score,
+    _kabsch,
+    compute_chain_similarity_matrix,
+    paired_atoms,
+    pairs_from_alignment,
+    perform_sequence_alignment,
     select_residues,
 )
 

@@ -1,6 +1,6 @@
+import json
 import os
 import zipfile
-import json
 
 from pdb_align import PDBAligner
 
@@ -25,7 +25,7 @@ def test_export_bundle_zip_contains_all(tmp_path):
         assert any(n.endswith(".cxc") for n in names)
         assert any(n.endswith("report.txt") for n in names)
         assert any(n.endswith("report.json") for n in names)
-        jname = [n for n in names if n.endswith("report.json")][0]
+        jname = next(n for n in names if n.endswith("report.json"))
         with z.open(jname) as f:
             payload = json.load(f)
             assert "quality" in payload

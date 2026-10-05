@@ -1,9 +1,0 @@
-numpy<2.0
-pandas
-scipy
-scikit-learn
-biopython
-gemmi
-numba
-requests
-matplotlib

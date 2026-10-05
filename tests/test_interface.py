@@ -5,14 +5,19 @@ several metric values are known in closed form (no external files, no network).
 """
 import numpy as np
 import pytest
-
-from pdb_align.interface import (
-    compute_dockq, dockq_formula, capri_class, epitope_metrics,
-    evaluate_antibody_complex, compute_pdockq,
-    FNAT_CONTACT_CUTOFF, DOCKQ_D1_IRMSD, DOCKQ_D2_LRMSD,
-)
 from _synthetic import SPACING, make_chain, make_structure, two_chain_complex
 
+from pdb_align.interface import (
+    DOCKQ_D1_IRMSD,
+    DOCKQ_D2_LRMSD,
+    FNAT_CONTACT_CUTOFF,
+    capri_class,
+    compute_dockq,
+    compute_pdockq,
+    dockq_formula,
+    epitope_metrics,
+    evaluate_antibody_complex,
+)
 
 # --------------------------------------------------------------------------
 # DockQ

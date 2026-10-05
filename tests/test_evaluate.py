@@ -3,9 +3,9 @@ import os
 
 import numpy as np
 import pytest
+from _synthetic import make_chain, make_structure, two_chain_complex
 
 from pdb_align.evaluate import evaluate_models
-from _synthetic import two_chain_complex, make_chain, make_structure
 
 DATA = os.path.join(os.path.dirname(__file__), "data")
 REF = os.path.join(DATA, "ref.pdb")

@@ -1,15 +1,17 @@
 import os
-import pytest
+
 import numpy as np
+import pytest
 
 from pdb_align.core import (
-    compute_gdt_ts,
-    compute_contact_overlap,
-    _extract_ca_infos,
-    _parse_path,
-    _kabsch,
     _detect_hinges,
+    _extract_ca_infos,
+    _kabsch,
+    _parse_path,
+    compute_contact_overlap,
+    compute_gdt_ts,
 )
+
 
 def test_compute_gdt_ts():
     # If distance is perfectly 0, all cutoffs are satisfied
@@ -56,10 +58,10 @@ def test_kabsch():
         [0.0, 1.0, 0.0],
         [-1.0, 0.0, 0.0]
     ])
-    
+
     R, t, rmsd = _kabsch(ref, mob)
     assert np.isclose(rmsd, 0.0, atol=1e-6)
-    
+
 def test_detect_hinges_flat_no_hinges():
     """Uniform low RMSD → no hinge detected."""
     rmsd = np.ones(120) * 0.5

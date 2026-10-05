@@ -6,7 +6,7 @@ exactly the residues that ``get_aligned_atoms_by_alignment`` will iterate over
 the sequence, the alignment-to-residue walk desynchronises and every downstream
 pair is shifted, silently corrupting the superposition.
 """
-from pdb_align.core import extract_sequences_and_lengths, _parse_path
+from pdb_align.core import _parse_path, extract_sequences_and_lengths
 
 
 def test_sequence_excludes_residues_without_ca(tmp_path):
@@ -26,3 +26,37 @@ END
     assert lens["A"] == 2
     assert len(str(seqs["A"].seq)) == 2
     assert str(seqs["A"].seq) == "AA"
+
+
+def test_semiglobal_alignment_does_not_penalise_terminal_overhang():
+    """A domain must align inside its parent chain without paying for the
+    overhang, on every supported Biopython.
+
+    Biopython 1.86 renamed the end-gap attributes and deprecated the old
+    names. Setting neither silently charges for the overhang, which changes
+    every alignment, so the configuration is asserted by its effect rather
+    than by which attribute exists.
+    """
+    from pdb_align.core import pairs_from_alignment, perform_sequence_alignment
+
+    domain = "MKTAYIAKQRQISFVKSHFSRQ"
+    full = "GSHMGSHM" + domain + "LEDPRVWQDFLSRAKEIVAGNC"
+
+    aln = perform_sequence_alignment(full, domain, -10.0, -0.5)
+    pairs = pairs_from_alignment(aln)
+    # Every domain residue pairs, contiguously, at its true offset in `full`.
+    assert len(pairs) == len(domain)
+    assert pairs[0] == (full.index(domain), 0)
+    assert [j for _i, j in pairs] == list(range(len(domain)))
+
+
+def test_no_biopython_deprecation_warnings_escape():
+    """A deprecation warning from a dependency is a maintenance alarm; it must
+    not be part of normal output."""
+    import warnings
+
+    from pdb_align.core import perform_sequence_alignment
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        perform_sequence_alignment("MKTAYIAKQR", "MKTAYIAKQR", -10.0, -0.5)

@@ -12,7 +12,6 @@ core install:
 """
 import numpy as np
 import pytest
-
 from _synthetic import two_chain_complex
 
 dockq_pkg = pytest.importorskip("DockQ.DockQ", reason="official DockQ not installed")

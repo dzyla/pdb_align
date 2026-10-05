@@ -1,6 +1,8 @@
-import numpy as np
 from types import SimpleNamespace
-from pdb_align.chains import match_chains, ChainMapping
+
+import numpy as np
+
+from pdb_align.chains import ChainMapping, match_chains
 
 
 def _seqrec(seq):
@@ -57,10 +59,11 @@ def test_weak_correspondence_is_warned_about():
 def test_homodimer_swapped_chains_refined_by_geometry():
     """Two identical chains; correct mapping must come from geometry, not sequence."""
     import gemmi
+
     from pdb_align.core import extract_sequences_and_lengths
 
     def _struct(coords_by_chain):
-        st = gemmi.Structure(); model = gemmi.Model("1");
+        st = gemmi.Structure(); model = gemmi.Model("1")
         for cname, coords in coords_by_chain.items():
             chain = gemmi.Chain(cname)
             for k, (x, y, z) in enumerate(coords, start=1):
@@ -85,10 +88,11 @@ def test_homodimer_swapped_chains_keep_true_identity():
     """Chains reassigned by geometric refinement must carry their real
     sequence identity, not a 0.0 fallback from the stale Hungarian pairing."""
     import gemmi
+
     from pdb_align.core import extract_sequences_and_lengths
 
     def _struct(coords_by_chain):
-        st = gemmi.Structure(); model = gemmi.Model("1");
+        st = gemmi.Structure(); model = gemmi.Model("1")
         for cname, coords in coords_by_chain.items():
             chain = gemmi.Chain(cname)
             for k, (x, y, z) in enumerate(coords, start=1):

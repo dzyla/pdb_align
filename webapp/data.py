@@ -9,7 +9,7 @@ import json
 import os
 import tempfile
 
-from pdb_align import PDBAligner, inspect_structure, evaluate_models
+from pdb_align import PDBAligner, evaluate_models, inspect_structure
 
 
 def save_upload_to_temp(name: str, data: bytes) -> str:

@@ -1,6 +1,10 @@
 import os
 
 import gemmi
+import pytest
+
+pytest.importorskip("py3Dmol", reason="the [app] extras are not installed")
+
 from webapp import viewer as V
 
 DATA = os.path.join(os.path.dirname(__file__), "data")

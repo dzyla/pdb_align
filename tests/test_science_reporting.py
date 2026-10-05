@@ -97,7 +97,8 @@ def test_gdt_normalization_follows_the_filtered_selection():
     for i, res in enumerate(st[0]["A"]):
         for atom in res:
             atom.b_iso = 95.0 if i < 40 else 20.0
-    import tempfile, os
+    import os
+    import tempfile
     fd, path = tempfile.mkstemp(suffix=".pdb")
     os.close(fd)
     st.write_pdb(path)

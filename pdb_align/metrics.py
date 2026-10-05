@@ -69,7 +69,7 @@ def _kabsch_np(P: np.ndarray, Q: np.ndarray):
     cP = P.mean(axis=0)
     cQ = Q.mean(axis=0)
     H = (Q - cQ).T @ (P - cP)
-    U, S, Vt = np.linalg.svd(H)
+    U, _S, Vt = np.linalg.svd(H)
     R = Vt.T @ U.T
     if np.linalg.det(R) < 0:
         Vt[-1, :] *= -1.0

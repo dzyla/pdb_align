@@ -1,8 +1,0 @@
--r requirements-core.txt
-streamlit
-py3Dmol
-stmol
-plotly
-matplotlib
-seaborn
-streamlit-molstar

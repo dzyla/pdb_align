@@ -1,5 +1,7 @@
 import os
+
 import pytest
+
 from pdb_align import PDBAligner
 
 DATA = os.path.join(os.path.dirname(__file__), "data")

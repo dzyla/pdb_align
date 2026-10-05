@@ -13,7 +13,7 @@ pytest.importorskip("stmol")
 pytest.importorskip("py3Dmol")
 pytest.importorskip("plotly")
 
-from streamlit.testing.v1 import AppTest  # noqa: E402
+from streamlit.testing.v1 import AppTest
 
 DATA = os.path.join(os.path.dirname(__file__), "data")
 

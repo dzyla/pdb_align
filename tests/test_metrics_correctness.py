@@ -2,12 +2,14 @@
 import numpy as np
 import pytest
 
+from pdb_align.core import compute_contact_overlap, compute_gdt_ts
 from pdb_align.metrics import (
-    calculate_tm_pvalue, calculate_tm_score, calculate_lddt,
-    tm_optimal_superposition, compute_d0,
+    calculate_lddt,
+    calculate_tm_pvalue,
+    calculate_tm_score,
+    compute_d0,
+    tm_optimal_superposition,
 )
-from pdb_align.core import compute_gdt_ts, compute_contact_overlap
-
 
 # --- TM p-value: Xu & Zhang 2010 EVD (mu=0.1512, sigma=0.0242) --------------
 

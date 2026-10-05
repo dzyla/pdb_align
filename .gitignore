@@ -1,8 +1,26 @@
+# Byte-compiled / build artefacts
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Structures downloaded or produced by a run. Test fixtures under tests/data/
+# are deliberately tracked (added with `git add -f`) — the suite needs real
+# structures, and an earlier blanket ignore here is why every fixture was a
+# synthetic poly-alanine rod and why eight residue-pairing bugs went unnoticed.
 *.pdb
 *.cif
-*.ipynb
+*.mmcif
+!tests/data/*.pdb
+!tests/data/*.cif
 *.zip
-*.pyc
-__pycache__/
-*.egg-info/
+*.npz
+
+# Notebooks and scratch output
+*.ipynb
+rmsd.png
+summary.png
 .superpowers/

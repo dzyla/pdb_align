@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-from .aligner import PDBAligner, AlignmentFailedError
+from .aligner import AlignmentFailedError, PDBAligner
 
 
 def build_parser():
@@ -142,7 +142,8 @@ def main(argv=None) -> int:
     if args.plot is not None:
         res.plot_rmsd(filename=args.plot)
         if args.show:
-            import matplotlib.pyplot as plt; plt.show()
+            import matplotlib.pyplot as plt
+            plt.show()
         if not args.json: print(f"Wrote RMSD plot: {args.plot}")
     if args.summary_plot is not None:
         res.plot_summary(filename=args.summary_plot, show=args.show)

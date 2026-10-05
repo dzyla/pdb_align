@@ -22,11 +22,12 @@ parent one-letter code instead of vanishing from the sequence.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 from dataclasses import dataclass, field
 from functools import lru_cache, wraps
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import gemmi
 import numpy as np
@@ -591,7 +592,7 @@ def _iterative_kabsch(P: np.ndarray, Q: np.ndarray, recycles: int,
     """
     R, t, rmsd = _kabsch(P, Q)
     N = P.shape[0]
-    min_keep = max(3, int(round(N * keep_fraction)))
+    min_keep = max(3, round(N * keep_fraction))
     mask = np.ones(N, dtype=bool)
 
     for _ in range(recycles):
@@ -696,7 +697,7 @@ def _detect_hinges(per_residue_rmsd: np.ndarray, window: int = 15,
     starts = sorted({0, *(int(s) for s in (chain_starts or []) if 0 < int(s) < N)})
     boundaries = starts + [N]
     splits: List[int] = [s for s in starts if s > 0]
-    for lo, hi in zip(boundaries[:-1], boundaries[1:]):
+    for lo, hi in itertools.pairwise(boundaries):
         inner = _detect_hinges_1d(arr[lo:hi], window, threshold, min_segment)
         splits.extend(lo + s for s in inner)
     return sorted(set(splits))
@@ -915,7 +916,7 @@ def _shape_pairs(coords1: np.ndarray, coords2: np.ndarray, nbins: int = 24,
 class PairwiseAlignment:
     """Two gapped strings plus the raw score (the only thing callers need)."""
 
-    __slots__ = ("seqA", "seqB", "score")
+    __slots__ = ("score", "seqA", "seqB")
 
     def __init__(self, seqA: str, seqB: str, score: float):
         self.seqA = seqA
@@ -957,8 +958,27 @@ def _build_aligner(gap_open: float, gap_extend: float, mode: str = "global",
     if free_end_gaps and mode == "global":
         # Semi-global: a domain or a truncated construct should align inside a
         # longer chain without paying for the overhang.
-        aligner.target_end_gap_score = 0.0
-        aligner.query_end_gap_score = 0.0
+        #
+        # Biopython 1.86 renamed target/query_end_gap_score to
+        # end_insertion/end_deletion_score and deprecated the old names, so set
+        # whichever this installation has. Setting neither would silently
+        # charge for the overhang and change every alignment, so a version that
+        # has neither is an error rather than a fallback.
+        # Probed on the *class*: these are properties whose getter raises
+        # ValueError("gap scores are different") once the open/extend scores
+        # differ, so hasattr() on the instance raises instead of answering.
+        cls = type(aligner)
+        if hasattr(cls, "end_insertion_score"):
+            aligner.end_insertion_score = 0.0
+            aligner.end_deletion_score = 0.0
+        elif hasattr(cls, "target_end_gap_score"):
+            aligner.target_end_gap_score = 0.0
+            aligner.query_end_gap_score = 0.0
+        else:  # pragma: no cover - no released Biopython lacks both
+            raise RuntimeError(
+                "This Biopython exposes no end-gap score attribute, so "
+                "semi-global alignment cannot be configured; pass "
+                "free_end_gaps=False to align with penalised end gaps.")
     return aligner
 
 
@@ -1019,8 +1039,15 @@ class AtomRef:
     reporting without guessing.
     """
 
-    __slots__ = ("coord", "name", "chain_name", "res_seq", "res_icode",
-                 "resname", "res_index")
+    __slots__ = (
+        "chain_name",
+        "coord",
+        "name",
+        "res_icode",
+        "res_index",
+        "res_seq",
+        "resname",
+    )
 
     def __init__(self, coord, name, chain_name, res_seq, res_icode, resname,
                  res_index):

@@ -1,40 +1,118 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdb_align"
-version = "0.3.0"
+version = "0.4.0"
 description = "Protein structure alignment and prediction-model assessment (TM-score, lDDT, GDT, DockQ, epitope metrics, pDockQ)."
-requires-python = ">=3.9"
-dependencies = [
-    "numpy<2.0",
-    "pandas",
-    "scipy",
-    "scikit-learn",
-    "biopython",
-    "gemmi",
-    "numba",
-    "requests",
-    "matplotlib",
+readme = "README.md"
+requires-python = ">=3.10"
+# PEP 639 SPDX expression; the matching trove classifier is deliberately
+# absent because setuptools rejects having both.
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "COPYRIGHT"]
+authors = [{ name = "Dawid Zyla" }]
+keywords = [
+    "structural biology", "protein structure", "structure alignment",
+    "TM-score", "lDDT", "GDT_TS", "DockQ", "AlphaFold", "epitope",
+    "cryo-EM", "bioinformatics",
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+# numpy is unpinned: the <2.0 cap existed only because numba used to need it,
+# and numba is no longer a hard dependency (see [speed]).
+dependencies = [
+    "numpy>=1.23",
+    "pandas>=1.5",
+    "scipy>=1.9",
+    "scikit-learn>=1.1",
+    "biopython>=1.80",
+    "gemmi>=0.6",
+    "requests>=2.28",
+    "matplotlib>=3.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/dzyla/pdb_align"
+Source = "https://github.com/dzyla/pdb_align"
+Issues = "https://github.com/dzyla/pdb_align/issues"
+Methods = "https://github.com/dzyla/pdb_align/blob/main/docs/METHODS.md"
+Changelog = "https://github.com/dzyla/pdb_align/blob/main/CHANGELOG.md"
 
 [project.scripts]
 pdb_align = "pdb_align.__main__:main"
 
 [project.optional-dependencies]
-app = [
-    "streamlit", "py3Dmol", "stmol", "plotly", "seaborn", "streamlit-molstar"
-]
-# CDR annotation (IMGT numbering). anarci also needs an HMMER 3.3.x `hmmscan`
-# on PATH (e.g. `conda install -c bioconda 'hmmer=3.3*'`); HMMER >= 3.4 text
-# output is not parsed correctly by anarci's Biopython parser.
+# JIT acceleration of the sequence-free distance-matrix kernels. Optional: the
+# package produces identical numbers without it (tests/test_optional_numba.py),
+# just slower on those paths.
+speed = ["numba>=0.57"]
+# Streamlit front-end.
+app = ["streamlit>=1.30", "py3Dmol", "stmol", "plotly>=5", "streamlit-molstar"]
+# IMGT CDR annotation. anarci also needs an HMMER 3.3.x `hmmscan` on PATH
+# (e.g. `conda install -c bioconda 'hmmer=3.3*'`); HMMER >= 3.4 changed its
+# text output and anarci's parser does not read it.
 antibody = ["anarci"]
+# Reference implementations used by tests/test_golden_crossvalidation.py to
+# cross-validate our numbers. Not needed to use the package.
+validation = ["DockQ>=2.1", "tmtools>=0.3"]
+test = ["pytest>=7", "pdb_align[speed,validation]"]
+dev = ["pdb_align[speed,app,validation,test]", "ruff>=0.5"]
 
 [tool.setuptools]
 packages = ["pdb_align"]
 
+[tool.setuptools.package-data]
+pdb_align = ["py.typed"]
+
 [tool.pytest.ini_options]
 # Put the repo root on sys.path so tests can import the app-level `webapp`
-# package (shipped alongside struct_pair_align.py, not inside the installed pkg).
-pythonpath = ["."]
+# package (shipped alongside struct_pair_align.py, not inside the installed
+# package) and the shared `_synthetic` fixtures.
+pythonpath = [".", "tests"]
+testpaths = ["tests"]
+filterwarnings = [
+    # A warning the package raises on purpose must never be silently lost.
+    "error::DeprecationWarning:pdb_align.*",
+]
+
+[tool.ruff]
+line-length = 90
+target-version = "py310"
+
+[tool.ruff.lint]
+# F catches real defects (unused imports, shadowed names, f-strings with no
+# placeholders); E/W, I, B, C4 and RUF catch the rest. The typing
+# modernisation rules are off on purpose: rewriting every `Optional[X]` in a
+# scientific codebase buys nothing and would bury the reviewable history.
+select = ["E", "F", "W", "I", "B", "C4", "RUF"]
+ignore = [
+    "E501",    # long lines are a formatter concern
+    "E701",    # `if x: return` one-liners are used deliberately for guards
+    "E741",    # `l` reads fine as a length in this domain
+    "B008",    # numpy arrays as argument defaults
+    "B905",    # zip(strict=) — the pairs here are equal-length by construction
+    "C408",    # dict() calls read better than literals for keyword-ish data
+    "RUF002",  # non-ASCII in docstrings: the angstrom sign is the point
+    "RUF003",
+    "RUF005",  # unpacking over concatenation: no clearer here
+    "E702",    # compact `a = 1; b = 2` setup lines, used throughout the tests
+    "RUF022",  # __all__ is grouped by topic, not alphabetised
+    "RUF001",  # "Ca" is a calcium ion; the alpha carbon is written Cα
+    "RUF059",  # `_, _, rmsd = kabsch(...)` reads better than index juggling
+    "E402",    # a few deliberate post-logger imports
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F401"]

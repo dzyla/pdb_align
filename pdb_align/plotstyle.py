@@ -1,5 +1,6 @@
 """Nature-journal-style matplotlib defaults for pdb_align figures."""
 from contextlib import contextmanager
+from typing import Optional
 
 # Okabe-Ito colorblind-safe categorical palette.
 PALETTE = [
@@ -42,7 +43,7 @@ def apply_nature_style():
         yield
 
 
-def nature_figure(width: str = "single", height: float = None):
+def nature_figure(width: str = "single", height: Optional[float] = None):
     """Return (fig, ax) sized to a Nature column width at 300 dpi."""
     import matplotlib.pyplot as plt
     w_in = _WIDTH_MM.get(width, _WIDTH_MM["single"]) / _MM_PER_INCH

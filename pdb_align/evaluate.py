@@ -20,10 +20,12 @@ import numpy as np
 import pandas as pd
 
 from .aligner import PDBAligner, _map_parallel, _resolve_workers
+from .confidence import compute_pdockq2, find_confidence_files, load_confidence
 from .interface import (
-    compute_dockq, epitope_metrics, compute_pdockq, capri_class,
+    compute_dockq,
+    compute_pdockq,
+    epitope_metrics,
 )
-from .confidence import load_confidence, find_confidence_files, compute_pdockq2
 
 
 @dataclass
