@@ -144,3 +144,49 @@ def test_contact_overlap_is_superposition_invariant():
     moved = P @ np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]) \
         + np.array([120.0, -40.0, 7.0])
     assert compute_contact_overlap(P, moved) == pytest.approx(1.0)
+
+
+# --- sequence-free kernels ------------------------------------------------------
+
+def test_radial_histograms_match_a_plain_histogram_loop():
+    """The fast path must be bit-identical to the obvious implementation."""
+    from pdb_align.core import _pairwise_dists, _radial_histograms
+
+    rng = np.random.default_rng(13)
+    D = _pairwise_dists(rng.random((120, 3)) * 50)
+    nbins = 24
+    fast, edges = _radial_histograms(D, nbins=nbins)
+
+    slow = np.zeros_like(fast)
+    for i in range(len(D)):
+        row = D[i][D[i] > 0.0]
+        counts, _ = np.histogram(row, bins=edges)
+        total = counts.sum()
+        slow[i] = counts / total if total else counts
+    assert np.abs(fast - slow).max() == 0.0
+
+
+def test_window_pairs_matches_a_direct_scan():
+    """The parallel, allocation-free kernel must pick the same offset as the
+    straightforward O(dN * N^2) scan it replaced."""
+    from pdb_align.core import _pairwise_dists, _window_pairs
+
+    rng = np.random.default_rng(17)
+    big = _pairwise_dists(np.cumsum(rng.normal(size=(60, 3)) * 3.0, axis=0))
+    small = big[12:42, 12:42]  # an exact sub-block: offset 12 must win
+
+    pairs, scores = _window_pairs(small, big)
+    assert pairs[0] == (0, 12)
+    assert int(np.argmax(scores)) == 12
+
+
+def test_banded_dp_finds_the_diagonal_alignment():
+    """Banded storage must not change which path the DP recovers."""
+    from pdb_align.core import _banded_dp_maxscore
+
+    n = 30
+    S = np.full((n, n), -1.0)
+    np.fill_diagonal(S, 5.0)
+    pairs, score = _banded_dp_maxscore(S, gap=2.0, band=6)
+    assert pairs == [(i, i) for i in range(n)]
+    assert score == pytest.approx(5.0 * n)

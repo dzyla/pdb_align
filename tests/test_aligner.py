@@ -194,38 +194,40 @@ def test_flexible_alignment_produces_domains(tmp_path):
     assert result.rmsd is not None
     assert result.rmsd >= 0.0
 
+class _StubResult:
+    """Stand-in carrying a chosen per-residue RMSD vector.
+
+    EnsembleResult only needs rmsd / tm_score / get_rmsd_df / summary_stats, so
+    the stub implements exactly those. It deliberately does NOT subclass
+    AlignmentResult: inheriting without running its __init__ produced a half-
+    built object whose missing attributes surfaced as AttributeError from
+    production code the moment that code touched a new field.
+    """
+
+    def __init__(self, per_res_rmsd, tm_score=0.8):
+        import numpy as np
+        self._per_res = np.asarray(per_res_rmsd, dtype=float)
+        self.rmsd = float(self._per_res.mean())
+        self.tm_score = tm_score
+        self.domains = None
+
+    def get_rmsd_df(self, on="reference"):
+        import pandas as pd
+        n = len(self._per_res)
+        return pd.DataFrame({
+            "Residue": [f"A:{i+1}" for i in range(n)],
+            "Chain": ["A"] * n,
+            "RMSD": self._per_res,
+        })
+
+    def summary_stats(self):
+        return {"rmsd": self.rmsd, "tm_score": self.tm_score, "gdt_ts": None,
+                "lddt_ca": None, "coverage_pct": 100.0,
+                "n_aligned": len(self._per_res)}
+
+
 def _make_mock_result(rmsd_vals, tm_score=0.8):
-    """Build a minimal AlignmentResult-like mock for EnsembleResult testing."""
-    class MockResult(AlignmentResult):
-        def __init__(self, per_res_rmsd, rmsd_val, tm):
-            self._per_res = per_res_rmsd
-            self._rmsd_val = rmsd_val
-            self._tm = tm
-            self.domains = None
-            self.ref_lens = {"A": len(per_res_rmsd)}
-            self.mob_lens = {"A": len(per_res_rmsd)}
-            self._chosen = {"seqguided": None, "seqfree": None, "name": "mock", "reason": ""}
-            self.verbose = False
-
-        @property
-        def rmsd(self):
-            return self._rmsd_val
-
-        @property
-        def tm_score(self):
-            return self._tm
-
-        def get_rmsd_df(self, on="reference"):
-            import pandas as pd
-            import numpy as np
-            n = len(self._per_res)
-            return pd.DataFrame({
-                "Residue": [f"A:{i+1}" for i in range(n)],
-                "Chain": ["A"] * n,
-                "RMSD": np.array(self._per_res, dtype=float),
-            })
-
-    return MockResult(rmsd_vals, rmsd_val=float(sum(rmsd_vals)/len(rmsd_vals)), tm=tm_score)
+    return _StubResult(rmsd_vals, tm_score=tm_score)
 
 
 def test_ensemble_result_summary():
@@ -234,7 +236,8 @@ def test_ensemble_result_summary():
     r2 = _make_mock_result([2.0, 1.5, 1.8])
     ens = EnsembleResult(results=[r1, r2], labels=["model_1", "model_2"])
     df = ens.summary()
-    assert list(df.columns) == ["model", "rmsd", "tm_score", "gdt_ts", "n_aligned"]
+    assert list(df.columns) == ["model", "rmsd", "tm_score", "gdt_ts",
+                                "lddt_ca", "coverage_pct", "n_aligned"]
     assert len(df) == 2
     assert df.loc[0, "model"] == "model_1"
 

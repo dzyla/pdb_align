@@ -107,3 +107,12 @@ def test_gdt_normalization_follows_the_filtered_selection():
         assert res.summary_stats()["coverage_pct"] == pytest.approx(100.0)
     finally:
         os.unlink(path)
+
+
+def test_contact_overlap_is_opt_in_and_superposition_free():
+    """It is an O(N^2) comparison (peaking near 900 MB at 6000 residues) that
+    no report shows, so it must not run as part of every alignment — but it
+    must still be available."""
+    res = pdb_align.align(UBQ, UBQ, chains_ref=["A"], chains_mob=["A"])
+    assert "contact_overlap" not in res.summary_stats()
+    assert res.contact_overlap() == pytest.approx(1.0)

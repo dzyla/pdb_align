@@ -361,6 +361,27 @@ class AlignmentResult:
         self._lddt_cache = float(calculate_lddt(P, Q))
         return self._lddt_cache
 
+    def contact_overlap(self, contact_dist: float = 8.0) -> Optional[float]:
+        """Jaccard index of the two CA contact maps over the matched residues.
+
+        Superposition-free, so it measures whether the same residues are
+        neighbours in both structures rather than whether they superimpose.
+        Computed on demand and cached: it is an O(N^2) comparison that used to
+        run on every alignment (peaking near 900 MB at 6000 residues) while
+        appearing in no report.
+
+        Not the CAD-score of Olechnovic & Venclovas, which is defined on
+        Voronoi contact *areas* over heavy atoms.
+        """
+        if self._contact_overlap_cache is not None:
+            return self._contact_overlap_cache
+        P, Q = self._matched_ca_coords()
+        if P is None or len(P) < 3:
+            return None
+        self._contact_overlap_cache = float(
+            compute_contact_overlap(P, Q, contact_dist=contact_dist))
+        return self._contact_overlap_cache
+
     @property
     def tm_pvalue(self) -> Optional[float]:
         """
@@ -1105,28 +1126,22 @@ class EnsembleResult:
         return self._feature_matrix
 
     def summary(self) -> pd.DataFrame:
-        """DataFrame with columns: model, rmsd, tm_score, gdt_ts, n_aligned."""
+        """One row per model: rmsd, tm_score, gdt_ts, lddt_ca, coverage, n_aligned.
+
+        Reads from each result's ``summary_stats()`` so it works for results
+        computed in this process and for those returned by a worker process.
+        """
         rows = []
         for label, result in zip(self.labels, self.results):
-            gdt_ts = None
-            sg = result._chosen.get("seqguided")
-            sf = result._chosen.get("seqfree")
-            if sg and sg.get("si"):
-                gdt_ts = sg["si"].get("gdt_ts")
-            elif sf:
-                gdt_ts = getattr(sf, "gdt_ts", None)
-
-            try:
-                n_aligned = len(result.get_rmsd_df())
-            except Exception:
-                n_aligned = None
-
+            s = result.summary_stats()
             rows.append({
                 "model": label,
-                "rmsd": result.rmsd,
-                "tm_score": result.tm_score,
-                "gdt_ts": gdt_ts,
-                "n_aligned": n_aligned,
+                "rmsd": s.get("rmsd"),
+                "tm_score": s.get("tm_score"),
+                "gdt_ts": s.get("gdt_ts"),
+                "lddt_ca": s.get("lddt_ca"),
+                "coverage_pct": s.get("coverage_pct"),
+                "n_aligned": s.get("n_aligned"),
             })
         return pd.DataFrame(rows)
 
@@ -1287,6 +1302,155 @@ class EnsembleResult:
         preview = self.labels[:3]
         suffix = "..." if n > 3 else ""
         return f"<EnsembleResult n_models={n} labels={preview}{suffix}>"
+
+
+def _resolve_workers(workers: Optional[int], n_tasks: int) -> int:
+    """Worker count: ``-1``/``None`` means all cores, never more than tasks."""
+    if n_tasks <= 1:
+        return 1
+    if workers is None or workers < 0:
+        workers = os.cpu_count() or 1
+    return max(1, min(int(workers), n_tasks))
+
+
+#: Start methods tried in order. ``forkserver`` forks workers from a clean,
+#: single-threaded server process, which avoids the classic deadlock where a
+#: plain ``fork`` copies a numpy/BLAS thread lock mid-operation and the child
+#: blocks on it forever. ``spawn`` is the Windows fallback (and the macOS
+#: default). Plain ``fork`` is last: it is the only one that works when
+#: ``__main__`` is not importable, but it carries that deadlock risk.
+_START_METHODS = ("forkserver", "spawn", "fork")
+
+
+def _process_pool(n_workers: int, start_method: Optional[str] = None):
+    """A ``ProcessPoolExecutor`` using the safest available start method."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+    methods = (start_method,) if start_method else _START_METHODS
+    available = multiprocessing.get_all_start_methods()
+    ctx = None
+    for name in methods:
+        if name in available:
+            ctx = multiprocessing.get_context(name)
+            break
+    return ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx)
+
+
+def _map_parallel(func, payloads, n_workers, what, start_method=None):
+    """Map *func* over *payloads* in worker processes, falling back to serial.
+
+    ``forkserver``/``spawn`` require the calling ``__main__`` module to be
+    importable, which it is not for code piped into the interpreter, in some
+    notebook setups, or when a parallel call is made from inside another
+    worker. That surfaces as ``BrokenProcessPool`` — a crash in place of a
+    result. Since parallelism here is only ever an optimisation, the work is
+    redone in process with a warning that says what to do about it: the numbers
+    are identical, only slower.
+    """
+    try:
+        with _process_pool(n_workers, start_method) as pool:
+            return list(pool.map(func, payloads))
+    except Exception as exc:
+        warnings.warn(
+            f"{what}: could not run on {n_workers} worker processes "
+            f"({type(exc).__name__}: {exc}); continuing in this process. "
+            f"Parallel execution needs the calling module to be importable — "
+            f"put the call under `if __name__ == \"__main__\":` in a script "
+            f"file. Results are unaffected.",
+            UserWarning, stacklevel=3)
+        return [func(p) for p in payloads]
+
+
+def _ensemble_worker(payload: dict) -> dict:
+    """Align one mobile structure in a worker process.
+
+    Returns only picklable data: AlignmentResult holds a ``gemmi.Structure``,
+    which cannot cross a process boundary, so the per-residue table, the
+    summary and the coordinates come back instead and the parent rebuilds a
+    read-only view (:class:`_RemoteAlignmentResult`).
+    """
+    try:
+        aligner = PDBAligner(verbose=False)
+        aligner.add_reference(payload["ref_file"], chains=payload["chains_ref"])
+        aligner.add_mobile(payload["mob_file"], chains=payload["chains_mob"])
+        res = aligner.align(**payload["kwargs"])
+        out_dir = payload.get("out_dir")
+        if out_dir:
+            name = os.path.basename(aligner.mob_file or payload["mob_file"])
+            res.save_aligned_pdb(os.path.join(out_dir, f"aligned_{name}"))
+        coords = res.get_aligned_coords()
+        ref_c, mob_c = coords if coords is not None else (None, None)
+        df = res.get_rmsd_df()
+        return {
+            "meta": res.summary_stats(),
+            "quality": res.quality.to_dict(),
+            "residues": df["Residue"].tolist(),
+            "chains": df["Chain"].tolist(),
+            "rmsd_values": df["RMSD"].to_numpy(dtype=float),
+            "per_chain": res.per_chain.to_dict(orient="records"),
+            "ref_coords": np.asarray(ref_c) if ref_c is not None else None,
+            "mob_coords": np.asarray(mob_c) if mob_c is not None else None,
+            "strategy": res.strategy,
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+class _RemoteAlignmentResult:
+    """Read-only AlignmentResult view rebuilt from a worker's return value.
+
+    Exposes what ensemble analysis needs (``rmsd``, ``tm_score``,
+    ``get_rmsd_df``, ``summary_stats``, ``per_chain``, ``quality``, ``report``)
+    and nothing that would require the original structures.
+    """
+
+    def __init__(self, payload: dict):
+        self._meta = payload["meta"]
+        self._quality = payload.get("quality") or {}
+        self._df = pd.DataFrame({"Residue": payload["residues"],
+                                 "Chain": payload["chains"],
+                                 "RMSD": payload["rmsd_values"]})
+        self._per_chain = pd.DataFrame(
+            payload.get("per_chain") or [],
+            columns=["chain_ref", "chain_mob", "n_residues", "rmsd"])
+        self.ref_coords = payload.get("ref_coords")
+        self.mob_coords_aligned = payload.get("mob_coords")
+        self.strategy = payload.get("strategy")
+        self.rmsd = self._meta.get("rmsd")
+        self.tm_score = self._meta.get("tm_score")
+        self.domains = None
+
+    def summary_stats(self):
+        return dict(self._meta)
+
+    def get_rmsd_df(self, on: str = "reference"):
+        return self._df.copy()
+
+    @property
+    def per_chain(self):
+        return self._per_chain
+
+    @property
+    def quality(self):
+        from .interpretation import AlignmentQuality
+        return AlignmentQuality(
+            band=self._quality.get("band", "moderate"),
+            verdict=self._quality.get("verdict", ""),
+            confidence=self._quality.get("confidence", "low"),
+            flagged_regions=[], warnings=list(self._quality.get("warnings", [])))
+
+    def get_aligned_coords(self):
+        if self.ref_coords is None:
+            return None
+        return self.ref_coords, self.mob_coords_aligned
+
+    report = AlignmentResult.report
+    plot_rmsd = AlignmentResult.plot_rmsd
+    plot_summary = AlignmentResult.plot_summary
+
+    def __repr__(self):
+        return (f"<AlignmentResult(from worker) RMSD: {self.rmsd:.3f}Å, "
+                f"Method: {self._meta.get('method')}>")
 
 
 def _process_single_alignment(task_payload: dict):
@@ -2004,54 +2168,90 @@ class PDBAligner:
         Parameters
         ----------
         mob_list : list[str]
-            Paths to mobile PDB/CIF files, or remote IDs (``pdb:XXXX``, ``af:UniProtID``).
+            Paths to mobile PDB/CIF files, or remote IDs (``pdb:XXXX``,
+            ``af:UniProtID``).
         mode : str
             Alignment mode forwarded to :meth:`align`. Default ``"auto"``.
         atoms : str
             Atom selection forwarded to :meth:`align`. Default ``"CA"``.
         workers : int
-            Reserved for future parallel execution. Currently unused. Default ``1``.
+            Worker processes. ``1`` runs in-process; ``>1`` or ``-1`` (all
+            cores) spreads the models over a process pool. Models are
+            independent, so this scales nearly linearly — the usual ensemble is
+            tens to hundreds of models and used to run strictly serially.
         out_dir : str | None
-            If given, each aligned mobile PDB is saved here as ``aligned_<filename>``.
+            If given, each aligned mobile structure is saved here as
+            ``aligned_<filename>``.
         **kwargs
             Additional keyword arguments forwarded to :meth:`align`.
 
         Returns
         -------
         EnsembleResult
+
+        Notes
+        -----
+        A model that fails is reported with a ``UserWarning`` and left out of
+        the result rather than aborting the run.
         """
         if not self.ref_file:
-            raise ValueError("Reference structure must be loaded before calling align_ensemble().")
-
+            raise ValueError("Reference structure must be loaded before "
+                             "calling align_ensemble().")
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
 
-        results = []
-        labels = []
+        n_workers = _resolve_workers(workers, len(mob_list))
+        align_kwargs = dict(mode=mode, atoms=atoms, **kwargs)
 
+        if n_workers > 1:
+            return self._align_ensemble_parallel(mob_list, align_kwargs,
+                                                 n_workers, out_dir)
+
+        results, labels = [], []
         for mob_path in mob_list:
-            label = mob_path  # preserve original input as label
             try:
                 self.add_mobile(mob_path)
-                # Use the resolved local path for filesystem operations
                 safe_fname = os.path.basename(self.mob_file or mob_path)
-                res = self.align(mode=mode, atoms=atoms, **kwargs)
+                res = self.align(**align_kwargs)
                 if out_dir:
-                    out_pdb = os.path.join(out_dir, f"aligned_{safe_fname}")
-                    res.save_aligned_pdb(out_pdb)
+                    res.save_aligned_pdb(os.path.join(out_dir,
+                                                      f"aligned_{safe_fname}"))
                 results.append(res)
-                labels.append(label)
+                labels.append(mob_path)
                 if self.verbose:
-                    print(f"align_ensemble: {label} → RMSD={res.rmsd:.3f} Å")
+                    print(f"align_ensemble: {mob_path} → RMSD={res.rmsd:.3f} Å")
             except Exception as exc:
-                warnings.warn(
-                    f"align_ensemble: skipping '{label}' — {exc}",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                if self.verbose:
-                    print(f"align_ensemble: {label} failed — {exc}")
+                warnings.warn(f"align_ensemble: skipping {mob_path!r} — {exc}",
+                              UserWarning, stacklevel=2)
+        return EnsembleResult(results=results, labels=labels)
 
+    def _align_ensemble_parallel(self, mob_list, align_kwargs, n_workers, out_dir):
+        """Run the ensemble over a process pool.
+
+        Only the per-model *inputs* cross the process boundary; each worker
+        parses the reference itself. AlignmentResult holds a gemmi.Structure,
+        which does not pickle, so workers return the plain arrays and tables
+        the result is rebuilt from.
+        """
+        payloads = [
+            {"ref_file": self.ref_file, "chains_ref": self.chains_ref,
+             "chains_mob": self.chains_mob, "mob_file": mob,
+             "kwargs": align_kwargs, "out_dir": out_dir}
+            for mob in mob_list
+        ]
+        results, labels = [], []
+        outcomes = _map_parallel(_ensemble_worker, payloads, n_workers,
+                                 "align_ensemble")
+        for mob_path, payload in zip(mob_list, outcomes):
+            if payload.get("error"):
+                warnings.warn(f"align_ensemble: skipping {mob_path!r} — "
+                              f"{payload['error']}", UserWarning, stacklevel=3)
+                continue
+            results.append(_RemoteAlignmentResult(payload))
+            labels.append(mob_path)
+            if self.verbose:
+                print(f"align_ensemble: {mob_path} → "
+                      f"RMSD={payload['meta']['rmsd']:.3f} Å")
         return EnsembleResult(results=results, labels=labels)
 
     def batch_align_iter(self, mob_dir: str, out_dir: str, mode: str = "auto", workers: int = 1, **kwargs):
