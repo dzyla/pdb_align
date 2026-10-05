@@ -1,31 +1,47 @@
-import os
 import io
+import itertools
 import logging
+import math
+import os
 import tempfile
 import warnings
-from typing import Optional, List, Union
 from dataclasses import dataclass
+from typing import List, Optional, Union
+
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-from Bio.PDB import PDBParser, MMCIFParser
-
 from .core import (
-    extract_sequences_and_lengths, _parse_path,
+    Selection,
+    _detect_hinges,
+    _kabsch,
+    _parse_chain_selector,
+    _parse_path,
+    compute_chain_similarity_matrix,
+    compute_contact_overlap,
+    extract_sequences_and_lengths,
+    paired_atoms,
+    pairs_from_alignment,
+    perform_sequence_alignment,
+    pick_best_overall,
+    select_residues,
     sequence_independent_alignment_joined_v2,
-    perform_sequence_alignment, get_aligned_atoms_by_alignment,
-    superimpose_atoms, pick_best_overall, compute_chain_similarity_matrix,
-    _detect_hinges, _kabsch,
+    superimpose_atoms,
 )
-from .exceptions import ParsingError, ChainNotFoundError
-from .metrics import compute_d0, tm_optimal_superposition, calculate_lddt
+from .exceptions import ChainNotFoundError
+from .metrics import calculate_lddt, tm_optimal_superposition
 
-class AlignmentFailedError(Exception):
-    """Raised when the alignment fails to produce a viable result."""
-    pass
+
+class AlignmentFailedError(ValueError):
+    """Raised when the alignment cannot produce a usable result.
+
+    Subclasses :class:`ValueError` so a caller can catch every "this request
+    cannot be answered" condition — an empty selection, an unknown chain, a
+    superposition with no residues — with one ``except ValueError``.
+    """
 
 @dataclass
 class DomainResult:
@@ -62,6 +78,11 @@ class AlignmentResult:
         self._per_chain = None  # optional DataFrame set by multi-chain path
         self._tm_cache = {}     # normalize_by -> TM-optimal score
         self._lddt_cache = None
+        self._contact_overlap_cache = None
+        # The selections the comparison was actually made on (post-filter), so
+        # every reported length, coverage and normalisation refers to them.
+        self.ref_selection: Optional[Selection] = None
+        self.mob_selection: Optional[Selection] = None
 
     @property
     def per_chain(self):
@@ -90,7 +111,8 @@ class AlignmentResult:
                 {"ref": p[0], "mob": p[1], "identity": round(float(p[2]), 1)}
                 for p in self.chain_mapping.pairs
             ]
-        return {
+        multi = len(self.ref_lens) > 1
+        stats = {
             "method": self._chosen.get("name"),
             "strategy": self.strategy,
             "reason": self._chosen.get("reason"),
@@ -98,14 +120,23 @@ class AlignmentResult:
             "tm_score": self.tm_score,
             "tm_score_min": self.get_tm_score("min"),
             "tm_pvalue": self.tm_pvalue,
+            # TM-score is a single-chain measure; say what it was normalized by
+            # so a complex-level value is never mistaken for a per-chain one.
+            "tm_scope": "complex" if multi else "chain",
+            "tm_normalization_length": sum(self.ref_lens.values()),
             "gdt_ts": gdt,
             "lddt_ca": self.lddt_ca,
             "n_aligned": n_aligned,
             "coverage_pct": coverage,
             "chain_mapping": mapping,
+            "chain_mapping_warnings": list(
+                getattr(self.chain_mapping, "warnings", []) or []),
             "ref_file": self.ref_file,
             "mob_file": self.mob_file,
         }
+        if multi:
+            stats["tm_score_per_chain"] = self.tm_score_per_chain()
+        return stats
 
     @property
     def quality(self):
@@ -139,6 +170,10 @@ class AlignmentResult:
             per_residue=per_residue, chain_mapping=s.get("chain_mapping"),
             candidate_rmsds=cand, hinge_regions=hinge,
             tm_pvalue=self.tm_pvalue,
+            mapping_warnings=s.get("chain_mapping_warnings"),
+            tm_scope=s.get("tm_scope"),
+            tm_normalization_length=s.get("tm_normalization_length"),
+            tm_per_chain_available=bool(s.get("tm_score_per_chain")),
         )
 
     def to_dict(self) -> dict:
@@ -169,8 +204,11 @@ class AlignmentResult:
         lines.append(f" Method    : {s['method']}  (strategy: {s['strategy']})")
         lines.append("-" * 52)
         lines.append(f" RMSD          : {fmt_num(s['rmsd'], '.3f')} A")
-        lines.append(f" TM-score      : {fmt_num(s['tm_score'], '.4f')}"
-                     + (f"  (p = {s['tm_pvalue']:.2g})" if s.get('tm_pvalue') is not None else ""))
+        tm_label = ("TM-score (cplx)" if s.get("tm_scope") == "complex"
+                    else "TM-score      ")
+        lines.append(f" {tm_label}: {fmt_num(s['tm_score'], '.4f')}"
+                     + (f"  (p = {s['tm_pvalue']:.2g})"
+                        if s.get('tm_pvalue') is not None else ""))
         lines.append(f" GDT_TS*       : {fmt_num(s['gdt_ts'], '.2f')}")
         lines.append(f" lDDT-Ca       : {fmt_num(s.get('lddt_ca'), '.3f')}  (matched residues)")
         lines.append(f" Aligned res   : {s['n_aligned'] if s['n_aligned'] is not None else 'n/a'}")
@@ -183,10 +221,14 @@ class AlignmentResult:
         df = self.per_chain
         if not df.empty:
             lines.append("-" * 52)
-            lines.append(" Per-chain RMSD:")
+            per_tm = s.get("tm_score_per_chain") or {}
+            lines.append(" Per-chain RMSD" + (" / TM" if per_tm else "") + ":")
             for _, r in df.iterrows():
+                tm = per_tm.get(str(r['chain_ref']))
+                suffix = f"  TM={tm:.3f}" if tm is not None else ""
                 lines.append(f"   {r['chain_ref']}->{r['chain_mob']}: "
-                             f"{r['rmsd']:.3f} A ({int(r['n_residues'])} res)")
+                             f"{r['rmsd']:.3f} A ({int(r['n_residues'])} res)"
+                             f"{suffix}")
         q = self.quality
         lines.append("-" * 52)
         lines.append(f" Quality   : {q.band.upper()}  (confidence: {q.confidence})")
@@ -208,12 +250,16 @@ class AlignmentResult:
 
     @property
     def rmsd(self) -> Optional[float]:
-        # flexible mode: weighted average of domain RMSDs by residue count
+        # Flexible mode: combine the per-domain RMSDs over all domain residues.
+        # RMSDs are root-mean-*square* deviations, so they combine in
+        # quadrature; an arithmetic mean of 1 A and 5 A reports 3.0 A where the
+        # actual deviation over the union of both domains is 3.6 A.
         if self.domains is not None:
             total = sum(d.n_residues for d in self.domains)
             if total == 0:
                 return None
-            return sum(d.rmsd * d.n_residues for d in self.domains) / total
+            ss = sum((d.rmsd ** 2) * d.n_residues for d in self.domains)
+            return math.sqrt(ss / total)
         if self._chosen["seqguided"]:
             return self._chosen["seqguided"]["si"]["rmsd"]
         elif self._chosen["seqfree"]:
@@ -234,14 +280,11 @@ class AlignmentResult:
         """
         import numpy as np
         if self._chosen["seqguided"]:
-            ref_atoms = self._chosen["seqguided"]["ref_atoms"]
-            mob_atoms = self._chosen["seqguided"]["mob_atoms"]
-            ca_idx = [i for i, a in enumerate(ref_atoms) if a.get_name() == "CA"]
-            if not ca_idx:
+            si = self._chosen["seqguided"]["si"]
+            P, Q = si.get("ca_ref"), si.get("ca_mob")
+            if P is None or len(P) == 0:
                 return None, None
-            P = np.array([ref_atoms[i].get_coord() for i in ca_idx])
-            Q = np.array([mob_atoms[i].get_coord() for i in ca_idx])
-            return P, Q
+            return np.asarray(P), np.asarray(Q)
         elif self._chosen["seqfree"]:
             sf = self._chosen["seqfree"]
             if not sf.pairs:
@@ -286,6 +329,35 @@ class AlignmentResult:
         self._tm_cache[normalize_by] = float(tm)
         return float(tm)
 
+    def tm_score_per_chain(self) -> dict:
+        """TM-score of each mapped chain pair, normalized by that reference chain.
+
+        TM-score is defined for a single chain against a single chain: its
+        normalization length and its ``d0`` both come from one chain's length.
+        Applied to a whole complex it is still a monotone similarity measure,
+        but it is not comparable with a published per-chain TM-score, and a
+        well-modelled large chain can mask a badly placed small one. Reporting
+        both is the honest option, so the complex-level value is labelled as
+        such and these per-chain values sit next to it.
+        """
+        out: dict = {}
+        if not self._chosen.get("seqguided"):
+            return out
+        si = self._chosen["seqguided"]["si"]
+        chains = si.get("residue_chains")
+        ca_ref, ca_mob = si.get("ca_ref"), si.get("ca_mob")
+        if not chains or ca_ref is None or len(ca_ref) != len(chains):
+            return out
+        chains = np.asarray(chains)
+        for chain in dict.fromkeys(chains.tolist()):
+            m = chains == chain
+            L = self.ref_lens.get(chain)
+            if not L or L <= 15 or m.sum() < 3:
+                continue
+            tm, _R, _t = tm_optimal_superposition(ca_ref[m], ca_mob[m], L)
+            out[str(chain)] = float(tm)
+        return out
+
     @property
     def lddt_ca(self) -> Optional[float]:
         """lDDT-Ca over the matched residues (Mariani et al. 2013).
@@ -301,6 +373,27 @@ class AlignmentResult:
             return None
         self._lddt_cache = float(calculate_lddt(P, Q))
         return self._lddt_cache
+
+    def contact_overlap(self, contact_dist: float = 8.0) -> Optional[float]:
+        """Jaccard index of the two CA contact maps over the matched residues.
+
+        Superposition-free, so it measures whether the same residues are
+        neighbours in both structures rather than whether they superimpose.
+        Computed on demand and cached: it is an O(N^2) comparison that used to
+        run on every alignment (peaking near 900 MB at 6000 residues) while
+        appearing in no report.
+
+        Not the CAD-score of Olechnovic & Venclovas, which is defined on
+        Voronoi contact *areas* over heavy atoms.
+        """
+        if self._contact_overlap_cache is not None:
+            return self._contact_overlap_cache
+        P, Q = self._matched_ca_coords()
+        if P is None or len(P) < 3:
+            return None
+        self._contact_overlap_cache = float(
+            compute_contact_overlap(P, Q, contact_dist=contact_dist))
+        return self._contact_overlap_cache
 
     @property
     def tm_pvalue(self) -> Optional[float]:
@@ -369,11 +462,16 @@ class AlignmentResult:
         chosen = self._chosen
         R = t = per_res_rmsd = None
         mob_atoms = []
+        dist_map = {}
 
         if chosen["seqguided"]:
-            R = chosen["seqguided"]["si"]["rotation"]
-            t = chosen["seqguided"]["si"]["translation"]
-            per_res_rmsd = chosen["seqguided"]["si"]["per_residue_rmsd"]
+            si = chosen["seqguided"]["si"]
+            R = si["rotation"]
+            t = si["translation"]
+            per_res_rmsd = si["per_residue_rmsd"]
+            # Residue-keyed directly: no re-derivation from atom objects.
+            keys = si.get("mob_residue_keys") or []
+            dist_map = {k: float(v) for k, v in zip(keys, per_res_rmsd) if k}
             mob_atoms = chosen["seqguided"]["mob_atoms"]
         elif chosen["seqfree"]:
             R = chosen["seqfree"].rotation
@@ -401,17 +499,13 @@ class AlignmentResult:
             else self.mob_struct.copy()
 
         write_rmsd = (color_by == "rmsd")
-        dist_map = {}
-        if write_rmsd and mob_atoms and per_res_rmsd is not None:
+        if write_rmsd and not dist_map and mob_atoms and per_res_rmsd is not None:
             for k in range(min(len(mob_atoms), len(per_res_rmsd))):
                 ma = mob_atoms[k]
-                c_name = getattr(ma, 'chain_name', getattr(ma, 'last_chain_name', 'A'))
-                if hasattr(ma, 'get_id'):
-                    het, r_seq, r_ico = ma.get_parent().get_id()
-                else:
-                    r_seq = ma.res_seq
-                    r_ico = ma.res_icode
-                key = (c_name, r_seq, r_ico.strip() if hasattr(r_ico, 'strip') else "")
+                c_name = getattr(ma, 'chain_name', 'A')
+                r_ico = getattr(ma, 'res_icode', '')
+                key = (c_name, ma.res_seq,
+                       r_ico.strip() if hasattr(r_ico, 'strip') else "")
                 dist_map[key] = float(per_res_rmsd[k])
 
         for model in out_struct:
@@ -445,13 +539,15 @@ class AlignmentResult:
 
     def _write_pymol_script(self, path, aligned_name, ref_name):
         lines = [
+            "# pdb_align: reference (grey) + mobile coloured by per-residue "
+            "deviation (B-factor column, 0-5 A)",
             f"load {ref_name}, ref",
             f"load {aligned_name}, mob",
             "hide everything",
             "show cartoon",
             "color grey70, ref",
-            "spectrum b, blue_white_red, mob",
-            "set cartoon_transparency, 0.1",
+            "spectrum b, blue_white_red, mob, minimum=0, maximum=5",
+            "set cartoon_transparency, 0.1, ref",
             "zoom",
         ]
         with open(path, "w") as f:
@@ -459,12 +555,14 @@ class AlignmentResult:
 
     def _write_chimerax_script(self, path, aligned_name, ref_name):
         lines = [
+            "# pdb_align: reference (grey) + mobile coloured by per-residue "
+            "deviation (B-factor column, 0-5 A)",
             f"open {ref_name}",
             f"open {aligned_name}",
             "hide atoms",
             "show cartoons",
             "color #1 grey",
-            "color byattribute bfactor #2 palette blue:white:red",
+            "color byattribute bfactor #2 palette blue:white:red range 0,5",
             "view",
         ]
         with open(path, "w") as f:
@@ -480,17 +578,23 @@ class AlignmentResult:
         ``fmt="zip"`` writes a ``.zip``; ``fmt="dir"`` a folder. Returns the path.
         """
         import os
+        import shutil
         import tempfile
         import zipfile
-        import shutil
-        components = include or ["aligned", "rmsd_csv", "plots", "pymol",
-                                 "chimerax", "report"]
-        ref_name = "aligned.pdb"
+        components = include or ["aligned", "reference", "rmsd_csv", "plots",
+                                 "pymol", "chimerax", "report"]
+        # The viewer scripts load the reference *and* the aligned mobile; the
+        # bundle must therefore contain both. It previously shipped only the
+        # aligned mobile and loaded it twice, so the side-by-side view the
+        # scripts promise was impossible to reproduce.
+        ref_name = "reference.pdb"
         workdir = tempfile.mkdtemp(prefix="pdb_align_bundle_")
         try:
             if "aligned" in components:
                 self.aligned_structure(color_by="rmsd").write_pdb(
                     os.path.join(workdir, "aligned.pdb"))
+            if "reference" in components:
+                self._write_reference_copy(os.path.join(workdir, ref_name))
             if "rmsd_csv" in components:
                 self.get_rmsd_df().to_csv(os.path.join(workdir, "rmsd.csv"),
                                           index=False)
@@ -525,6 +629,18 @@ class AlignmentResult:
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
+    def _write_reference_copy(self, path):
+        """Write the reference structure into a bundle as PDB.
+
+        Re-reading and re-writing (rather than copying bytes) normalises mmCIF
+        input to the PDB the viewer scripts expect and drops anything the
+        viewers cannot use.
+        """
+        import gemmi
+        struct = gemmi.read_structure(self.ref_file)
+        struct.setup_entities()
+        struct.write_pdb(path)
+
     def get_log(self) -> str:
         lines = []
         lines.append("PDB Aligner Result Log")
@@ -557,11 +673,11 @@ class AlignmentResult:
             mob_aln = ""
             from Bio.PDB.Polypeptide import protein_letters_3to1
             def to_1l(resname): return protein_letters_3to1.get(resname, 'X')
-            ref_idx_to_info = {i: info for i, info in enumerate(ref_subset)}
-            mob_idx_to_info = {i: info for i, info in enumerate(mob_subset)}
+            ref_idx_to_info = dict(enumerate(ref_subset))
+            mob_idx_to_info = dict(enumerate(mob_subset))
             matched_ref = {r for r, m in pairs}
             matched_mob = {m for r, m in pairs}
-            pair_dict = {r: m for r, m in pairs}
+            pair_dict = dict(pairs)
             r_idx, m_idx = 0, 0
             while r_idx < len(ref_subset) or m_idx < len(mob_subset):
                 if r_idx in matched_ref and m_idx in matched_mob and pair_dict.get(r_idx) == m_idx:
@@ -623,8 +739,10 @@ class AlignmentResult:
         id2p = mob_id.ljust(pad)
         mp = "Match".ljust(pad)
         from Bio.Align import substitution_matrices
-        try: blosum62 = substitution_matrices.load("BLOSUM62")
-        except: blosum62 = {}
+        try:
+            blosum62 = substitution_matrices.load("BLOSUM62")
+        except Exception:
+            blosum62 = {}
         match = ""
         for a, b in zip(seqA, seqB):
             if a == b and a != '-': match += "|"
@@ -642,24 +760,28 @@ class AlignmentResult:
         if score is not None: print(f"Alignment Score: {score}")
 
     def get_rmsd_df(self, on: str = 'reference'):
-        import pandas as pd
+        """Per-**residue** deviation table (``Residue``, ``Chain``, ``RMSD``).
+
+        One row per residue in every atom mode. With ``atoms="backbone"`` or
+        ``"all_heavy"`` the value is the RMS over that residue's matched atoms;
+        emitting one row per atom (as before) multiplied the residue count by
+        ~4 or ~8 and pushed the reported coverage to 792%.
+        """
         import numpy as np
+        import pandas as pd
         labels, chains, distances = [], [], []
         if self._chosen["seqguided"]:
-            atoms = self._chosen["seqguided"]["ref_atoms"] if on == 'reference' else self._chosen["seqguided"]["mob_atoms"]
-            per_res_rmsd = self._chosen["seqguided"]["si"]["per_residue_rmsd"]
-            for idx, a in enumerate(atoms):
-                if hasattr(a, 'chain_name'):
-                    chain = getattr(a, 'chain_name', 'A')
-                    r_seq = getattr(a, 'res_seq', '1')
-                    r_ico = getattr(a, 'res_icode', '')
-                    lbl = f"{chain}:{r_seq}{r_ico.strip()}" if str(r_ico).strip() else f"{chain}:{r_seq}"
-                else:
-                    p = a.get_parent()
-                    chain = p.get_parent().id
-                    rid = p.get_id()
-                    lbl = f"{chain}:{rid[1]}{rid[2].strip()}" if str(rid[2]).strip() else f"{chain}:{rid[1]}"
-                labels.append(lbl); chains.append(chain); distances.append(per_res_rmsd[idx])
+            si = self._chosen["seqguided"]["si"]
+            per_res_rmsd = si["per_residue_rmsd"]
+            if on == 'reference':
+                labels = list(si["residue_labels"])
+                chains = list(si["residue_chains"])
+            else:
+                labels = list(si.get("mob_residue_labels") or si["residue_labels"])
+                chains = list(si.get("mob_residue_chains") or si["residue_chains"])
+            distances = list(per_res_rmsd)
+            n = min(len(labels), len(distances))
+            labels, chains, distances = labels[:n], chains[:n], distances[:n]
         elif self._chosen["seqfree"]:
             ref_subset = self._chosen["seqfree"].ref_subset_infos
             mob_subset = self._chosen["seqfree"].mob_subset_infos
@@ -698,12 +820,21 @@ class AlignmentResult:
                 print(f"  Residue {lbl}: {dist:.3f} Å")
         return top_peaks
 
-    def plot_rmsd(self, filename: str = "rmsd.pdf", style: str = "scientific", on: str = 'reference'):
+    def plot_rmsd(self, filename: str = "rmsd.pdf", style: str = "scientific",
+                  on: str = 'reference'):
+        """Per-residue deviation plot, one line per chain.
+
+        Drawn with matplotlib only. It used to require seaborn, which is
+        declared in the ``[app]`` extra, so ``pdb_align --plot`` raised
+        ImportError on a core install.
+        """
         import contextlib
+
         import matplotlib.pyplot as plt
-        import seaborn as sns
+
         from . import plotstyle
-        try: df = self.get_rmsd_df(on=on)
+        try:
+            df = self.get_rmsd_df(on=on)
         except Exception:
             print("No data to plot.")
             return
@@ -714,35 +845,46 @@ class AlignmentResult:
             if style == "scientific":
                 style_ctx = plotstyle.apply_nature_style()
                 figsize = (89 / 25.4 * 2, 89 / 25.4 * 1.1)
-                palette = plotstyle.PALETTE[:df["Chain"].nunique()]
                 markersize, linewidth = 3, 0.9
             else:
                 style_ctx = contextlib.nullcontext()
                 figsize = (10, 4)
-                palette = None
                 markersize, linewidth = 4, 1
             with style_ctx:
                 fig, ax = plt.subplots(figsize=figsize)
-                sns.lineplot(data=df, x=df.index, y="RMSD", hue="Chain",
-                             palette=palette, marker='o', markersize=markersize,
-                             linestyle='-', linewidth=linewidth, ax=ax)
+                multi = df["Chain"].nunique() > 1
+                for i, (chain, grp) in enumerate(df.groupby("Chain", sort=False)):
+                    ax.plot(grp.index, grp["RMSD"], marker='o',
+                            markersize=markersize, linestyle='-',
+                            linewidth=linewidth,
+                            color=plotstyle.PALETTE[i % len(plotstyle.PALETTE)],
+                            label=str(chain))
+                if multi:
+                    ax.legend(frameon=False, title="Chain")
                 n_labels = len(df)
                 step = max(1, n_labels // 10)
                 ax.set_xticks(range(0, n_labels, step))
-                ax.set_xticklabels(df["Residue"].iloc[::step], rotation=45, ha='right')
+                ax.set_xticklabels(df["Residue"].iloc[::step], rotation=45,
+                                   ha='right')
                 ax.set_xlabel(f"Residue ({on.capitalize()})")
-                ax.set_ylabel(r"C$\alpha$ RMSD ($\AA$)")
-                ax.set_title("Per-Residue Structural Deviation")
-                plt.tight_layout()
-                plt.savefig(filename, bbox_inches='tight')
-                plt.close()
+                ax.set_ylabel(r"C$\alpha$ deviation ($\AA$)")
+                ax.set_title("Per-residue structural deviation")
+                fig.tight_layout()
+                fig.savefig(filename, bbox_inches='tight')
+                plt.close(fig)
 
-    def plot_summary(self, filename: str = None, show: bool = False):
-        """Compact multi-panel Nature-style summary: per-residue RMSD + per-chain bar + scores."""
-        import matplotlib
-        if not show:
-            matplotlib.use("Agg")
+    def plot_summary(self, filename: Optional[str] = None, show: bool = False):
+        """Compact two-panel summary: per-residue RMSD and per-chain RMSD.
+
+        Does not touch the matplotlib backend. Switching it from inside a
+        library is a global side effect on the caller's process: a notebook or
+        an application that had already selected an interactive backend would
+        find its figures silently stop displaying after one call here. Choosing
+        a backend is the caller's decision — the CLI makes it, before importing
+        pyplot.
+        """
         import matplotlib.pyplot as plt
+
         from . import plotstyle
         df = self.get_rmsd_df()
         stats = self.summary_stats()
@@ -780,9 +922,6 @@ class AlignmentResult:
         Generates a .pml script for PyMOL to easily visualize the alignment.
         This assumes you have saved the aligned mobile structure using `save_aligned_pdb`.
         """
-        ref_basename = os.path.basename(self.ref_file)
-        mob_basename = os.path.basename(self.mob_file)
-
         script = f"""# PyMOL Script for visualizing alignment
 # Load structures
 load {self.ref_file}, reference
@@ -896,7 +1035,9 @@ view
 
     def save(self, path: str):
         """Persist all computed data to a versioned .npz (no gemmi needed to reload)."""
-        import numpy as np, json
+        import json
+
+        import numpy as np
         df = self.get_rmsd_df()
         per_chain = self.per_chain
         meta = self.summary_stats()
@@ -934,7 +1075,10 @@ class LoadedResult:
 
     @classmethod
     def _from_npz(cls, path):
-        import numpy as np, json, pandas as pd
+        import json
+
+        import numpy as np
+        import pandas as pd
         z = np.load(path, allow_pickle=True)
         meta = json.loads(str(z["meta_json"]))
         if meta.get("_save_version") != AlignmentResult._SAVE_VERSION:
@@ -1007,28 +1151,22 @@ class EnsembleResult:
         return self._feature_matrix
 
     def summary(self) -> pd.DataFrame:
-        """DataFrame with columns: model, rmsd, tm_score, gdt_ts, n_aligned."""
+        """One row per model: rmsd, tm_score, gdt_ts, lddt_ca, coverage, n_aligned.
+
+        Reads from each result's ``summary_stats()`` so it works for results
+        computed in this process and for those returned by a worker process.
+        """
         rows = []
         for label, result in zip(self.labels, self.results):
-            gdt_ts = None
-            sg = result._chosen.get("seqguided")
-            sf = result._chosen.get("seqfree")
-            if sg and sg.get("si"):
-                gdt_ts = sg["si"].get("gdt_ts")
-            elif sf:
-                gdt_ts = getattr(sf, "gdt_ts", None)
-
-            try:
-                n_aligned = len(result.get_rmsd_df())
-            except Exception:
-                n_aligned = None
-
+            s = result.summary_stats()
             rows.append({
                 "model": label,
-                "rmsd": result.rmsd,
-                "tm_score": result.tm_score,
-                "gdt_ts": gdt_ts,
-                "n_aligned": n_aligned,
+                "rmsd": s.get("rmsd"),
+                "tm_score": s.get("tm_score"),
+                "gdt_ts": s.get("gdt_ts"),
+                "lddt_ca": s.get("lddt_ca"),
+                "coverage_pct": s.get("coverage_pct"),
+                "n_aligned": s.get("n_aligned"),
             })
         return pd.DataFrame(rows)
 
@@ -1045,7 +1183,7 @@ class EnsembleResult:
                 pairwise[j, i] = d
         return pd.DataFrame(pairwise, index=self.labels, columns=self.labels)
 
-    def cluster(self, n_clusters: int = None) -> np.ndarray:
+    def cluster(self, n_clusters: Optional[int] = None) -> np.ndarray:
         """
         K-means clustering on per-residue RMSD vectors.
 
@@ -1070,8 +1208,11 @@ class EnsembleResult:
                 km.fit(mat)
                 inertias.append(km.inertia_)
             if len(inertias) >= 2:
-                # Standard elbow: k where the drop in inertia is greatest
-                n_clusters = ks[int(np.argmax(-np.diff(inertias)))]
+                # Elbow: the k *after* the largest drop in inertia. Going from
+                # ks[i] to ks[i+1] is what buys the improvement, so the k worth
+                # keeping is ks[i+1]; taking ks[i] systematically returns one
+                # cluster too few.
+                n_clusters = ks[int(np.argmax(-np.diff(inertias))) + 1]
             else:
                 n_clusters = 2
 
@@ -1079,7 +1220,7 @@ class EnsembleResult:
         self._cluster_labels = km.fit_predict(mat)
         return self._cluster_labels
 
-    def plot_pca(self, color_by: str = "cluster", save_path: str = None):
+    def plot_pca(self, color_by: str = "cluster", save_path: Optional[str] = None):
         """
         2D PCA of per-residue RMSD vectors, one point per model.
 
@@ -1128,7 +1269,7 @@ class EnsembleResult:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         return fig
 
-    def plot_dendrogram(self, save_path: str = None):
+    def plot_dendrogram(self, save_path: Optional[str] = None):
         """Hierarchical clustering dendrogram using Ward linkage on per-residue RMSD vectors."""
         import matplotlib.pyplot as plt
         from scipy.cluster.hierarchy import dendrogram, linkage
@@ -1151,9 +1292,9 @@ class EnsembleResult:
         ``fmt="zip"`` writes a ``.zip``; ``fmt="dir"`` a folder. Returns the path.
         """
         import os
+        import shutil
         import tempfile
         import zipfile
-        import shutil
         workdir = tempfile.mkdtemp(prefix="pdb_align_ens_")
         try:
             self.summary().to_csv(os.path.join(workdir, "summary.csv"), index=False)
@@ -1189,6 +1330,189 @@ class EnsembleResult:
         preview = self.labels[:3]
         suffix = "..." if n > 3 else ""
         return f"<EnsembleResult n_models={n} labels={preview}{suffix}>"
+
+
+def _warn_on_cross_chain_pairs(ref_sel, mob_sel, pairs) -> int:
+    """Warn when a sequence-guided pairing spans a chain junction.
+
+    The single-chain path aligns the *concatenation* of the selected chains.
+    That is the right behaviour when one side is a single chain that should
+    match somewhere inside a multi-chain reference, but the junction between
+    two concatenated chains does not exist in either structure, so a pairing
+    that runs across it joins residues from different chains. The multi-chain
+    path (both sides with several chains) matches chains explicitly and is not
+    affected.
+
+    Returns the number of residue pairs whose chain assignment disagrees.
+    """
+    if len(ref_sel.chain_order) == 1 and len(mob_sel.chain_order) == 1:
+        return 0
+    ref_chains = ref_sel.chain_ids
+    mob_chains = mob_sel.chain_ids
+    seen: dict = {}
+    crossing = 0
+    for i, j in pairs:
+        rc, mc = ref_chains[i], mob_chains[j]
+        if seen.setdefault(mc, rc) != rc:
+            crossing += 1
+    if crossing:
+        warnings.warn(
+            f"{crossing} of {len(pairs)} residue pairs cross a chain junction: "
+            f"the selected chains were concatenated into one sequence, and the "
+            f"alignment ran across the boundary between them, pairing residues "
+            f"from different chains. Select one chain per side, or give both "
+            f"sides several chains so the chain-matching path is used.",
+            UserWarning, stacklevel=3)
+    return crossing
+
+
+def _resolve_workers(workers: Optional[int], n_tasks: int) -> int:
+    """Worker count: ``-1``/``None`` means all cores, never more than tasks."""
+    if n_tasks <= 1:
+        return 1
+    if workers is None or workers < 0:
+        workers = os.cpu_count() or 1
+    return max(1, min(int(workers), n_tasks))
+
+
+#: Start methods tried in order. ``forkserver`` forks workers from a clean,
+#: single-threaded server process, which avoids the classic deadlock where a
+#: plain ``fork`` copies a numpy/BLAS thread lock mid-operation and the child
+#: blocks on it forever. ``spawn`` is the Windows fallback (and the macOS
+#: default). Plain ``fork`` is last: it is the only one that works when
+#: ``__main__`` is not importable, but it carries that deadlock risk.
+_START_METHODS = ("forkserver", "spawn", "fork")
+
+
+def _process_pool(n_workers: int, start_method: Optional[str] = None):
+    """A ``ProcessPoolExecutor`` using the safest available start method."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+    methods = (start_method,) if start_method else _START_METHODS
+    available = multiprocessing.get_all_start_methods()
+    ctx = None
+    for name in methods:
+        if name in available:
+            ctx = multiprocessing.get_context(name)
+            break
+    return ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx)
+
+
+def _map_parallel(func, payloads, n_workers, what, start_method=None):
+    """Map *func* over *payloads* in worker processes, falling back to serial.
+
+    ``forkserver``/``spawn`` require the calling ``__main__`` module to be
+    importable, which it is not for code piped into the interpreter, in some
+    notebook setups, or when a parallel call is made from inside another
+    worker. That surfaces as ``BrokenProcessPool`` — a crash in place of a
+    result. Since parallelism here is only ever an optimisation, the work is
+    redone in process with a warning that says what to do about it: the numbers
+    are identical, only slower.
+    """
+    try:
+        with _process_pool(n_workers, start_method) as pool:
+            return list(pool.map(func, payloads))
+    except Exception as exc:
+        warnings.warn(
+            f"{what}: could not run on {n_workers} worker processes "
+            f"({type(exc).__name__}: {exc}); continuing in this process. "
+            f"Parallel execution needs the calling module to be importable — "
+            f"put the call under `if __name__ == \"__main__\":` in a script "
+            f"file. Results are unaffected.",
+            UserWarning, stacklevel=3)
+        return [func(p) for p in payloads]
+
+
+def _ensemble_worker(payload: dict) -> dict:
+    """Align one mobile structure in a worker process.
+
+    Returns only picklable data: AlignmentResult holds a ``gemmi.Structure``,
+    which cannot cross a process boundary, so the per-residue table, the
+    summary and the coordinates come back instead and the parent rebuilds a
+    read-only view (:class:`_RemoteAlignmentResult`).
+    """
+    try:
+        aligner = PDBAligner(verbose=False)
+        aligner.add_reference(payload["ref_file"], chains=payload["chains_ref"])
+        aligner.add_mobile(payload["mob_file"], chains=payload["chains_mob"])
+        res = aligner.align(**payload["kwargs"])
+        out_dir = payload.get("out_dir")
+        if out_dir:
+            name = os.path.basename(aligner.mob_file or payload["mob_file"])
+            res.save_aligned_pdb(os.path.join(out_dir, f"aligned_{name}"))
+        coords = res.get_aligned_coords()
+        ref_c, mob_c = coords if coords is not None else (None, None)
+        df = res.get_rmsd_df()
+        return {
+            "meta": res.summary_stats(),
+            "quality": res.quality.to_dict(),
+            "residues": df["Residue"].tolist(),
+            "chains": df["Chain"].tolist(),
+            "rmsd_values": df["RMSD"].to_numpy(dtype=float),
+            "per_chain": res.per_chain.to_dict(orient="records"),
+            "ref_coords": np.asarray(ref_c) if ref_c is not None else None,
+            "mob_coords": np.asarray(mob_c) if mob_c is not None else None,
+            "strategy": res.strategy,
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+class _RemoteAlignmentResult:
+    """Read-only AlignmentResult view rebuilt from a worker's return value.
+
+    Exposes what ensemble analysis needs (``rmsd``, ``tm_score``,
+    ``get_rmsd_df``, ``summary_stats``, ``per_chain``, ``quality``, ``report``)
+    and nothing that would require the original structures.
+    """
+
+    def __init__(self, payload: dict):
+        self._meta = payload["meta"]
+        self._quality = payload.get("quality") or {}
+        self._df = pd.DataFrame({"Residue": payload["residues"],
+                                 "Chain": payload["chains"],
+                                 "RMSD": payload["rmsd_values"]})
+        self._per_chain = pd.DataFrame(
+            payload.get("per_chain") or [],
+            columns=["chain_ref", "chain_mob", "n_residues", "rmsd"])
+        self.ref_coords = payload.get("ref_coords")
+        self.mob_coords_aligned = payload.get("mob_coords")
+        self.strategy = payload.get("strategy")
+        self.rmsd = self._meta.get("rmsd")
+        self.tm_score = self._meta.get("tm_score")
+        self.domains = None
+
+    def summary_stats(self):
+        return dict(self._meta)
+
+    def get_rmsd_df(self, on: str = "reference"):
+        return self._df.copy()
+
+    @property
+    def per_chain(self):
+        return self._per_chain
+
+    @property
+    def quality(self):
+        from .interpretation import AlignmentQuality
+        return AlignmentQuality(
+            band=self._quality.get("band", "moderate"),
+            verdict=self._quality.get("verdict", ""),
+            confidence=self._quality.get("confidence", "low"),
+            flagged_regions=[], warnings=list(self._quality.get("warnings", [])))
+
+    def get_aligned_coords(self):
+        if self.ref_coords is None:
+            return None
+        return self.ref_coords, self.mob_coords_aligned
+
+    report = AlignmentResult.report
+    plot_rmsd = AlignmentResult.plot_rmsd
+    plot_summary = AlignmentResult.plot_summary
+
+    def __repr__(self):
+        return (f"<AlignmentResult(from worker) RMSD: {self.rmsd:.3f}Å, "
+                f"Method: {self._meta.get('method')}>")
 
 
 def _process_single_alignment(task_payload: dict):
@@ -1266,6 +1590,11 @@ class PDBAligner:
         """Sets the reference structure. Alias for set_reference."""
         self.set_reference(ref_file, chains)
 
+    #: Parsed structures kept in memory. Bounded because evaluating N models
+    #: through one aligner would otherwise retain all N structures (tens of MB
+    #: each for a large complex).
+    _CACHE_MAX = 4
+
     def _load_cached_structure(self, abspath: str):
         """Return a fresh clone of the parsed structure, re-parsing if the file
         on disk changed since it was cached (keyed on mtime + size)."""
@@ -1276,7 +1605,11 @@ class PDBAligner:
             sig = None
         cached = self._struct_cache.get(abspath)
         if cached is None or cached[1] != sig:
+            while len(self._struct_cache) >= self._CACHE_MAX:
+                self._struct_cache.pop(next(iter(self._struct_cache)))
             self._struct_cache[abspath] = (_parse_path(abspath), sig)
+        else:  # mark as most recently used
+            self._struct_cache[abspath] = self._struct_cache.pop(abspath)
         return self._struct_cache[abspath][0].clone()
 
     # Network timeout (seconds) for remote structure fetches; without it a
@@ -1385,7 +1718,8 @@ class PDBAligner:
                 print(f"  Chain {ch}: {self.mob_lens.get(ch, 0)} aa")
             if self.ref_file:
                 print("\nSimilarity Matrix:")
-                id_mat, sc_mat = compute_chain_similarity_matrix(self.ref_seqs, self.mob_seqs)
+                id_mat, _sc_mat = compute_chain_similarity_matrix(
+                    self.ref_seqs, self.mob_seqs)
                 ref_chains = list(self.ref_seqs.keys())
                 mob_chains = list(self.mob_seqs.keys())
                 for i, r_ch in enumerate(ref_chains):
@@ -1413,6 +1747,13 @@ class PDBAligner:
             return None
         seq = list(chains)
         dupes = sorted({str(c) for c in seq if seq.count(c) > 1})
+        # A selector may carry a residue range ("A:10-150"); validate the chain
+        # part only. Comparing the whole selector against chain names rejected
+        # the documented range syntax outright.
+        def _chain_part(c):
+            if isinstance(c, (int, np.integer)) and not isinstance(c, bool):
+                return c
+            return _parse_chain_selector(c)[0]
         if dupes:
             raise ValueError(
                 f"{side} chain selection contains duplicate chain(s) {dupes}: {seq}. "
@@ -1423,11 +1764,15 @@ class PDBAligner:
                 f"the identity for them."
             )
         if available:
-            unknown = [str(c) for c in seq if str(c) not in {str(a) for a in available}]
+            known = {str(a) for a in available}
+            unknown = [str(c) for c in seq
+                       if not isinstance(_chain_part(c), (int, np.integer))
+                       and str(_chain_part(c)) not in known]
             if unknown:
                 raise ValueError(
                     f"{side} chain(s) {unknown} are not present in the structure "
-                    f"(available: {sorted(str(a) for a in available)})."
+                    f"(available: {sorted(known)}). Residue ranges are written "
+                    f"'CHAIN:start-end', e.g. 'A:10-150'."
                 )
         return seq
 
@@ -1449,125 +1794,128 @@ class PDBAligner:
         if self.verbose:
             print(f"Mobile chains updated to: {chains}")
 
+    # --- residue selection -------------------------------------------------
+
+    @staticmethod
+    def _looks_like_plddt(struct, chains) -> bool:
+        """True when the B-factor column plausibly holds pLDDT.
+
+        pLDDT is a confidence in [0, 100] that is high for well-predicted
+        residues; a crystallographic B-factor is a disorder measure that is
+        *low* for well-ordered ones and routinely exceeds 100 for flexible
+        loops. The two therefore demand opposite cutoffs, and applying a
+        pLDDT floor to an experimental reference discards exactly the ordered
+        core one wants to keep (and, at a typical --min-plddt 70, discards the
+        entire structure).
+
+        Heuristic, deliberately conservative: a predicted model has a high
+        mean, nothing above 100, and no exact zeros.
+        """
+        from .core import select_residues
+        try:
+            sel = select_residues(struct, chains, with_atoms=False)
+        except ValueError:
+            return False
+        b = np.array([r.b_iso for r in sel.residues], dtype=float)
+        if b.size == 0:
+            return False
+        return bool(b.max() <= 100.0 and b.mean() >= 50.0 and b.min() > 0.0)
+
+    def _build_selections(self, ref_chs, mob_chs, min_b_factor, min_plddt):
+        """Build both selections, applying ``min_plddt`` only where it means
+        something. Returns (ref_sel, mob_sel)."""
+        ref_plddt = mob_plddt = 0.0
+        if min_plddt > 0.0:
+            ref_is_pred = self._looks_like_plddt(self.ref_struct, ref_chs)
+            mob_is_pred = self._looks_like_plddt(self.mob_struct, mob_chs)
+            ref_plddt = min_plddt if ref_is_pred else 0.0
+            mob_plddt = min_plddt if mob_is_pred else 0.0
+            skipped = [name for name, pred in
+                       (("reference", ref_is_pred), ("mobile", mob_is_pred))
+                       if not pred]
+            if skipped:
+                warnings.warn(
+                    f"min_plddt={min_plddt:g} was not applied to the "
+                    f"{' and '.join(skipped)} structure: its B-factor column "
+                    f"does not look like pLDDT (predicted models carry 0-100 "
+                    f"confidences, experimental structures carry B-factors, "
+                    f"where low means well ordered). Use min_b_factor to "
+                    f"filter on B-factors explicitly.",
+                    UserWarning, stacklevel=3)
+        ref_sel = select_residues(self.ref_struct, ref_chs,
+                                  min_b_factor=min_b_factor, min_plddt=ref_plddt,
+                                  source=os.path.basename(self.ref_file or ""))
+        mob_sel = select_residues(self.mob_struct, mob_chs,
+                                  min_b_factor=min_b_factor, min_plddt=mob_plddt,
+                                  source=os.path.basename(self.mob_file or ""))
+        return ref_sel, mob_sel
+
     def align(self, mode: str = "auto", seq_gap_open: float = -10,
               seq_gap_extend: float = -0.5, atoms: str = "CA",
               min_plddt: float = 0.0, min_b_factor: float = 0.0,
               hinge_threshold: float = 3.0, hinge_window: int = 15,
               domain_min_residues: int = 30, strategy: str = "auto", **kwargs):
         """
-        Runs the alignment process.
+        Run the alignment.
 
-        :param mode: Alignment mode to use. Options include:
-            - "auto" (or "Auto (best RMSD)"): Automatically picks the best between seq-guided and seq-free.
-            - "seq_guided" (or "Sequence-guided"): Forces sequence-guided alignment.
-            - "seq_free_auto" (or "Sequence-free (auto)"): Sequence-free auto-selection between shape/window.
-            - "seq_free_shape" (or "Sequence-free (shape)"): Sequence-free using shape matching.
-            - "seq_free_window" (or "Sequence-free (window)"): Sequence-free using sliding windows.
-        :type mode: str
-        :param seq_gap_open: Gap open penalty for sequence alignment (default: -10).
-        :type seq_gap_open: float
-        :param seq_gap_extend: Gap extension penalty for sequence alignment (default: -0.5).
-        :type seq_gap_extend: float
-        :param atoms: Atoms to consider during superposition ("CA", "backbone", "all_heavy").
-        :type atoms: str
-        :param min_plddt: Minimum pLDDT (confidence) threshold to retain an atom (default: 0.0). Filter AF models.
-        :type min_plddt: float
-        :param min_b_factor: Minimum B-factor to retain an atom (default: 0.0).
-        :type min_b_factor: float
-        :returns: An AlignmentResult object containing transformation matrices, matched pairs, and metrics.
-        :rtype: AlignmentResult
+        :param mode: ``"auto"`` (compare sequence-guided and sequence-free and
+            keep the better), ``"seq_guided"``, ``"seq_free_shape"``,
+            ``"seq_free_window"``, ``"seq_free_auto"``, or ``"flexible"``
+            (rigid domains separated by hinges).
+        :param seq_gap_open: gap-open score for the sequence alignment.
+        :param seq_gap_extend: gap-extend score for the sequence alignment.
+        :param atoms: atoms to superpose: ``"CA"``, ``"backbone"`` (N, CA, C, O)
+            or ``"all_heavy"``. Side chains are only paired between residues of
+            the same type.
+        :param min_plddt: pLDDT floor for *predicted* structures. Applied only
+            to a side whose B-factor column looks like pLDDT; a warning names
+            any side it was skipped for.
+        :param min_b_factor: B-factor floor, applied symmetrically.
+        :param strategy: multi-chain superposition strategy, ``"auto"``,
+            ``"global"`` or ``"local"``.
+        :returns: an :class:`AlignmentResult`.
+        :raises AlignmentFailedError: when the requested mode cannot produce an
+            alignment. It never returns a result whose metrics are all ``None``.
         """
-        # --- flexible domain alignment ---
         if mode == "flexible":
-            # Step 1: run auto alignment to get matched atom pairs
-            initial = self.align(
-                mode="auto",
+            return self._align_flexible(
                 seq_gap_open=seq_gap_open, seq_gap_extend=seq_gap_extend,
                 atoms=atoms, min_plddt=min_plddt, min_b_factor=min_b_factor,
-                strategy=strategy,
-                **kwargs,
-            )
-            if initial._chosen.get("seqguided") is None:
-                warnings.warn(
-                    "mode='flexible': no sequence-guided alignment available; "
-                    "returning rigid-body result without domain decomposition.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                return initial
-
-            sg = initial._chosen["seqguided"]
-            ref_atoms = sg["ref_atoms"]
-            mob_atoms = sg["mob_atoms"]
-            per_res = sg["si"]["per_residue_rmsd"]
-
-            # Filter to CA atoms for hinge detection
-            ca_idx = [i for i, a in enumerate(ref_atoms) if a.get_name() == "CA"]
-            if not ca_idx:
-                warnings.warn(
-                    "mode='flexible': no CA atoms found in alignment; "
-                    "returning rigid-body result without domain decomposition.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                return initial
-
-            ca_rmsd = per_res[ca_idx]
-            ca_ref = [ref_atoms[i] for i in ca_idx]
-            ca_mob = [mob_atoms[i] for i in ca_idx]
-
-            splits = _detect_hinges(
-                ca_rmsd,
-                window=hinge_window,
-                threshold=hinge_threshold,
-                min_segment=domain_min_residues,
-            )
-
-            boundaries = [0] + splits + [len(ca_ref)]
-            domains = []
-            for d_id, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
-                seg_ref = ca_ref[start:end]
-                seg_mob = ca_mob[start:end]
-                if len(seg_ref) < 3:
-                    continue
-                ref_coords = np.array([a.get_coord() for a in seg_ref])
-                mob_coords = np.array([a.get_coord() for a in seg_mob])
-                R, t, rmsd = _kabsch(ref_coords, mob_coords)
-
-                domains.append(DomainResult(
-                    domain_id=d_id,
-                    chain_id=seg_ref[0].chain_name,
-                    residue_start=int(seg_ref[0].res_seq),
-                    residue_end=int(seg_ref[-1].res_seq),
-                    n_residues=len(seg_ref),
-                    rmsd=float(rmsd),
-                    rotation=R,
-                    translation=t,
-                ))
-
-            for idx, dr in enumerate(domains):
-                dr.domain_id = idx
-            initial.domains = domains if domains else None
-            return initial
+                hinge_threshold=hinge_threshold, hinge_window=hinge_window,
+                domain_min_residues=domain_min_residues, strategy=strategy,
+                **kwargs)
 
         if not self.ref_file or not self.mob_file:
-            raise ValueError("Both reference and mobile structures must be set before alignment.")
+            raise ValueError("Both reference and mobile structures must be set "
+                             "before alignment.")
 
         ref_chs = self.chains_ref if self.chains_ref else list(self.ref_seqs.keys())
         mob_chs = self.chains_mob if self.chains_mob else list(self.mob_seqs.keys())
-
         if not ref_chs or not mob_chs:
             raise ValueError("Select at least one chain per file.")
 
-        if mode in ("auto", "Auto (best RMSD)") and len(ref_chs) > 1 and len(mob_chs) > 1:
-            from .chains import match_chains, align_multichain
+        ref_sel, mob_sel = self._build_selections(ref_chs, mob_chs,
+                                                  min_b_factor, min_plddt)
+
+        # Multi-chain dispatch: only when both sides really have several chains.
+        if mode in ("auto", "Auto (best RMSD)") and \
+                len(ref_sel.chain_order) > 1 and len(mob_sel.chain_order) > 1:
+            from .chains import align_multichain, match_chains
             mapping = match_chains(self.ref_seqs, self.mob_seqs,
-                                   self.ref_struct, self.mob_struct, ref_chs, mob_chs)
+                                   self.ref_struct, self.mob_struct,
+                                   ref_sel.chain_order, mob_sel.chain_order)
             if mapping.pairs:
+                ref_subs = {c: ref_sel.sub([i for i, r in enumerate(ref_sel.residues)
+                                            if r.chain_id == c])
+                            for c in ref_sel.chain_order}
+                mob_subs = {c: mob_sel.sub([i for i, r in enumerate(mob_sel.residues)
+                                            if r.chain_id == c])
+                            for c in mob_sel.chain_order}
                 mc = align_multichain(self.ref_struct, self.mob_struct, mapping,
                                       strategy=strategy, atoms=atoms,
-                                      min_b_factor=min_b_factor, min_plddt=min_plddt)
-                result_obj = self._multichain_to_result(mc, ref_chs, mob_chs)
+                                      ref_selections=ref_subs,
+                                      mob_selections=mob_subs)
+                result_obj = self._multichain_to_result(mc, ref_sel, mob_sel)
                 self.last_result = {"seqguided": None, "seqfree": None,
                                     "chosen": result_obj._chosen}
                 if self.verbose:
@@ -1576,149 +1924,253 @@ class PDBAligner:
 
         seqguided = None
         seqfree = None
+        failures = []
 
         if mode in ("auto", "Auto (best RMSD)", "seq_guided", "Sequence-guided"):
-            seqA = "".join(str(self.ref_seqs[c].seq) for c in ref_chs if c in self.ref_seqs)
-            seqB = "".join(str(self.mob_seqs[c].seq) for c in mob_chs if c in self.mob_seqs)
-            aln = perform_sequence_alignment(seqA, seqB, seq_gap_open, seq_gap_extend)
-            if aln:
-                ref_atoms, mob_atoms = get_aligned_atoms_by_alignment(self.ref_struct, ref_chs, self.mob_struct, mob_chs, aln, atoms=atoms, min_b_factor=min_b_factor, min_plddt=min_plddt)
-                if ref_atoms and mob_atoms:
-                    # Forward outlier-rejection controls so the seq-guided path is
-                    # governed by the same recycles/keep_fraction as seq-free.
-                    # n_total normalizes GDT_TS by the reference selection length.
-                    si = superimpose_atoms(
-                        ref_atoms, mob_atoms,
-                        recycles=int(kwargs.get("recycles", 0)),
-                        keep_fraction=float(kwargs.get("keep_fraction", 1.0)),
-                        n_total=sum(self.ref_lens[c] for c in ref_chs if c in self.ref_lens) or None,
-                    )
-                    if si:
-                        seqguided = dict(aln=aln, ref_atoms=ref_atoms, mob_atoms=mob_atoms, si=si)
+            # One sequence per selection, so alignment columns map onto
+            # residues by index and cannot drift (see core module docstring).
+            aln = perform_sequence_alignment(ref_sel.sequence, mob_sel.sequence,
+                                             seq_gap_open, seq_gap_extend)
+            pairs = pairs_from_alignment(aln)
+            if pairs:
+                _warn_on_cross_chain_pairs(ref_sel, mob_sel, pairs)
+                ref_atoms, mob_atoms = paired_atoms(ref_sel, mob_sel, pairs,
+                                                    atoms=atoms)
+                si = superimpose_atoms(
+                    ref_atoms, mob_atoms,
+                    recycles=int(kwargs.get("recycles", 0)),
+                    keep_fraction=float(kwargs.get("keep_fraction", 1.0)),
+                    n_total=ref_sel.n_residues)
+                if si:
+                    seqguided = dict(aln=aln, ref_atoms=ref_atoms,
+                                     mob_atoms=mob_atoms, si=si,
+                                     ref_selection=ref_sel,
+                                     mob_selection=mob_sel)
+                else:
+                    failures.append("sequence-guided: no superposable atoms")
+            else:
+                failures.append("sequence-guided: the sequences share no "
+                                "alignable residues")
 
-        if mode in ("auto", "Auto (best RMSD)", "seq_free_auto", "Sequence-free (auto)", "seq_free_shape", "Sequence-free (shape)", "seq_free_window", "Sequence-free (window)"):
-            sf_mode_map = {
-                "seq_free_shape": "shape",
-                "Sequence-free (shape)": "shape",
-                "seq_free_window": "window",
-                "Sequence-free (window)": "window"
-            }
-            sf_method = sf_mode_map.get(mode, "auto")
-
+        seqfree_modes = ("auto", "Auto (best RMSD)", "seq_free_auto",
+                         "Sequence-free (auto)", "seq_free_shape",
+                         "Sequence-free (shape)", "seq_free_window",
+                         "Sequence-free (window)")
+        if mode in seqfree_modes:
+            sf_method = {"seq_free_shape": "shape", "Sequence-free (shape)": "shape",
+                         "seq_free_window": "window",
+                         "Sequence-free (window)": "window"}.get(mode, "auto")
             try:
-                res = sequence_independent_alignment_joined_v2(
+                seqfree = sequence_independent_alignment_joined_v2(
                     file_ref=self.ref_file, file_mob=self.mob_file,
-                    chains_ref=ref_chs, chains_mob=mob_chs,
-                    method=sf_method, atoms=atoms, min_b_factor=min_b_factor, min_plddt=min_plddt, **kwargs
-                )
-                seqfree = res
-            except Exception as e:
-                logger.warning("Sequence-free alignment failed: %s", e, exc_info=True)
+                    method=sf_method, atoms=atoms,
+                    ref_selection=ref_sel, mob_selection=mob_sel, **kwargs)
+            except Exception as exc:
+                logger.warning("Sequence-free alignment failed: %s", exc,
+                               exc_info=True)
+                failures.append(f"sequence-free: {exc}")
 
         if mode in ("auto", "Auto (best RMSD)"):
             best, reason = pick_best_overall(seqguided, seqfree, min_pairs=3)
             if best is None:
-                raise AlignmentFailedError("No alignment could be produced. Try different chains or mode.")
+                raise AlignmentFailedError(
+                    "No alignment could be produced. "
+                    + "; ".join(failures or ["no candidate strategy applied"]))
             chosen_name = best["name"]
             chosen = dict(name=chosen_name, reason=reason,
                           seqguided=seqguided if "Sequence-guided" in chosen_name else None,
                           seqfree=seqfree if "Sequence-free" in chosen_name else None)
         else:
+            picked_sg = seqguided if ("seq_guided" in mode or "Sequence-guided" in mode) else None
+            picked_sf = seqfree if ("seq_free" in mode or "Sequence-free" in mode) else None
+            if picked_sg is None and picked_sf is None:
+                # Explicit modes must fail loudly. Returning a result whose
+                # rmsd/tm_score/report are all None pushes the failure into the
+                # caller's output instead of raising it here.
+                raise AlignmentFailedError(
+                    f"mode={mode!r} produced no alignment. "
+                    + "; ".join(failures or ["unknown mode"]))
             chosen = dict(name=mode, reason="Manual mode.",
-                          seqguided=seqguided if "seq_guided" in mode or "Sequence-guided" in mode else None,
-                          seqfree=seqfree if "seq_free" in mode or "Sequence-free" in mode else None)
+                          seqguided=picked_sg, seqfree=picked_sf)
+
+        # A non-finite RMSD means the chosen strategy never managed a
+        # superposition (fewer than three matched residues). Returning it would
+        # put "inf" in a report and in every derived metric.
+        chosen_rmsd = (chosen["seqguided"]["si"]["rmsd"] if chosen["seqguided"]
+                       else chosen["seqfree"].rmsd if chosen["seqfree"] else None)
+        if chosen_rmsd is None or not np.isfinite(chosen_rmsd):
+            detail = "; ".join(failures) if failures else \
+                "fewer than the 3 matched residues a superposition needs"
+            raise AlignmentFailedError(
+                f"mode={mode!r} could not superpose the selections "
+                f"({chosen['name']}): {detail}.")
 
         self.last_result = dict(seqguided=seqguided, seqfree=seqfree, chosen=chosen)
-
-        # Calculate restricted lengths for TM-score based on specific chains aligned
-        active_ref_lens = {c: self.ref_lens[c] for c in ref_chs if c in self.ref_lens}
-        active_mob_lens = {c: self.mob_lens[c] for c in mob_chs if c in self.mob_lens}
 
         result_obj = AlignmentResult(
             chosen=chosen, seqguided=seqguided, seqfree=seqfree,
             ref_file=self.ref_file, mob_file=self.mob_file,
             mob_struct=self.mob_struct,
-            ref_lens=active_ref_lens, mob_lens=active_mob_lens,
-            verbose=self.verbose
-        )
+            ref_lens=dict(ref_sel.lens), mob_lens=dict(mob_sel.lens),
+            verbose=self.verbose)
+        result_obj.ref_selection = ref_sel
+        result_obj.mob_selection = mob_sel
 
         if self.verbose:
-            print(f"\nAlignment Completed:")
+            print("\nAlignment completed:")
             print(f"  Mode evaluated: {mode}")
             if seqguided:
-                print(f"  Sequence-based RMSD: {seqguided['si']['rmsd']:.3f} Å")
+                print(f"  Sequence-guided RMSD: {seqguided['si']['rmsd']:.3f} Å")
             if seqfree:
-                print(f"  Sequence-free RMSD: {seqfree.rmsd:.3f} Å")
+                print(f"  Sequence-free RMSD:   {seqfree.rmsd:.3f} Å")
             print(f"  Chosen method: {chosen['name']}")
             print(f"  Reason: {chosen['reason']}")
 
         return result_obj
 
-    def _multichain_to_result(self, mc, ref_chs, mob_chs):
-        import numpy as np
-        from .core import compute_gdt_ts
+    def _align_flexible(self, hinge_threshold, hinge_window,
+                        domain_min_residues, **align_kwargs):
+        """Rigid-body decomposition: align, find hinges, refit per domain.
 
-        # mc.ref_infos / mc.mob_infos are already PseudoAtom objects (from
-        # core.get_aligned_atoms_by_alignment), exposing get_name()/get_coord()/
-        # chain_name/res_seq/res_icode -- no wrapping needed.
+        Hinge detection runs per chain. A chain boundary is not a hinge, and a
+        "domain" spanning one is not a rigid body: fitting it mixes two
+        independent motions and reports a per-domain RMSD that describes
+        neither (observed: domains labelled 'chain A 42-21' with a 4.6 A fit on
+        a structure whose chains are individually rigid).
+        """
+        initial = self.align(mode="auto", **align_kwargs)
+        sg = initial._chosen.get("seqguided")
+        if sg is None:
+            warnings.warn(
+                "mode='flexible': the chosen alignment has no residue-level "
+                "correspondence, so no domain decomposition was attempted; "
+                "returning the rigid-body result.",
+                UserWarning, stacklevel=3)
+            return initial
+
+        si = sg["si"]
+        ca_rmsd = np.asarray(si["per_residue_rmsd"], dtype=float)
+        keys = si["residue_keys"]
+        chains = si["residue_chains"]
+        ca_ref = np.asarray(si["ca_ref"])
+        ca_mob = np.asarray(si["ca_mob"])
+        if len(ca_ref) != len(ca_rmsd) or len(ca_ref) < 3:
+            warnings.warn(
+                "mode='flexible': no CA-level correspondence available; "
+                "returning the rigid-body result.", UserWarning, stacklevel=3)
+            return initial
+
+        chain_starts = [i for i in range(len(chains))
+                        if i == 0 or chains[i] != chains[i - 1]]
+        splits = _detect_hinges(ca_rmsd, window=hinge_window,
+                                threshold=hinge_threshold,
+                                min_segment=domain_min_residues,
+                                chain_starts=chain_starts)
+        boundaries = sorted({0, *splits, len(ca_rmsd)})
+        segments = [(s, e) for s, e in itertools.pairwise(boundaries)
+                    if e - s >= 3 and len(set(chains[s:e])) == 1]
+        segments = self._merge_rigid_segments(segments, chains, ca_ref, ca_mob,
+                                              hinge_threshold)
+
+        domains = []
+        for start, end in segments:
+            R, t, rmsd = _kabsch(ca_ref[start:end], ca_mob[start:end])
+            domains.append(DomainResult(
+                domain_id=len(domains), chain_id=chains[start],
+                residue_start=int(keys[start][1]),
+                residue_end=int(keys[end - 1][1]),
+                n_residues=end - start, rmsd=float(rmsd),
+                rotation=R, translation=t))
+        initial.domains = domains or None
+        return initial
+
+    @staticmethod
+    def _merge_rigid_segments(segments, chains, ca_ref, ca_mob, threshold):
+        """Merge consecutive same-chain segments that are one rigid body.
+
+        Hinges are detected on deviations measured in the *initial* whole-
+        structure frame, which is a compromise fit: a chain that moved as one
+        rigid body still shows a deviation ramp across its length and picks up
+        spurious splits (a hinged haemoglobin decomposed into 9 "domains" for 4
+        rigid chains). A split is only real if the two sides cannot be fitted
+        together, so adjacent segments are merged while their union still
+        superposes within the same threshold that declared the hinge.
+        """
+        merged = []
+        for seg in segments:
+            if not merged:
+                merged.append(seg)
+                continue
+            p_start, p_end = merged[-1]
+            s_start, s_end = seg
+            if p_end == s_start and chains[p_start] == chains[s_start]:
+                _R, _t, rmsd = _kabsch(ca_ref[p_start:s_end], ca_mob[p_start:s_end])
+                if rmsd <= threshold:
+                    merged[-1] = (p_start, s_end)
+                    continue
+            merged.append(seg)
+        return merged
+
+    def _multichain_to_result(self, mc, ref_sel, mob_sel):
+
         ref_atoms = mc.ref_infos
         mob_atoms = mc.mob_infos
-        diff = mc.ref_coords - mc.mob_coords_aligned
-        per_res = np.sqrt(np.sum(diff ** 2, axis=1)) if len(diff) else np.array([])
-        # GDT_TS on CA distances only (atoms="backbone"/"all_heavy" include
-        # several atoms per residue), normalized by the reference selection.
-        ca_idx = [i for i, a in enumerate(ref_atoms)
-                  if getattr(a, "get_name", lambda: "CA")() == "CA"]
-        n_total = sum(self.ref_lens[c] for c in ref_chs if c in self.ref_lens) or None
-        gdt = (compute_gdt_ts(per_res[ca_idx] if ca_idx else per_res, n_total=n_total)
-               if len(per_res) else None)
-        si = {"rotation": mc.rotation, "translation": mc.translation,
-              "rmsd": mc.rmsd, "per_residue_rmsd": per_res,
-              "ref_coords": mc.ref_coords, "mob_coords_transformed": mc.mob_coords_aligned,
-              "gdt_ts": gdt}
-        seqguided = {"aln": None, "ref_atoms": ref_atoms, "mob_atoms": mob_atoms, "si": si}
+        si = superimpose_atoms(ref_atoms, mob_atoms, n_total=ref_sel.n_residues)
+        if si is None:
+            raise AlignmentFailedError(
+                "The multi-chain superposition produced no matched atoms.")
+        # Keep the transform the chain layer chose (it may be the local fit).
+        si["rotation"] = mc.rotation
+        si["translation"] = mc.translation
+        si["rmsd"] = mc.rmsd
+        seqguided = {"aln": None, "ref_atoms": ref_atoms, "mob_atoms": mob_atoms,
+                     "si": si, "ref_selection": ref_sel, "mob_selection": mob_sel}
         chosen = {"name": f"Multi-chain ({mc.strategy})",
                   "reason": f"Chain-aware {mc.strategy} superposition over "
-                            f"{len(mc.mapping.pairs)} chain pair(s).",
+                            f"{len(mc.mapping.pairs)} chain pair(s)."
+                            + (" Correspondence refined geometrically "
+                               "(sequence-identical chains)."
+                               if getattr(mc.mapping, "refined", False) else ""),
                   "seqguided": seqguided, "seqfree": None}
-        active_ref_lens = {c: self.ref_lens[c] for c in ref_chs if c in self.ref_lens}
-        active_mob_lens = {c: self.mob_lens[c] for c in mob_chs if c in self.mob_lens}
         res = AlignmentResult(chosen=chosen, seqguided=seqguided, seqfree=None,
                               ref_file=self.ref_file, mob_file=self.mob_file,
                               mob_struct=self.mob_struct,
-                              ref_lens=active_ref_lens, mob_lens=active_mob_lens,
+                              ref_lens=dict(ref_sel.lens),
+                              mob_lens=dict(mob_sel.lens),
                               verbose=self.verbose)
         res.strategy = mc.strategy
         res.chain_mapping = mc.mapping
-        import pandas as pd
-        res._per_chain = pd.DataFrame(mc.per_chain,
-            columns=["chain_ref", "chain_mob", "n_residues", "rmsd"])
+        res.ref_selection = ref_sel
+        res.mob_selection = mob_sel
+        res._per_chain = pd.DataFrame(
+            mc.per_chain, columns=["chain_ref", "chain_mob", "n_residues", "rmsd"])
         return res
 
     def find_binder_target_chain(self, binder_chains: List[str], candidate_chains: List[str]) -> str:
         """
         Identifies which candidate chain in the currently loaded mobile structure
         is physically closest to the specified binder chains.
-        
+
         This is useful for multimeric complexes (like AlphaFold predictions) where
         a binder might stochastically attach to any of the symmetric chains.
         """
         if not self.mob_struct or not self.mob_file:
             raise ValueError("Mobile structure must be loaded before finding the binder target.")
-            
+
         import numpy as np
         from scipy.spatial.distance import cdist
+
         from .core import _extract_ca_infos
-        
+
         # Get coordinates for the binder chains
         binder_infos = _extract_ca_infos(self.mob_struct, chain_filter=binder_chains)
         if not binder_infos:
             raise ValueError(f"Could not extract CA atoms for binder chains {binder_chains} in {os.path.basename(self.mob_file)}")
         binder_coords = np.array([info.coord for info in binder_infos])
-        
+
         min_dist = float('inf')
         best_chain = None
-        
+
         # Check distance to each candidate chain
         for candidate in candidate_chains:
             candidate_infos = _extract_ca_infos(self.mob_struct, chain_filter=[candidate])
@@ -1726,32 +2178,32 @@ class PDBAligner:
                 if self.verbose:
                     print(f"Warning: Candidate chain {candidate} not found or has no CA atoms.")
                 continue
-                
+
             candidate_coords = np.array([info.coord for info in candidate_infos])
-            
+
             # Calculate all pairwise distances between binder CA atoms and candidate CA atoms
             distances = cdist(binder_coords, candidate_coords)
-            
+
             # Find the minimum distance
             current_min = np.min(distances)
-            
+
             if self.verbose:
                 print(f"  Minimum distance to chain {candidate}: {current_min:.2f} Å")
-                
+
             if current_min < min_dist:
                 min_dist = current_min
                 best_chain = candidate
-                
+
         if best_chain is None:
             raise ValueError(f"Could not find any valid candidate chains from {candidate_chains} in {os.path.basename(self.mob_file)}")
-            
+
         if self.verbose:
             print(f"Selected chain {best_chain} as the target for binder {binder_chains} (distance: {min_dist:.2f} Å)")
-            
+
         return best_chain
 
-    def align_with_binder(self, binder_chains: List[str], candidate_chains: List[str], 
-                          mode: str = "auto", seq_gap_open: float = -10, seq_gap_extend: float = -0.5, 
+    def align_with_binder(self, binder_chains: List[str], candidate_chains: List[str],
+                          mode: str = "auto", seq_gap_open: float = -10, seq_gap_extend: float = -0.5,
                           atoms: str = "CA", **kwargs) -> AlignmentResult:
         """
         Calculates the target chain that the binder is bound to, sets it as the active mobile chain,
@@ -1759,7 +2211,7 @@ class PDBAligner:
         """
         if self.verbose:
             print(f"Looking for target chain among {candidate_chains} bound by {binder_chains}...")
-            
+
         best_chain = self.find_binder_target_chain(binder_chains, candidate_chains)
         self.set_mobile_chains([best_chain])
 
@@ -1780,54 +2232,90 @@ class PDBAligner:
         Parameters
         ----------
         mob_list : list[str]
-            Paths to mobile PDB/CIF files, or remote IDs (``pdb:XXXX``, ``af:UniProtID``).
+            Paths to mobile PDB/CIF files, or remote IDs (``pdb:XXXX``,
+            ``af:UniProtID``).
         mode : str
             Alignment mode forwarded to :meth:`align`. Default ``"auto"``.
         atoms : str
             Atom selection forwarded to :meth:`align`. Default ``"CA"``.
         workers : int
-            Reserved for future parallel execution. Currently unused. Default ``1``.
+            Worker processes. ``1`` runs in-process; ``>1`` or ``-1`` (all
+            cores) spreads the models over a process pool. Models are
+            independent, so this scales nearly linearly — the usual ensemble is
+            tens to hundreds of models and used to run strictly serially.
         out_dir : str | None
-            If given, each aligned mobile PDB is saved here as ``aligned_<filename>``.
+            If given, each aligned mobile structure is saved here as
+            ``aligned_<filename>``.
         **kwargs
             Additional keyword arguments forwarded to :meth:`align`.
 
         Returns
         -------
         EnsembleResult
+
+        Notes
+        -----
+        A model that fails is reported with a ``UserWarning`` and left out of
+        the result rather than aborting the run.
         """
         if not self.ref_file:
-            raise ValueError("Reference structure must be loaded before calling align_ensemble().")
-
+            raise ValueError("Reference structure must be loaded before "
+                             "calling align_ensemble().")
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
 
-        results = []
-        labels = []
+        n_workers = _resolve_workers(workers, len(mob_list))
+        align_kwargs = dict(mode=mode, atoms=atoms, **kwargs)
 
+        if n_workers > 1:
+            return self._align_ensemble_parallel(mob_list, align_kwargs,
+                                                 n_workers, out_dir)
+
+        results, labels = [], []
         for mob_path in mob_list:
-            label = mob_path  # preserve original input as label
             try:
                 self.add_mobile(mob_path)
-                # Use the resolved local path for filesystem operations
                 safe_fname = os.path.basename(self.mob_file or mob_path)
-                res = self.align(mode=mode, atoms=atoms, **kwargs)
+                res = self.align(**align_kwargs)
                 if out_dir:
-                    out_pdb = os.path.join(out_dir, f"aligned_{safe_fname}")
-                    res.save_aligned_pdb(out_pdb)
+                    res.save_aligned_pdb(os.path.join(out_dir,
+                                                      f"aligned_{safe_fname}"))
                 results.append(res)
-                labels.append(label)
+                labels.append(mob_path)
                 if self.verbose:
-                    print(f"align_ensemble: {label} → RMSD={res.rmsd:.3f} Å")
+                    print(f"align_ensemble: {mob_path} → RMSD={res.rmsd:.3f} Å")
             except Exception as exc:
-                warnings.warn(
-                    f"align_ensemble: skipping '{label}' — {exc}",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                if self.verbose:
-                    print(f"align_ensemble: {label} failed — {exc}")
+                warnings.warn(f"align_ensemble: skipping {mob_path!r} — {exc}",
+                              UserWarning, stacklevel=2)
+        return EnsembleResult(results=results, labels=labels)
 
+    def _align_ensemble_parallel(self, mob_list, align_kwargs, n_workers, out_dir):
+        """Run the ensemble over a process pool.
+
+        Only the per-model *inputs* cross the process boundary; each worker
+        parses the reference itself. AlignmentResult holds a gemmi.Structure,
+        which does not pickle, so workers return the plain arrays and tables
+        the result is rebuilt from.
+        """
+        payloads = [
+            {"ref_file": self.ref_file, "chains_ref": self.chains_ref,
+             "chains_mob": self.chains_mob, "mob_file": mob,
+             "kwargs": align_kwargs, "out_dir": out_dir}
+            for mob in mob_list
+        ]
+        results, labels = [], []
+        outcomes = _map_parallel(_ensemble_worker, payloads, n_workers,
+                                 "align_ensemble")
+        for mob_path, payload in zip(mob_list, outcomes):
+            if payload.get("error"):
+                warnings.warn(f"align_ensemble: skipping {mob_path!r} — "
+                              f"{payload['error']}", UserWarning, stacklevel=3)
+                continue
+            results.append(_RemoteAlignmentResult(payload))
+            labels.append(mob_path)
+            if self.verbose:
+                print(f"align_ensemble: {mob_path} → "
+                      f"RMSD={payload['meta']['rmsd']:.3f} Å")
         return EnsembleResult(results=results, labels=labels)
 
     def batch_align_iter(self, mob_dir: str, out_dir: str, mode: str = "auto", workers: int = 1, **kwargs):
@@ -1974,7 +2462,7 @@ class PDBAligner:
         from Bio.Align import substitution_matrices
         try:
             blosum62 = substitution_matrices.load("BLOSUM62")
-        except:
+        except Exception:
             blosum62 = {}
 
         match = ""

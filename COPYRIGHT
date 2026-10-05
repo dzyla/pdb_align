@@ -1,0 +1,33 @@
+pdb_align — protein structure alignment and prediction-model assessment
+
+Copyright (C) 2026 Dawid Zyla
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+
+Why the AGPL
+------------
+Two properties were wanted: every modified version stays under the same
+licence, and nobody can take the work proprietary by offering it only as a
+hosted service. Section 13 of the AGPL supplies the second one — anyone who
+lets users interact with a modified version over a network must offer those
+users its source under this same licence. A plain GPL would not: it is
+triggered by distribution, and a web service distributes nothing.
+
+Note that the AGPL does not forbid charging money, for hosting or otherwise.
+No OSI-approved licence does; a non-commercial clause would make this project
+not open source, cut it off from the scientific Python ecosystem, and bar
+legitimate users such as companies doing internal research and universities
+with commercial arms. What the AGPL guarantees instead is that a paid hosted
+version cannot be a closed one: its users get the source, and any improvement
+in it comes back to everyone under the same terms.

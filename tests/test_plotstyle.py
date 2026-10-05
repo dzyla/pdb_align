@@ -1,6 +1,8 @@
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 from pdb_align import plotstyle
 
 
@@ -42,6 +44,7 @@ def test_plot_summary_returns_figure(tmp_path):
 
 def test_plot_summary_bar_chart_branch(tmp_path):
     import pandas as pd
+
     import pdb_align
     r = pdb_align.align("tests/data/ref.pdb", "tests/data/mob.pdb")
     r._per_chain = pd.DataFrame(

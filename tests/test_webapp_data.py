@@ -31,7 +31,7 @@ def test_run_pairwise_returns_result():
 
 def test_run_ensemble_returns_result():
     from pdb_align import EnsembleResult
-    ens = D.run_ensemble(REF, [MOB, REF], None, {}, "auto", "auto", OPTS)
+    ens = D.run_ensemble(REF, [MOB, REF], None, "auto", "auto", OPTS)
     assert isinstance(ens, EnsembleResult)
     assert len(ens.results) == 2
 
@@ -41,3 +41,16 @@ def test_input_key_stability():
     k2 = D.input_key(REF, [MOB], None, {}, "auto", "auto", OPTS)
     k3 = D.input_key(REF, [MOB], None, {}, "flexible", "auto", OPTS)
     assert k1 == k2 and k1 != k3
+
+
+def test_run_ensemble_forwards_strategy_and_workers():
+    """Both were accepted and dropped, so the sidebar's Strategy selector had
+    no effect on an ensemble run."""
+    import inspect
+
+    sig = inspect.signature(D.run_ensemble)
+    assert "strategy" in sig.parameters
+    assert "workers" in sig.parameters
+    src = inspect.getsource(D.run_ensemble)
+    assert "strategy=strategy" in src
+    assert "workers=workers" in src

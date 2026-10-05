@@ -1,6 +1,13 @@
 import os
 
+import pytest
+
+# These exercise the app-level webapp package, which needs the optional [app]
+# extras. A core install must skip them, not fail to collect them.
+pytest.importorskip("plotly", reason="the [app] extras are not installed")
+
 import plotly.graph_objects as go
+
 from pdb_align import PDBAligner
 from webapp import figures as F
 

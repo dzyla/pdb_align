@@ -35,11 +35,14 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
-import numpy as np
 import gemmi
+import numpy as np
 
 from .core import (
-    AA_DICT, _kabsch, perform_sequence_alignment,
+    _kabsch,
+    pairs_from_alignment,
+    perform_sequence_alignment,
+    residue_letter,
 )
 
 # --- published constants (see module docstring for sources) -----------------
@@ -111,7 +114,8 @@ def _chain_residues(struct: gemmi.Structure, chain_names: Sequence[str]) -> Dict
         if chain.name not in out:
             continue
         for res in chain:
-            if res.name not in AA_DICT:
+            letter = residue_letter(res.name)
+            if letter is None:
                 continue
             heavy = {}
             plddt = None
@@ -127,7 +131,7 @@ def _chain_residues(struct: gemmi.Structure, chain_names: Sequence[str]) -> Dict
             icode = res.seqid.icode if res.seqid.icode and res.seqid.icode != " " else ""
             out[chain.name].append(_Res(
                 chain=chain.name, seqid=int(res.seqid.num), icode=icode.strip(),
-                name=res.name, letter=AA_DICT[res.name], heavy=heavy, plddt=plddt))
+                name=res.name, letter=letter, heavy=heavy, plddt=plddt))
     return out
 
 
@@ -148,15 +152,7 @@ def _pair_residues(ref_res: List[_Res], mob_res: List[_Res],
     aln = perform_sequence_alignment(seq_a, seq_b, -10.0, -0.5)
     if aln is None:
         return []
-    pairs = []
-    i = j = 0
-    for a, b in zip(aln.seqA, aln.seqB):
-        if a != "-" and b != "-":
-            pairs.append((i, j))
-        if a != "-":
-            i += 1
-        if b != "-":
-            j += 1
+    pairs = pairs_from_alignment(aln)
     if _cache is not None:
         _cache[(ref_res[0].chain, mob_res[0].chain)] = pairs
     return pairs
@@ -164,8 +160,8 @@ def _pair_residues(ref_res: List[_Res], mob_res: List[_Res],
 
 def _match_chain_groups(ref_struct, model_struct, ref_chains, model_chains):
     """1:1 ref->model chain mapping within a group via Hungarian on % identity."""
-    from .core import extract_sequences_and_lengths
     from .chains import match_chains
+    from .core import extract_sequences_and_lengths
     ref_seqs, _ = extract_sequences_and_lengths(ref_struct, "ref")
     mob_seqs, _ = extract_sequences_and_lengths(model_struct, "model")
     mapping = match_chains(ref_seqs, mob_seqs, ref_struct, model_struct,
@@ -489,7 +485,9 @@ def _compare_sites(native_keys: set, model_keys_in_ref_space: set) -> SiteCompar
     recall = len(inter) / len(native_keys) if native_keys else 0.0
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
     jac = len(inter) / len(union) if union else 0.0
-    fmt = lambda ks: sorted(f"{k[0]}:{k[1]}{k[2]}" for k in ks)
+    def fmt(keys):
+        return sorted(f"{k[0]}:{k[1]}{k[2]}" for k in keys)
+
     return SiteComparison(precision=precision, recall=recall, f1=f1, jaccard=jac,
                           native_residues=fmt(native_keys),
                           model_residues=fmt(model_keys_in_ref_space))

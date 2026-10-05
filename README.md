@@ -1,19 +1,44 @@
 # pdb_align
-Align protein structures and explore local differences — pairwise, domain-flexible, or across full ensembles.
 
-This package provides a Python library for structural bioinformatics scripting, a CLI, and an interactive Streamlit web app.
+Compare protein structures and score predicted models against experimental
+references — pairwise, domain-flexible, across ensembles, or as a ranked table
+of N models.
+
+A Python library, a command-line tool, and a Streamlit web app. Metric
+implementations are cross-validated against the reference programs (official
+`DockQ`, TM-align via `tmtools`) in the test suite, and every reported number
+states what it was normalized by. See **[docs/METHODS.md](docs/METHODS.md)**
+for what each number means and where the implementation deviates from the
+published method.
+
+[![CI](https://github.com/dzyla/pdb_align/actions/workflows/ci.yml/badge.svg)](https://github.com/dzyla/pdb_align/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%E2%80%933.13-blue)
+![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)
+
+## What it computes
+
+| | |
+|---|---|
+| **Fold similarity** | RMSD, TM-score (TM-optimal superposition, with p-value), GDT_TS, lDDT-Cα, coverage |
+| **Correspondence** | sequence-guided, sequence-free (shape/window), automatic multi-chain matching, flexible multi-domain |
+| **Interfaces** | DockQ + CAPRI class, fnat/fnonnat, iRMSD, LRMSD, epitope/paratope precision–recall–F1 |
+| **Prediction confidence** | pDockQ, pDockQ2 (from PAE), ipTM ingestion for AlphaFold 2/3 and Boltz |
+| **Antibodies** | IMGT CDR annotation and per-CDR backbone RMSD after framework superposition |
+| **Interpretation** | plain-language verdict, confidence, flagged flexible regions, explicit warnings |
 
 ## Installation
 
-Core library only:
 ```bash
-pip install -e .
+pip install pdb_align                 # core library + CLI
+pip install 'pdb_align[speed]'        # + numba JIT on the sequence-free kernels
+pip install 'pdb_align[app]'          # + Streamlit web app
+pip install 'pdb_align[antibody]'     # + ANARCI for CDR annotation
+pip install 'pdb_align[dev]'          # everything, including the test suite
 ```
 
-With Streamlit app and visualization extras (Py3Dmol, Plotly):
-```bash
-pip install -e .[app]
-```
+Requires Python 3.10+. Everything outside the core dependencies is optional:
+the whole test suite passes on a core install, and `numba` changes no result,
+only speed.
 
 ## Command-line quickstart
 
@@ -29,6 +54,7 @@ pdb_align a.cif b.cif -o aligned.cif --summary-plot   # + aligned structure + su
 
 ```bash
 pdb_align ref.pdb mob.pdb --strategy global      # force global vs. local multi-chain superposition (default: auto)
+pdb_align ref.pdb mob.pdb --ref-chains "A:10-150 B"   # chains, or residue ranges within them
 pdb_align ref.pdb mob.pdb --ref-chains A --mob-chains A
 pdb_align ref.pdb mob.pdb --json                 # machine-readable report to stdout
 pdb_align ref.pdb mob.pdb --csv rmsd.csv --report report.txt --save result.npz
@@ -303,3 +329,44 @@ for fname, res in aligner.batch_align_iter(mob_dir="models/", out_dir="out/", wo
 stats = aligner.get_ensemble_statistics(df_batch)
 print(stats)  # mean RMSD, median TM-score, etc.
 ```
+
+
+## Reproducibility
+
+```python
+res = pdb_align.align("ref.cif", "model.cif")
+
+res.export_bundle("run1.zip")   # aligned structure + reference + per-residue CSV
+                                # + both plots + PyMOL/ChimeraX scripts + report
+res.save("run1.npz")            # versioned, gemmi-free; reload and re-plot later
+pdb_align.AlignmentResult.load("run1.npz").report()
+
+print(res.report(fmt="json"))   # every number, plus what it was normalized by
+```
+
+Parallel and serial execution give identical numbers, as does running with or
+without `numba`; both are asserted in the test suite
+(`tests/test_parallel.py`, `tests/test_optional_numba.py`).
+
+## Running the tests
+
+```bash
+pip install -e '.[dev]'
+pytest                      # 242 tests
+pytest -k crossvalidation   # agreement with the official DockQ and TM-align
+ruff check pdb_align tests
+```
+
+## Citing
+
+If you use `pdb_align` in published work, please cite it (see
+[CITATION.cff](CITATION.cff)) **and** the original papers for whichever metrics
+you report — they are listed with DOIs in `CITATION.cff` and against each
+metric in [docs/METHODS.md](docs/METHODS.md).
+
+## Licence
+
+AGPL-3.0-or-later. Modified versions stay under the same licence, and §13
+extends that to network use: anyone who offers a modified version as a hosted
+service must offer its users the source. See [COPYRIGHT](COPYRIGHT) for why
+this licence was chosen.

@@ -1,4 +1,4 @@
-from pdb_align.interpretation import assess, AlignmentQuality, FlaggedRegion
+from pdb_align.interpretation import AlignmentQuality, FlaggedRegion, assess
 
 
 def _uniform(chain, n, val):

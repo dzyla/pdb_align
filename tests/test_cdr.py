@@ -4,12 +4,12 @@ The geometry tests use an injected deterministic numberer so they run without
 ANARCI; a separate integration test exercises real ANARCI numbering on the
 D1.3 antibody sequence and is skipped when ANARCI/HMMER are not functional.
 """
+import gemmi
 import numpy as np
 import pytest
-import gemmi
-
-from pdb_align.cdr import annotate_cdrs, cdr_rmsd, IMGT_CDR_RANGES
 from _synthetic import make_chain, make_structure
+
+from pdb_align.cdr import IMGT_CDR_RANGES, annotate_cdrs, cdr_rmsd
 
 # D1.3 anti-lysozyme VH/VL (from PDB 1VFB chains B/A)
 D13_VH = ("QVQLQESGPGLVAPSQSLSITCTVSGFSLTGYGVNWVRQPPGKGLEWLGMIWGDGNTDYNSALKSR"

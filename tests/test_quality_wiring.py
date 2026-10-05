@@ -1,7 +1,7 @@
+import json
 import os
 import subprocess
 import sys
-import json
 
 from pdb_align import PDBAligner
 from pdb_align.interpretation import AlignmentQuality

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from pdb_align.metrics import compute_d0, calculate_tm_score, calculate_tm_pvalue
+from pdb_align.metrics import calculate_tm_pvalue, calculate_tm_score, compute_d0
 
 
 def test_compute_d0_normal_length():

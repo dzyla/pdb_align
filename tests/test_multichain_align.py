@@ -1,7 +1,8 @@
-import numpy as np
 import gemmi
+import numpy as np
+
+from pdb_align.chains import align_multichain, match_chains
 from pdb_align.core import extract_sequences_and_lengths
-from pdb_align.chains import match_chains, align_multichain
 
 
 def _struct(coords_by_chain):
@@ -49,7 +50,9 @@ def test_local_beats_global_when_one_chain_diverges():
 
 
 def test_pdbaligner_auto_uses_multichain(tmp_path):
-    import gemmi, pdb_align
+    import gemmi
+
+    import pdb_align
     ref = _struct(_two_chain(0.0))
     mob = _struct({k: [(x + 3, y, z) for x, y, z in v] for k, v in _two_chain(0.0).items()})
     rp, mp = tmp_path / "ref.pdb", tmp_path / "mob.pdb"

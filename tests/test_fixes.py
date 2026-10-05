@@ -9,10 +9,10 @@ import os
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from pdb_align.aligner import PDBAligner
-from pdb_align.core import pick_best_overall, _select_seqfree_method, AlignSummary
-
+from pdb_align.core import AlignSummary, _select_seqfree_method, pick_best_overall
 
 _PDB = """\
 ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00           C
@@ -168,8 +168,9 @@ def test_fetch_alphafold_version_fallback(tmp_path, monkeypatch):
 
 def test_struct_cache_invalidates_on_file_change(tmp_path):
     """Editing a reference file on disk must cause a re-parse, not a stale hit."""
-    import gemmi
     from unittest.mock import patch
+
+    import gemmi
 
     p = tmp_path / "ref.pdb"
     coords_a = [(float(i) * 3.8, 0.0, 0.0) for i in range(4)]
@@ -271,13 +272,13 @@ def test_backbone_mode_handles_ca_less_residue(tmp_path):
     assert res.rmsd < 1e-6, f"CA-less residue should be skipped; got RMSD {res.rmsd}"
 
 
-def test_structurebase_chain_index_is_1_based(tmp_path):
-    """StructureBase must use the same 1-based chain indexing as the rest of the
-    library (core._resolve_selectors), not 0-based."""
-    from pdb_align.structure import StructureBase
-    from pdb_align.exceptions import ChainNotFoundError
+def test_chain_index_selection_is_1_based(tmp_path):
+    """A numeric chain selector is a 1-based index, consistently everywhere.
 
-    # Two chains A and B.
+    (The dead StructureBase wrapper this used to test was removed in 0.4.0;
+    select_residues() is now the single implementation.)"""
+    from pdb_align.core import _parse_path, select_residues
+
     lines = [
         "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C",
         "ATOM      2  CA  ALA B   1      10.000   0.000   0.000  1.00  0.00           C",
@@ -285,19 +286,14 @@ def test_structurebase_chain_index_is_1_based(tmp_path):
     ]
     p = tmp_path / "two.pdb"
     p.write_text("\n".join(lines) + "\n")
+    st = _parse_path(str(p))
 
-    # Index 1 -> first chain "A", index 2 -> second chain "B".
-    assert StructureBase(str(p), chains=[1]).chains == ["A"]
-    assert StructureBase(str(p), chains=[2]).chains == ["B"]
+    assert select_residues(st, [1]).chain_order == ["A"]
+    assert select_residues(st, [2]).chain_order == ["B"]
 
-    # Index 0 and out-of-range must be rejected (1-based domain).
     for bad in (0, 3):
-        try:
-            StructureBase(str(p), chains=[bad])
-        except ChainNotFoundError:
-            pass
-        else:
-            raise AssertionError(f"chain index {bad} should be rejected")
+        with pytest.raises(ValueError, match="out of range"):
+            select_residues(st, [bad])
 
 
 def test_pdbaligner_save_aligned_pdb_preserve_bfactor(tmp_path):

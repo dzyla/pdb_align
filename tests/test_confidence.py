@@ -4,12 +4,17 @@ import math
 
 import numpy as np
 import pytest
+from _synthetic import two_chain_complex
 
 from pdb_align.confidence import (
-    load_confidence, find_confidence_files, compute_pdockq2,
-    PDOCKQ2_L, PDOCKQ2_X0, PDOCKQ2_K, PDOCKQ2_B,
+    PDOCKQ2_B,
+    PDOCKQ2_K,
+    PDOCKQ2_L,
+    PDOCKQ2_X0,
+    compute_pdockq2,
+    find_confidence_files,
+    load_confidence,
 )
-from _synthetic import two_chain_complex
 
 
 def _sigmoid(x):

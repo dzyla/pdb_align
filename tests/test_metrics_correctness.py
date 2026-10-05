@@ -2,12 +2,14 @@
 import numpy as np
 import pytest
 
+from pdb_align.core import compute_contact_overlap, compute_gdt_ts
 from pdb_align.metrics import (
-    calculate_tm_pvalue, calculate_tm_score, calculate_lddt,
-    tm_optimal_superposition, compute_d0,
+    calculate_lddt,
+    calculate_tm_pvalue,
+    calculate_tm_score,
+    compute_d0,
+    tm_optimal_superposition,
 )
-from pdb_align.core import compute_gdt_ts, compute_contact_overlap
-
 
 # --- TM p-value: Xu & Zhang 2010 EVD (mu=0.1512, sigma=0.0242) --------------
 
@@ -116,11 +118,77 @@ def test_lddt_identity_is_one():
     assert calculate_lddt(P, P.copy()) == pytest.approx(1.0)
 
 
-# --- contact overlap rename ----------------------------------------------------
+# --- contact overlap ------------------------------------------------------------
 
-def test_contact_overlap_alias_warns():
-    from pdb_align.core import compute_cad_score_approx
-    P = _line(10)
-    with pytest.warns(DeprecationWarning):
-        v = compute_cad_score_approx(P, P.copy())
-    assert v == pytest.approx(compute_contact_overlap(P, P.copy()))
+def test_contact_overlap_chunking_does_not_change_the_result():
+    """The chunked implementation exists to bound memory (900 MB at N=6000),
+    so it must agree with the single-block result exactly."""
+    rng = np.random.default_rng(11)
+    P = np.cumsum(rng.normal(size=(400, 3)) * 2.0, axis=0)
+    Q = P + rng.normal(size=(400, 3)) * 0.5
+    full = compute_contact_overlap(P, Q, chunk=10_000)
+    chunked = compute_contact_overlap(P, Q, chunk=37)
+    assert chunked == pytest.approx(full, abs=1e-12)
+
+
+def test_contact_overlap_ignores_self_and_sequence_neighbour_pairs():
+    """Only i,i+1 contacts exist in a short straight chain, and those carry no
+    structural information, so the comparison has nothing to score (0.0) rather
+    than a free 1.0 from trivially-satisfied pairs."""
+    P = _line(2)  # the only pair is i, i+1, which is excluded
+    assert compute_contact_overlap(P, P.copy()) == 0.0
+
+
+def test_contact_overlap_is_superposition_invariant():
+    """It compares internal contact maps, so a rigid move must not change it."""
+    rng = np.random.default_rng(3)
+    P = np.cumsum(rng.normal(size=(60, 3)) * 2.0, axis=0)
+    moved = P @ np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]) \
+        + np.array([120.0, -40.0, 7.0])
+    assert compute_contact_overlap(P, moved) == pytest.approx(1.0)
+
+
+# --- sequence-free kernels ------------------------------------------------------
+
+def test_radial_histograms_match_a_plain_histogram_loop():
+    """The fast path must be bit-identical to the obvious implementation."""
+    from pdb_align.core import _pairwise_dists, _radial_histograms
+
+    rng = np.random.default_rng(13)
+    D = _pairwise_dists(rng.random((120, 3)) * 50)
+    nbins = 24
+    fast, edges = _radial_histograms(D, nbins=nbins)
+
+    slow = np.zeros_like(fast)
+    for i in range(len(D)):
+        row = D[i][D[i] > 0.0]
+        counts, _ = np.histogram(row, bins=edges)
+        total = counts.sum()
+        slow[i] = counts / total if total else counts
+    assert np.abs(fast - slow).max() == 0.0
+
+
+def test_window_pairs_matches_a_direct_scan():
+    """The parallel, allocation-free kernel must pick the same offset as the
+    straightforward O(dN * N^2) scan it replaced."""
+    from pdb_align.core import _pairwise_dists, _window_pairs
+
+    rng = np.random.default_rng(17)
+    big = _pairwise_dists(np.cumsum(rng.normal(size=(60, 3)) * 3.0, axis=0))
+    small = big[12:42, 12:42]  # an exact sub-block: offset 12 must win
+
+    pairs, scores = _window_pairs(small, big)
+    assert pairs[0] == (0, 12)
+    assert int(np.argmax(scores)) == 12
+
+
+def test_banded_dp_finds_the_diagonal_alignment():
+    """Banded storage must not change which path the DP recovers."""
+    from pdb_align.core import _banded_dp_maxscore
+
+    n = 30
+    S = np.full((n, n), -1.0)
+    np.fill_diagonal(S, 5.0)
+    pairs, score = _banded_dp_maxscore(S, gap=2.0, band=6)
+    assert pairs == [(i, i) for i in range(n)]
+    assert score == pytest.approx(5.0 * n)

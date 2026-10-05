@@ -1,4 +1,8 @@
-import os, json, gemmi
+import json
+import os
+
+import gemmi
+
 from pdb_align.__main__ import main
 
 

@@ -1,8 +1,14 @@
+import pytest
+
+pytest.importorskip("plotly", reason="the [app] extras are not installed")
+pytest.importorskip("streamlit", reason="the [app] extras are not installed")
+
+
 def test_webapp_modules_import():
-    import webapp.data  # noqa: F401
-    import webapp.figures  # noqa: F401
-    import webapp.viewer  # noqa: F401
-    import webapp.sections  # noqa: F401
+    import webapp.data
+    import webapp.figures
+    import webapp.sections
+    import webapp.viewer
 
     for fn in ("render_header", "render_overview", "render_3d",
                "render_per_residue", "render_ensemble", "render_export"):

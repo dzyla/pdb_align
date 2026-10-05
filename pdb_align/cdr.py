@@ -21,7 +21,7 @@ Almagro et al. 2014).
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -151,9 +151,14 @@ def cdr_rmsd(
     CDR labels are ``H1..H3`` / ``L1..L3`` (kappa reported as L); if two
     chains of the same type are present, later ones get a ``@chain`` suffix.
     """
-    from .interface import (_as_structure, _chain_residues, _pair_residues,
-                            _match_chain_groups, _collect_backbone, )
     from .core import _kabsch
+    from .interface import (
+        _as_structure,
+        _chain_residues,
+        _collect_backbone,
+        _match_chain_groups,
+        _pair_residues,
+    )
 
     ref_struct = _as_structure(reference)
     model_struct = _as_structure(model)
@@ -222,5 +227,5 @@ def cdr_rmsd(
                      cdr_n_residues={k: len(region_pairs[k]) for k in cdr_out},
                      cdr_sequences={k: region_seqs[k] for k in cdr_out},
                      framework_rmsd=float(fw_rmsd),
-                     n_framework_atoms=int(len(P_fw)),
+                     n_framework_atoms=len(P_fw),
                      chain_types=chain_types)
