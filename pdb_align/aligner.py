@@ -874,10 +874,15 @@ class AlignmentResult:
                 plt.close(fig)
 
     def plot_summary(self, filename: Optional[str] = None, show: bool = False):
-        """Compact multi-panel Nature-style summary: per-residue RMSD + per-chain bar + scores."""
-        import matplotlib
-        if not show:
-            matplotlib.use("Agg")
+        """Compact two-panel summary: per-residue RMSD and per-chain RMSD.
+
+        Does not touch the matplotlib backend. Switching it from inside a
+        library is a global side effect on the caller's process: a notebook or
+        an application that had already selected an interactive backend would
+        find its figures silently stop displaying after one call here. Choosing
+        a backend is the caller's decision — the CLI makes it, before importing
+        pyplot.
+        """
         import matplotlib.pyplot as plt
 
         from . import plotstyle
@@ -1203,8 +1208,11 @@ class EnsembleResult:
                 km.fit(mat)
                 inertias.append(km.inertia_)
             if len(inertias) >= 2:
-                # Standard elbow: k where the drop in inertia is greatest
-                n_clusters = ks[int(np.argmax(-np.diff(inertias)))]
+                # Elbow: the k *after* the largest drop in inertia. Going from
+                # ks[i] to ks[i+1] is what buys the improvement, so the k worth
+                # keeping is ks[i+1]; taking ks[i] systematically returns one
+                # cluster too few.
+                n_clusters = ks[int(np.argmax(-np.diff(inertias))) + 1]
             else:
                 n_clusters = 2
 
@@ -1322,6 +1330,40 @@ class EnsembleResult:
         preview = self.labels[:3]
         suffix = "..." if n > 3 else ""
         return f"<EnsembleResult n_models={n} labels={preview}{suffix}>"
+
+
+def _warn_on_cross_chain_pairs(ref_sel, mob_sel, pairs) -> int:
+    """Warn when a sequence-guided pairing spans a chain junction.
+
+    The single-chain path aligns the *concatenation* of the selected chains.
+    That is the right behaviour when one side is a single chain that should
+    match somewhere inside a multi-chain reference, but the junction between
+    two concatenated chains does not exist in either structure, so a pairing
+    that runs across it joins residues from different chains. The multi-chain
+    path (both sides with several chains) matches chains explicitly and is not
+    affected.
+
+    Returns the number of residue pairs whose chain assignment disagrees.
+    """
+    if len(ref_sel.chain_order) == 1 and len(mob_sel.chain_order) == 1:
+        return 0
+    ref_chains = ref_sel.chain_ids
+    mob_chains = mob_sel.chain_ids
+    seen: dict = {}
+    crossing = 0
+    for i, j in pairs:
+        rc, mc = ref_chains[i], mob_chains[j]
+        if seen.setdefault(mc, rc) != rc:
+            crossing += 1
+    if crossing:
+        warnings.warn(
+            f"{crossing} of {len(pairs)} residue pairs cross a chain junction: "
+            f"the selected chains were concatenated into one sequence, and the "
+            f"alignment ran across the boundary between them, pairing residues "
+            f"from different chains. Select one chain per side, or give both "
+            f"sides several chains so the chain-matching path is used.",
+            UserWarning, stacklevel=3)
+    return crossing
 
 
 def _resolve_workers(workers: Optional[int], n_tasks: int) -> int:
@@ -1891,6 +1933,7 @@ class PDBAligner:
                                              seq_gap_open, seq_gap_extend)
             pairs = pairs_from_alignment(aln)
             if pairs:
+                _warn_on_cross_chain_pairs(ref_sel, mob_sel, pairs)
                 ref_atoms, mob_atoms = paired_atoms(ref_sel, mob_sel, pairs,
                                                     atoms=atoms)
                 si = superimpose_atoms(

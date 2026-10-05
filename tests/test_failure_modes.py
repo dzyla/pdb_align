@@ -4,6 +4,8 @@ A scientific tool must fail loudly. The alternative — returning a result
 object whose every number is None, or quietly filtering a reference structure
 into nothing — is worse than an exception.
 """
+import warnings
+
 import gemmi
 import pytest
 
@@ -86,3 +88,55 @@ def test_unrelated_structures_warn_about_weak_chain_correspondence():
     res = pdb_align.align("tests/data/4hhb_bb.pdb", UBQ)
     q = res.quality
     assert q.band == "poor"
+
+
+def test_concatenating_chains_warns_when_pairs_cross_a_junction(tmp_path):
+    """The single-chain path aligns the concatenation of the selected chains.
+
+    A junction between two concatenated chains exists in neither structure, so
+    a pairing that runs across it joins residues from different chains. Here
+    the mobile is deliberately built as the tail of chain A fused to the head
+    of chain B, so the best alignment must span the junction — and the user has
+    to be told, because those pairs are not a correspondence between chains.
+    """
+    st = gemmi.read_structure("tests/data/4hhb_bb.pdb")
+    st.setup_entities()
+    fused = gemmi.Chain("X")
+    n = 1
+    for chain_name, which in (("A", slice(-40, None)), ("B", slice(0, 40))):
+        for res in list(st[0][chain_name])[which]:
+            copy = gemmi.Residue()
+            copy.name = res.name
+            copy.seqid = gemmi.SeqId(str(n))
+            for atom in res:
+                copy.add_atom(atom)
+            fused.add_residue(copy)
+            n += 1
+    out = gemmi.Structure()
+    model = gemmi.Model("1")
+    model.add_chain(fused)
+    out.add_model(model)
+    out.setup_entities()
+    path = tmp_path / "fused.pdb"
+    out.write_pdb(str(path))
+
+    with pytest.warns(UserWarning, match="cross a chain junction"):
+        pdb_align.align("tests/data/4hhb_bb.pdb", str(path),
+                        chains_ref=["A", "B"], chains_mob=["X"],
+                        mode="seq_guided")
+
+
+def test_no_junction_warning_for_a_clean_single_chain_comparison():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        pdb_align.align(UBQ, UBQ, chains_ref=["A"], chains_mob=["A"],
+                        mode="seq_guided")
+
+
+def test_no_junction_warning_when_both_sides_are_multi_chain():
+    """Both sides multi-chain takes the chain-matching path, which pairs chains
+    explicitly and cannot cross a junction."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        res = pdb_align.align("tests/data/4hhb_bb.pdb", "tests/data/4hhb_bb.pdb")
+    assert res.strategy in ("global", "local")

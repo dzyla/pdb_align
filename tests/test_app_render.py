@@ -51,7 +51,7 @@ REF = {os.path.join(DATA, "ref.pdb")!r}
 MOB = {os.path.join(DATA, "mob.pdb")!r}
 OPTS = {{"seq_gap_open": -10, "seq_gap_extend": -0.5, "atoms": "CA", "min_plddt": 0.0}}
 
-ens = D.run_ensemble(REF, [MOB, REF], None, {{}}, "auto", "auto", OPTS)
+ens = D.run_ensemble(REF, [MOB, REF], None, "auto", "auto", OPTS)
 best = min(ens.results, key=lambda r: r.rmsd if r.rmsd is not None else 1e9)
 st.session_state["_ref_pdb_str"] = open(REF).read()
 S.render_header(best)

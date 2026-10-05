@@ -41,12 +41,19 @@ def run_pairwise(ref_path, mob_path, ref_chains, mob_chains, mode, strategy, opt
     return al.align(**_apply_opts(dict(mode=mode, strategy=strategy), opts))
 
 
-def run_ensemble(ref_path, mob_paths, ref_chains, mob_chains_map, mode, strategy, opts):
+def run_ensemble(ref_path, mob_paths, ref_chains, mode, strategy, opts,
+                 workers=1):
+    """Align every mobile structure against one reference.
+
+    ``strategy`` and ``workers`` are forwarded (they were accepted and then
+    dropped, so the sidebar's Strategy selector had no effect on an ensemble
+    run and every model was aligned serially).
+    """
     al = PDBAligner()
     al.add_reference(ref_path, chains=ref_chains)
     return al.align_ensemble(
-        mob_list=list(mob_paths),
-        **_apply_opts(dict(mode=mode), opts),
+        mob_list=list(mob_paths), workers=workers,
+        **_apply_opts(dict(mode=mode, strategy=strategy), opts),
     )
 
 

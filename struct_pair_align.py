@@ -95,7 +95,7 @@ if run:
                 if is_ensemble:
                     st.session_state.results[key] = (
                         "ensemble",
-                        D.run_ensemble(ref_path, mob_paths, ref_chains, {},
+                        D.run_ensemble(ref_path, mob_paths, ref_chains,
                                        mode_label, strategy, opts))
                 else:
                     res = D.run_pairwise(ref_path, mob_paths[0], ref_chains, None,
