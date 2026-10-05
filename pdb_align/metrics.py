@@ -78,19 +78,35 @@ def _kabsch_np(P: np.ndarray, Q: np.ndarray):
     return R, t
 
 
+# TM-score's search cutoff, clamped as in the reference implementation. The
+# iterative refinement selects residues within this distance; the clamp keeps
+# the search radius sane for very short and very long chains.
+_D0_SEARCH_MIN = 4.5
+_D0_SEARCH_MAX = 8.0
+
+
 def tm_optimal_superposition(ref_coords: np.ndarray, mob_coords: np.ndarray,
-                             length: int, max_iter: int = 20):
+                             length: int, max_iter: int = 20,
+                             max_starts: int = 48):
     """
     TM-score-maximizing superposition for a *fixed* residue correspondence.
 
     TM-align/TM-score report the TM-score of the superposition that maximizes
-    it, not of the RMSD-optimal (Kabsch) superposition; evaluating TM on the
+    it, not of the RMSD-optimal (Kabsch) superposition; evaluating TM in the
     Kabsch frame systematically underestimates it whenever flexible tails or
-    hinges drag the least-squares fit. This implements the standard TM-score
-    heuristic: seed superpositions from contiguous fragments (full length,
-    halves, quarters), then iteratively re-superpose on the residue subset
-    within a distance cutoff, growing the cutoff when too few residues
-    qualify, and keep the superposition with the highest TM-score.
+    hinges drag the least-squares fit.
+
+    This follows the search of the reference TM-score program: seed a
+    superposition from every contiguous fragment of length L, L/2, L/4, ...
+    down to 4 residues at every start position, then iteratively re-superpose
+    on the residues within ``d0_search`` (clamped to [4.5, 8] A, grown by 0.5 A
+    when fewer than three residues qualify) until the selected set stops
+    changing, and keep the best TM-score seen.
+
+    An earlier version used only seven non-overlapping seeds (full chain,
+    halves, quarters) and a fixed cutoff of ``max(d0, 1)``. Both deviations
+    lose TM-score on structures where the best superposition is driven by a
+    sub-domain, because no seed starts inside it.
 
     Args:
         ref_coords: (N, 3) reference CA coordinates.
@@ -98,13 +114,16 @@ def tm_optimal_superposition(ref_coords: np.ndarray, mob_coords: np.ndarray,
             rigid transform is re-derived internally).
         length: normalization length L for the TM-score (reference length).
         max_iter: refinement iterations per seed.
+        max_starts: cap on seed start positions per fragment length, which
+            bounds the search cost on large structures. Raising it cannot
+            lower the score (the search only ever keeps the best seed).
 
     Returns:
         (tm_score, R, t): the maximal TM-score and its superposition, with
         ``R @ mob + t`` in the reference frame.
     """
-    P = np.asarray(ref_coords, dtype=float)
-    Q = np.asarray(mob_coords, dtype=float)
+    P = np.ascontiguousarray(ref_coords, dtype=float)
+    Q = np.ascontiguousarray(mob_coords, dtype=float)
     N = len(P)
     if N == 0 or N != len(Q) or length <= 0:
         return 0.0, np.eye(3), np.zeros(3)
@@ -116,44 +135,55 @@ def tm_optimal_superposition(ref_coords: np.ndarray, mob_coords: np.ndarray,
 
     d0 = compute_d0(length)
     d0_sq = d0 * d0
+    d0_search = min(max(d0, _D0_SEARCH_MIN), _D0_SEARCH_MAX)
 
     def tm_of(R, t):
         d_sq = np.sum((P - ((R @ Q.T).T + t)) ** 2, axis=1)
         return float(np.sum(1.0 / (1.0 + d_sq / d0_sq)) / length), d_sq
 
-    # Seed fragments: full chain, halves, quarters (TMscore-program style).
-    seeds = [(0, N)]
-    for frac in (2, 4):
-        flen = N // frac
-        if flen >= 4:
-            step = max(1, flen)
-            for start in range(0, N - flen + 1, step):
-                seeds.append((start, start + flen))
+    # Fragment lengths L, L/2, L/4, ... >= 4, each at every start position.
+    frag_lengths = []
+    flen = N
+    while flen >= 4:
+        frag_lengths.append(flen)
+        if flen == 4:
+            break
+        flen = max(4, flen // 2)
 
     best_tm, best_R, best_t = -1.0, np.eye(3), np.zeros(3)
-    d_search = max(d0, 1.0)
-    for (s, e) in seeds:
-        R, t = _kabsch_np(P[s:e], Q[s:e])
-        tm, d_sq = tm_of(R, t)
-        if tm > best_tm:
-            best_tm, best_R, best_t = tm, R, t
-        prev_sel = None
-        for _ in range(max_iter):
-            cut = d_search
-            sel = d_sq < cut * cut
-            # grow the cutoff until enough residues qualify
-            while sel.sum() < 3 and cut < 50.0:
-                cut += 0.5
-                sel = d_sq < cut * cut
-            if sel.sum() < 3:
-                break
-            if prev_sel is not None and np.array_equal(sel, prev_sel):
-                break
-            prev_sel = sel
-            R, t = _kabsch_np(P[sel], Q[sel])
+    for flen in frag_lengths:
+        # The reference program tries every start position, which is O(L^2)
+        # seeds — fine in Fortran, 5.5 s at L = 3000 here. Starts are spread
+        # evenly instead, at most `max_starts` per fragment length, so short
+        # fragments still probe the whole chain (consecutive windows of the
+        # same length overlap heavily and converge to the same refinement).
+        n_pos = N - flen + 1
+        if n_pos <= max_starts:
+            starts = range(n_pos)
+        else:
+            starts = np.unique(np.linspace(0, n_pos - 1, max_starts).astype(int))
+        for start in starts:
+            R, t = _kabsch_np(P[start:start + flen], Q[start:start + flen])
             tm, d_sq = tm_of(R, t)
             if tm > best_tm:
                 best_tm, best_R, best_t = tm, R, t
+            prev_sel = None
+            cut = d0_search
+            for _ in range(max_iter):
+                sel = d_sq < cut * cut
+                n_sel = int(sel.sum())
+                if n_sel < 3:
+                    if cut > 50.0:
+                        break
+                    cut += 0.5
+                    continue
+                if prev_sel is not None and np.array_equal(sel, prev_sel):
+                    break
+                prev_sel = sel
+                R, t = _kabsch_np(P[sel], Q[sel])
+                tm, d_sq = tm_of(R, t)
+                if tm > best_tm:
+                    best_tm, best_R, best_t = tm, R, t
     return best_tm, best_R, best_t
 
 

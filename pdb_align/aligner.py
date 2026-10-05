@@ -98,7 +98,8 @@ class AlignmentResult:
                 {"ref": p[0], "mob": p[1], "identity": round(float(p[2]), 1)}
                 for p in self.chain_mapping.pairs
             ]
-        return {
+        multi = len(self.ref_lens) > 1
+        stats = {
             "method": self._chosen.get("name"),
             "strategy": self.strategy,
             "reason": self._chosen.get("reason"),
@@ -106,14 +107,23 @@ class AlignmentResult:
             "tm_score": self.tm_score,
             "tm_score_min": self.get_tm_score("min"),
             "tm_pvalue": self.tm_pvalue,
+            # TM-score is a single-chain measure; say what it was normalized by
+            # so a complex-level value is never mistaken for a per-chain one.
+            "tm_scope": "complex" if multi else "chain",
+            "tm_normalization_length": sum(self.ref_lens.values()),
             "gdt_ts": gdt,
             "lddt_ca": self.lddt_ca,
             "n_aligned": n_aligned,
             "coverage_pct": coverage,
             "chain_mapping": mapping,
+            "chain_mapping_warnings": list(
+                getattr(self.chain_mapping, "warnings", []) or []),
             "ref_file": self.ref_file,
             "mob_file": self.mob_file,
         }
+        if multi:
+            stats["tm_score_per_chain"] = self.tm_score_per_chain()
+        return stats
 
     @property
     def quality(self):
@@ -147,6 +157,10 @@ class AlignmentResult:
             per_residue=per_residue, chain_mapping=s.get("chain_mapping"),
             candidate_rmsds=cand, hinge_regions=hinge,
             tm_pvalue=self.tm_pvalue,
+            mapping_warnings=s.get("chain_mapping_warnings"),
+            tm_scope=s.get("tm_scope"),
+            tm_normalization_length=s.get("tm_normalization_length"),
+            tm_per_chain_available=bool(s.get("tm_score_per_chain")),
         )
 
     def to_dict(self) -> dict:
@@ -177,8 +191,11 @@ class AlignmentResult:
         lines.append(f" Method    : {s['method']}  (strategy: {s['strategy']})")
         lines.append("-" * 52)
         lines.append(f" RMSD          : {fmt_num(s['rmsd'], '.3f')} A")
-        lines.append(f" TM-score      : {fmt_num(s['tm_score'], '.4f')}"
-                     + (f"  (p = {s['tm_pvalue']:.2g})" if s.get('tm_pvalue') is not None else ""))
+        tm_label = ("TM-score (cplx)" if s.get("tm_scope") == "complex"
+                    else "TM-score      ")
+        lines.append(f" {tm_label}: {fmt_num(s['tm_score'], '.4f')}"
+                     + (f"  (p = {s['tm_pvalue']:.2g})"
+                        if s.get('tm_pvalue') is not None else ""))
         lines.append(f" GDT_TS*       : {fmt_num(s['gdt_ts'], '.2f')}")
         lines.append(f" lDDT-Ca       : {fmt_num(s.get('lddt_ca'), '.3f')}  (matched residues)")
         lines.append(f" Aligned res   : {s['n_aligned'] if s['n_aligned'] is not None else 'n/a'}")
@@ -191,10 +208,14 @@ class AlignmentResult:
         df = self.per_chain
         if not df.empty:
             lines.append("-" * 52)
-            lines.append(" Per-chain RMSD:")
+            per_tm = s.get("tm_score_per_chain") or {}
+            lines.append(" Per-chain RMSD" + (" / TM" if per_tm else "") + ":")
             for _, r in df.iterrows():
+                tm = per_tm.get(str(r['chain_ref']))
+                suffix = f"  TM={tm:.3f}" if tm is not None else ""
                 lines.append(f"   {r['chain_ref']}->{r['chain_mob']}: "
-                             f"{r['rmsd']:.3f} A ({int(r['n_residues'])} res)")
+                             f"{r['rmsd']:.3f} A ({int(r['n_residues'])} res)"
+                             f"{suffix}")
         q = self.quality
         lines.append("-" * 52)
         lines.append(f" Quality   : {q.band.upper()}  (confidence: {q.confidence})")
@@ -294,6 +315,35 @@ class AlignmentResult:
         tm, _R, _t = tm_optimal_superposition(P, Q, L)
         self._tm_cache[normalize_by] = float(tm)
         return float(tm)
+
+    def tm_score_per_chain(self) -> dict:
+        """TM-score of each mapped chain pair, normalized by that reference chain.
+
+        TM-score is defined for a single chain against a single chain: its
+        normalization length and its ``d0`` both come from one chain's length.
+        Applied to a whole complex it is still a monotone similarity measure,
+        but it is not comparable with a published per-chain TM-score, and a
+        well-modelled large chain can mask a badly placed small one. Reporting
+        both is the honest option, so the complex-level value is labelled as
+        such and these per-chain values sit next to it.
+        """
+        out: dict = {}
+        if not self._chosen.get("seqguided"):
+            return out
+        si = self._chosen["seqguided"]["si"]
+        chains = si.get("residue_chains")
+        ca_ref, ca_mob = si.get("ca_ref"), si.get("ca_mob")
+        if not chains or ca_ref is None or len(ca_ref) != len(chains):
+            return out
+        chains = np.asarray(chains)
+        for chain in dict.fromkeys(chains.tolist()):
+            m = chains == chain
+            L = self.ref_lens.get(chain)
+            if not L or L <= 15 or m.sum() < 3:
+                continue
+            tm, _R, _t = tm_optimal_superposition(ca_ref[m], ca_mob[m], L)
+            out[str(chain)] = float(tm)
+        return out
 
     @property
     def lddt_ca(self) -> Optional[float]:

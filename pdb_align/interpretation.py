@@ -145,12 +145,16 @@ def _verdict(band, tm_score, rmsd, coverage_pct) -> str:
 
 def assess(*, tm_score, rmsd, coverage_pct, n_aligned, per_residue,
            chain_mapping, candidate_rmsds, hinge_regions=None,
-           tm_pvalue=None) -> AlignmentQuality:
+           tm_pvalue=None, mapping_warnings=None,
+           tm_scope=None, tm_normalization_length=None,
+           tm_per_chain_available=False) -> AlignmentQuality:
     """Turn raw alignment numbers into a plain-language quality assessment.
 
     ``per_residue`` is a list of ``(chain, residue_label, rmsd)`` tuples;
     ``candidate_rmsds`` a list of the seq-guided/seq-free RMSDs (may hold None);
-    ``hinge_regions`` an optional list of ``(chain, start_label, end_label)``.
+    ``hinge_regions`` an optional list of ``(chain, start_label, end_label)``;
+    ``mapping_warnings`` the notes the chain-matching step produced, which
+    belong in the verdict a user reads rather than only in the warning stream.
     """
     band = _band(tm_score, rmsd)
     regions = _flag_deviation_regions(per_residue)
@@ -166,7 +170,23 @@ def assess(*, tm_score, rmsd, coverage_pct, n_aligned, per_residue,
         warnings.append("TM-score unavailable; quality band derived from RMSD.")
     if chain_mapping is not None and len(chain_mapping) == 1:
         warnings.append("Only one chain pair aligned; multi-chain agreement not assessed.")
+    if tm_scope == "complex":
+        length = (f" over {tm_normalization_length} residues"
+                  if tm_normalization_length else "")
+        hint = (" Per-chain TM-scores are reported alongside."
+                if tm_per_chain_available else
+                " A single-chain TM-score is not comparable with it.")
+        warnings.append(
+            f"TM-score is normalized by the whole reference selection{length}, "
+            f"not by one chain, because the selection spans several chains."
+            f"{hint}")
+    for msg in (mapping_warnings or []):
+        warnings.append(msg)
     confidence = _confidence(coverage_pct, tm_pvalue, candidate_rmsds)
+    # A correspondence that sequence cannot support undermines every number
+    # derived from it, so it caps confidence regardless of how good the fit is.
+    if any(m.startswith("Chain correspondence rests") for m in (mapping_warnings or [])):
+        confidence = "low"
     verdict = _verdict(band, tm_score, rmsd, coverage_pct)
     return AlignmentQuality(band=band, verdict=verdict, confidence=confidence,
                             flagged_regions=regions, warnings=warnings)
