@@ -352,7 +352,7 @@ without `numba`; both are asserted in the test suite
 
 ```bash
 pip install -e '.[dev]'
-pytest                      # 232 tests
+pytest                      # 242 tests
 pytest -k crossvalidation   # agreement with the official DockQ and TM-align
 ruff check pdb_align tests
 ```

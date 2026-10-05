@@ -147,8 +147,12 @@ re-scanning for a matching one-letter code.
   the range.
 - New suites: residue-selection integrity, flexible-domain decomposition,
   failure modes, parallel-equals-serial, numba-optional equivalence, kernel
-  equivalence against the obvious implementations, and reporting claims.
-- 230 tests (from 170).
+  equivalence against the obvious implementations, reporting claims, and
+  **known biology** — haemoglobin's identical α copies (0.3 Å, TM 0.996), the
+  homologous α/β pair (1.57 Å, TM 0.895 against TM-align's 0.904, literature
+  ~1.5–2 Å), the swapped-identical-chain correspondence recovered by geometry,
+  and ubiquitin vs crambin as a negative control (TM 0.19, p = 0.18).
+- 242 tests (from 170).
 
 ## [0.3.0] — 2026-08-30
 
