@@ -159,7 +159,7 @@ def _pair_residues(ref_res: List[_Res], mob_res: List[_Res],
 
 
 def _match_chain_groups(ref_struct, model_struct, ref_chains, model_chains):
-    """1:1 ref->model chain mapping within a group via Hungarian on % identity."""
+    """1:1 ref->model chain mapping for one group via Hungarian on % identity."""
     from .chains import match_chains
     from .core import extract_sequences_and_lengths
     ref_seqs, _ = extract_sequences_and_lengths(ref_struct, "ref")
@@ -167,6 +167,32 @@ def _match_chain_groups(ref_struct, model_struct, ref_chains, model_chains):
     mapping = match_chains(ref_seqs, mob_seqs, ref_struct, model_struct,
                            list(ref_chains), list(model_chains))
     return [(a, b) for a, b, *_ in mapping.pairs]
+
+
+def _match_both_groups(ref_struct, model_struct, receptor_chains, ligand_chains,
+                       model_chains):
+    """Map the receptor and ligand groups to model chains in ONE assignment.
+
+    Matching the receptor first and then the ligand among the leftovers looks
+    equivalent but is not, when the assembly contains several copies of the
+    same chain. The receptor's matching searches the whole model, so it can be
+    assigned a copy that belongs to the ligand group; the ligand is then forced
+    onto the copies the receptor left behind, and both groups end up describing
+    the wrong half of the complex. On 4HHB (chains A and C identical α-globin,
+    B and D identical β) asking for receptor C+D produced receptor C->A, D->B
+    and ligand A->C, B->D, which inverted the interface and gave an LRMSD of
+    14.8 A where the correct answer is 20.6 A.
+
+    Assigning all reference chains at once removes the choice: the Hungarian
+    assignment is global, and the geometric tie-break sees the whole assembly,
+    which is the context in which it is correct.
+    """
+    ref_all = list(receptor_chains) + list(ligand_chains)
+    pairs = dict(_match_chain_groups(ref_struct, model_struct, ref_all,
+                                     list(model_chains)))
+    rec = [(c, pairs[c]) for c in receptor_chains if c in pairs]
+    lig = [(c, pairs[c]) for c in ligand_chains if c in pairs]
+    return rec, lig
 
 
 def _residue_contacts(res_a: List[_Res], res_b: List[_Res], cutoff: float):
@@ -315,12 +341,9 @@ def compute_dockq(
 
     if model_receptor_chains is None or model_ligand_chains is None:
         model_chain_names = [ch.name for ch in model_struct[0]]
-        rec_pairs = _match_chain_groups(ref_struct, model_struct,
-                                        receptor_chains, model_chain_names)
-        used = {b for _, b in rec_pairs}
-        lig_candidates = [c for c in model_chain_names if c not in used]
-        lig_pairs = _match_chain_groups(ref_struct, model_struct,
-                                        ligand_chains, lig_candidates)
+        rec_pairs, lig_pairs = _match_both_groups(
+            ref_struct, model_struct, receptor_chains, ligand_chains,
+            model_chain_names)
     else:
         if len(model_receptor_chains) != len(receptor_chains) or \
            len(model_ligand_chains) != len(ligand_chains):
@@ -332,9 +355,6 @@ def compute_dockq(
         raise ValueError("Could not establish a chain correspondence between "
                          "reference and model for the requested groups.")
 
-    mod_rec = _chain_residues(model_struct, [b for _, b in rec_pairs])
-    mod_lig = _chain_residues(model_struct, [b for _, b in lig_pairs])
-
     # Native contacts (fixed) in reference-key space.
     rec_res_flat = [r for c in receptor_chains for r in ref_rec[c]]
     lig_res_flat = [r for c in ligand_chains for r in ref_lig[c]]
@@ -344,33 +364,40 @@ def compute_dockq(
                          f"within {FNAT_CONTACT_CUTOFF} A in the reference — "
                          "there is no native interface to score.")
 
-    # Homomultimer handling: enumerate permutations of model chains within
-    # sequence-identical equivalence classes, keep the mapping with max fnat.
-    rec_pair_options = _mapping_permutations(rec_pairs, ref_rec, mod_rec)
-    lig_pair_options = _mapping_permutations(lig_pairs, ref_lig, mod_lig)
-    if len(rec_pair_options) * len(lig_pair_options) > _MAX_MAPPING_PERMUTATIONS:
-        rec_pair_options, lig_pair_options = [rec_pairs], [lig_pairs]
+    # Symmetric-chain handling. The mapping that is *correct* for DockQ is the
+    # one that best reproduces the native interface contacts, so candidate
+    # mappings are enumerated over sequence-identical chains and ranked by
+    # fnat. The enumeration spans both groups at once: when the same sequence
+    # appears on the receptor and the ligand side (a dimer of heterodimers, an
+    # antibody against a homodimeric antigen), the ambiguity is about which
+    # copy belongs to which group, and a search confined within a group cannot
+    # resolve it. Geometry is deliberately not used here — half the complex may
+    # have moved, which is exactly what is being measured.
+    mapping_options = _joint_mapping_options(
+        rec_pairs, lig_pairs, ref_rec, ref_lig, model_struct)
+    if not mapping_options:
+        mapping_options = [(list(rec_pairs), list(lig_pairs))]
 
     best = None
     pair_cache: dict = {}
-    for rp in rec_pair_options:
-        for lp in lig_pair_options:
-            rec_corr = _GroupCorrespondence(ref_rec, mod_rec, rp, pair_cache)
-            lig_corr = _GroupCorrespondence(ref_lig, mod_lig, lp, pair_cache)
-            model_contacts_model_keys = _residue_contacts(
-                rec_corr.model_res_all, lig_corr.model_res_all, FNAT_CONTACT_CUTOFF)
-            # translate model contacts into reference-key space
-            model_contacts = set()
-            for (ka, kb) in model_contacts_model_keys:
-                ra = rec_corr.ref_for_model.get(ka, ("?",) + ka)
-                rb = lig_corr.ref_for_model.get(kb, ("?",) + kb)
-                model_contacts.add((ra, rb))
-            shared = len(native_contacts & model_contacts)
-            fnat = shared / len(native_contacts)
-            fnonnat = (1.0 - shared / len(model_contacts)) if model_contacts else 0.0
-            cand = (fnat, rec_corr, lig_corr, model_contacts, fnonnat)
-            if best is None or fnat > best[0]:
-                best = cand
+    for rp, lp in mapping_options:
+        mod_rec_opt = _chain_residues(model_struct, [b for _, b in rp])
+        mod_lig_opt = _chain_residues(model_struct, [b for _, b in lp])
+        rec_corr = _GroupCorrespondence(ref_rec, mod_rec_opt, rp, pair_cache)
+        lig_corr = _GroupCorrespondence(ref_lig, mod_lig_opt, lp, pair_cache)
+        model_contacts_model_keys = _residue_contacts(
+            rec_corr.model_res_all, lig_corr.model_res_all, FNAT_CONTACT_CUTOFF)
+        # translate model contacts into reference-key space
+        model_contacts = set()
+        for (ka, kb) in model_contacts_model_keys:
+            ra = rec_corr.ref_for_model.get(ka, ("?",) + ka)
+            rb = lig_corr.ref_for_model.get(kb, ("?",) + kb)
+            model_contacts.add((ra, rb))
+        shared = len(native_contacts & model_contacts)
+        fnat = shared / len(native_contacts)
+        fnonnat = (1.0 - shared / len(model_contacts)) if model_contacts else 0.0
+        if best is None or fnat > best[0]:
+            best = (fnat, rec_corr, lig_corr, model_contacts, fnonnat)
     fnat, rec_corr, lig_corr, model_contacts, fnonnat = best
 
     # Interface residues (native 10 A heavy-atom definition).
@@ -422,6 +449,52 @@ def compute_dockq(
         ligand_mapping=list(lig_corr.chain_pairs),
         interface_ligand_residues=sorted(f"{k[0]}:{k[1]}{k[2]}" for k in iface_lig_keys),
     )
+
+
+def _joint_mapping_options(rec_pairs, lig_pairs, ref_rec, ref_lig, model_struct):
+    """Candidate (receptor, ligand) chain mappings, permuting interchangeable
+    model chains across BOTH groups.
+
+    Reference chains are grouped by their own sequence; the model chains
+    currently assigned to reference chains of one sequence are the pool that
+    may be permuted among them. Because the pool is built from the combined
+    receptor+ligand assignment, a model chain can move from the receptor group
+    to the ligand group and back — which is the only way to resolve "which copy
+    of this chain is the one in this group" on a symmetric assembly.
+
+    Returns a bounded list of (rec_pairs, lig_pairs); always includes the input.
+    """
+    combined = list(rec_pairs) + list(lig_pairs)
+    rec_refs = [a for a, _ in rec_pairs]
+    seq_of = {}
+    for chain, residues in list(ref_rec.items()) + list(ref_lig.items()):
+        seq_of[chain] = "".join(r.letter for r in residues)
+
+    classes: Dict[str, List[str]] = {}
+    for ref_chain, _model_chain in combined:
+        classes.setdefault(seq_of.get(ref_chain, ref_chain), []).append(ref_chain)
+    swappable = [members for members in classes.values() if len(members) > 1]
+    if not swappable:
+        return [(list(rec_pairs), list(lig_pairs))]
+
+    n_perms = 1
+    for members in swappable:
+        n_perms *= math.factorial(len(members))
+    if n_perms > _MAX_MAPPING_PERMUTATIONS:
+        return [(list(rec_pairs), list(lig_pairs))]
+
+    assigned = dict(combined)
+    options = []
+    perm_sets = [list(itertools.permutations([assigned[m] for m in members]))
+                 for members in swappable]
+    for combo in itertools.product(*perm_sets):
+        remap = dict(assigned)
+        for members, perm in zip(swappable, combo):
+            remap.update(dict(zip(members, perm)))
+        rec = [(a, remap[a]) for a in rec_refs]
+        lig = [(a, remap[a]) for a, _ in lig_pairs]
+        options.append((rec, lig))
+    return options
 
 
 def _mapping_permutations(chain_pairs, ref_res_by_chain, mod_res_by_chain):
@@ -517,11 +590,9 @@ def epitope_metrics(
 
     if model_receptor_chains is None or model_ligand_chains is None:
         model_chain_names = [ch.name for ch in model_struct[0]]
-        rec_pairs = _match_chain_groups(ref_struct, model_struct,
-                                        receptor_chains, model_chain_names)
-        used = {b for _, b in rec_pairs}
-        lig_pairs = _match_chain_groups(ref_struct, model_struct, ligand_chains,
-                                        [c for c in model_chain_names if c not in used])
+        rec_pairs, lig_pairs = _match_both_groups(
+            ref_struct, model_struct, receptor_chains, ligand_chains,
+            model_chain_names)
     else:
         rec_pairs = list(zip(receptor_chains, model_receptor_chains))
         lig_pairs = list(zip(ligand_chains, model_ligand_chains))

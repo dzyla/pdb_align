@@ -294,9 +294,32 @@ their permutations (capped at 720 combinations).
 Raises rather than guessing when the two groups share no contacts in the
 reference — there is then no native interface to score.
 
-**Cross-validated against the official `DockQ` package** on six decoys
-spanning DockQ 0.02–1.00 and three CAPRI classes: fnat exact, iRMSD and LRMSD
-within 1 × 10⁻⁴ Å, DockQ within 1 × 10⁻⁵.
+**Symmetric chains.** The mapping that is correct for DockQ is the one that
+best reproduces the native interface contacts, so candidate mappings are
+enumerated over sequence-identical chains and ranked by fnat. The enumeration
+spans **both groups at once**: when the same sequence appears on the receptor
+and the ligand side — a dimer of heterodimers, an antibody against a
+homodimeric antigen — the ambiguity is about which copy belongs to which
+group, and a search confined within a group cannot resolve it. Geometry is
+deliberately not used to break these ties: half the complex may have moved,
+which is precisely the quantity being measured.
+
+**Who is the receptor.** `pdb_align` honours the receptor/ligand groups you
+pass. The reference implementation instead assigns them itself (the larger
+group becomes the receptor; on a tie, the second one). LRMSD is defined *after
+superposing on the receptor*, so it — and therefore DockQ — depends on that
+choice, and the two tools will differ whenever the conventions differ. This is
+an input convention, not a disagreement: given the same assignment the numbers
+are identical. Fixing the assignment is usually what you want (an antibody's
+H+L should stay the receptor regardless of the antigen's size).
+
+**Cross-validated against the official `DockQ` package** on two fronts: six
+synthetic single-chain-per-side decoys spanning DockQ 0.02–1.00 and three
+CAPRI classes, and the merged multi-chain path on a real complex (4HHB,
+receptor A+B vs ligand C+D, displaced by rotations of 0–40°, with real side
+chains and two copies of every chain). In both, with the same receptor/ligand
+assignment: fnat exact, iRMSD and LRMSD within 1 × 10⁻⁴ Å, DockQ within
+1 × 10⁻⁵.
 
 ### Epitope / paratope agreement
 

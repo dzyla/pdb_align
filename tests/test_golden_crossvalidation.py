@@ -150,3 +150,100 @@ def test_raising_the_seed_cap_cannot_lower_the_tm_score():
     narrow, _, _ = tm_optimal_superposition(P, Q, len(P), max_starts=8)
     wide, _, _ = tm_optimal_superposition(P, Q, len(P), max_starts=256)
     assert wide >= narrow - 1e-12
+
+
+# --- DockQ on a real complex, merged multi-chain groups ------------------------
+
+def _merge_groups(struct, groups):
+    """Collapse each group of chains into one sequentially numbered chain.
+
+    The official implementation scores pairwise chain interfaces, so comparing
+    our merged-group DockQ against it requires physically merging the groups
+    first — which is also how the reference tool is used for antibody H+L.
+    """
+    import gemmi
+    out = gemmi.Structure()
+    model = gemmi.Model("1")
+    for new_name, members in groups.items():
+        chain = gemmi.Chain(new_name)
+        n = 1
+        for cname in members:
+            for res in struct[0][cname]:
+                copy = gemmi.Residue()
+                copy.name = res.name
+                copy.seqid = gemmi.SeqId(str(n))
+                for atom in res:
+                    copy.add_atom(atom)
+                chain.add_residue(copy)
+                n += 1
+        model.add_chain(chain)
+    out.add_model(model)
+    out.setup_entities()
+    return out
+
+
+@pytest.mark.parametrize("angle,shift", [
+    (0.0, (0.0, 0.0, 0.0)),
+    (3.0, (0.0, 0.0, 0.0)),
+    (10.0, (2.0, 0.0, 0.0)),
+    (40.0, (0.0, 0.0, 0.0)),
+])
+def test_dockq_matches_official_on_a_real_multichain_complex(tmp_path, angle, shift):
+    """Real side-chain geometry, merged multi-chain groups: 4HHB with chains
+    C+D displaced, receptor A+B vs ligand C+D.
+
+    The synthetic decoys above are single-chain-per-side. This exercises the
+    merged-group path, the chain correspondence on an assembly with two copies
+    of each chain, and real side chains — the combination that exposed a chain
+    mapping that paired α-globin with β-globin and inverted the interface.
+
+    The reference implementation chooses the receptor itself (the larger group;
+    on a tie, the second), and LRMSD is defined after superposing on the
+    receptor, so the comparison is made in whichever assignment it picked.
+    """
+    import math
+
+    import gemmi
+
+    from pdb_align.interface import compute_dockq
+
+    groups = {"R": ("A", "B"), "L": ("C", "D")}
+    native = gemmi.read_structure("tests/data/4hhb_bb.pdb")
+    native.setup_entities()
+    p_native = tmp_path / "native.pdb"
+    native.write_pdb(str(p_native))
+    p_native_merged = tmp_path / "native_merged.pdb"
+    _merge_groups(native, groups).write_pdb(str(p_native_merged))
+
+    model = gemmi.read_structure("tests/data/4hhb_bb.pdb")
+    model.setup_entities()
+    a = math.radians(angle)
+    R = np.array([[math.cos(a), -math.sin(a), 0.0],
+                  [math.sin(a), math.cos(a), 0.0],
+                  [0.0, 0.0, 1.0]])
+    t = np.asarray(shift, dtype=float)
+    for chain in model[0]:
+        if chain.name in ("C", "D"):
+            for res in chain:
+                for atom in res:
+                    atom.pos = gemmi.Position(*(R @ np.array(atom.pos.tolist()) + t))
+    p_model = tmp_path / f"model_{angle}.pdb"
+    model.write_pdb(str(p_model))
+    p_model_merged = tmp_path / f"model_merged_{angle}.pdb"
+    _merge_groups(model, groups).write_pdb(str(p_model_merged))
+
+    ref = _official_dockq(p_model_merged, p_native_merged, {"R": "R", "L": "L"})
+    # Mirror the reference tool's own receptor/ligand choice.
+    receptor = groups["R"] if ref["class1"] == "receptor" else groups["L"]
+    ligand = groups["L"] if ref["class1"] == "receptor" else groups["R"]
+
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("ignore", UserWarning)
+        ours = compute_dockq(str(p_native), str(p_model), list(receptor), list(ligand))
+
+    assert ours.receptor_mapping == [(c, c) for c in receptor]
+    assert ours.fnat == pytest.approx(ref["fnat"], abs=1e-9)
+    assert ours.irmsd == pytest.approx(ref["iRMSD"], abs=1e-4)
+    assert ours.lrmsd == pytest.approx(ref["LRMSD"], abs=1e-4)
+    assert ours.dockq == pytest.approx(ref["DockQ"], abs=1e-5)

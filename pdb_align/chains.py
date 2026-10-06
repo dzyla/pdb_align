@@ -36,6 +36,9 @@ from .core import (
 MAX_PERMUTE_CHAINS = 24
 _TIE_TOL = 5.0          # % identity within which chains are indistinguishable
 _REFINE_MAX_ROUNDS = 10  # ICP rounds; it converges in 2-3 on real assemblies
+# Added to the centroid distance of a pairing that sequence rules out, so the
+# geometric reassignment can only permute interchangeable chains.
+_INCOMPATIBLE_PENALTY = 1.0e6
 
 # A correspondence resting on this little sequence identity is not evidence of
 # homology: unrelated protein chains align at roughly 10-20% identity by
@@ -188,6 +191,24 @@ def _refine_by_superposition(mapping, ref_struct, mob_struct, r_ids, m_ids, mat)
     if len(common_r) < 2 or len(common_m) < 2:
         return mapping
 
+    # Geometry breaks ties; it does not overrule sequence. A pair whose
+    # identity is well below the best available for that reference chain is
+    # forbidden, so a chain can only be reassigned among candidates sequence
+    # says are interchangeable. Without this the reassignment cost is pure
+    # centroid distance, and on a dimer of heterodimers it happily paired
+    # α-globin with β-globin because their centroids happened to be closer —
+    # which drove fnat to 0 while every other number still looked plausible.
+    r_index = {c: i for i, c in enumerate(r_ids)}
+    m_index = {c: j for j, c in enumerate(m_ids)}
+
+    def _compatible(a: str, b: str) -> bool:
+        i, j = r_index.get(a), m_index.get(b)
+        if i is None or j is None:
+            return True
+        row = mat[i]
+        best = float(np.max(row)) if row.size else 0.0
+        return float(mat[i, j]) >= max(best - _TIE_TOL, 0.0)
+
     current = [(a, b) for a, b, *_ in mapping.pairs if a in r_cen and b in m_cen]
     best_pairs, best_cost, refined = current, np.inf, False
     seen = set()
@@ -203,7 +224,11 @@ def _refine_by_superposition(mapping, ref_struct, mob_struct, r_ids, m_ids, mat)
             break
         R, t, _ = _kabsch(P, Q)
         moved = {b: R @ m_cen[b] + t for b in common_m}
-        cost = np.array([[np.linalg.norm(r_cen[a] - moved[b]) for b in common_m]
+        # A large finite penalty rather than inf: the assignment must stay
+        # solvable even when no compatible pairing exists for some chain.
+        cost = np.array([[np.linalg.norm(r_cen[a] - moved[b])
+                          + (0.0 if _compatible(a, b) else _INCOMPATIBLE_PENALTY)
+                          for b in common_m]
                          for a in common_r])
         ri, ci = linear_sum_assignment(cost)
         total = float(cost[ri, ci].sum())

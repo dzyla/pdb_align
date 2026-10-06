@@ -52,6 +52,26 @@ re-scanning for a matching one-letter code.
   The hinged haemoglobin now gives 4 rigid domains at 0.000 Å instead of 9
   with a 4.55 Å artefact.
 
+### Fixed — chain correspondence **[affects results]**
+
+Found by cross-validating DockQ against the official implementation on a
+*real* multi-chain complex; the previous cross-validation used only synthetic
+single-chain-per-side decoys, where neither defect can appear.
+
+- **The geometric tie-break could overrule sequence.** The homomultimer
+  refinement reassigned chains by centroid proximity alone, so on 4HHB
+  (A, C identical α-globin; B, D identical β) it paired reference α-globin
+  with model β-globin — `fnat` went to 0 while every other number still looked
+  plausible. Geometry may now only permute chains sequence says are
+  interchangeable (within the 5% tie tolerance).
+- **The receptor group could steal the ligand's chains.** Matching the
+  receptor first against every model chain and the ligand among the leftovers
+  inverted the interface on a symmetric assembly: asking for receptor C+D gave
+  receptor C→A, D→B and ligand A→C, B→D, and an LRMSD of 14.8 Å where the
+  correct answer is 20.6 Å. Both groups are now assigned in one search, and
+  candidate mappings are enumerated across both groups and ranked by fnat —
+  the criterion that actually defines the correct mapping for DockQ.
+
 ### Fixed — other
 
 - `export_bundle()` shipped no reference structure, and its PyMOL/ChimeraX
@@ -141,10 +161,11 @@ re-scanning for a matching one-letter code.
   entirely straight-line poly-alanine rods — collinear Cα positions make a
   Kabsch fit rank-deficient about the chain axis — which is why none of the
   pairing bugs were caught. Synthetic complexes are now ideal α-helices.
-- DockQ cross-validation extended to six decoys spanning DockQ 0.02–1.00 and
-  three CAPRI classes, with tolerances tightened to 1e-4 Å (iRMSD/LRMSD) and
-  exact agreement on fnat, plus a guard test that the decoys really do span
-  the range.
+- DockQ cross-validation extended to six synthetic decoys spanning DockQ
+  0.02–1.00 and three CAPRI classes, **and** to the merged multi-chain path on
+  a real complex (4HHB, receptor A+B vs ligand C+D at rotations of 0–40°),
+  with tolerances tightened to 1e-4 Å (iRMSD/LRMSD) and exact agreement on
+  fnat, plus a guard test that the decoys really do span the range.
 - New suites: residue-selection integrity, flexible-domain decomposition,
   failure modes, parallel-equals-serial, numba-optional equivalence, kernel
   equivalence against the obvious implementations, reporting claims, and
@@ -152,7 +173,7 @@ re-scanning for a matching one-letter code.
   homologous α/β pair (1.57 Å, TM 0.895 against TM-align's 0.904, literature
   ~1.5–2 Å), the swapped-identical-chain correspondence recovered by geometry,
   and ubiquitin vs crambin as a negative control (TM 0.19, p = 0.18).
-- 242 tests (from 170).
+- 251 tests (from 170).
 
 ## [0.3.0] — 2026-08-30
 
