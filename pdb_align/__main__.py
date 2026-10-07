@@ -38,11 +38,22 @@ def build_parser():
     p.add_argument("--mob-chains", "--mob_chains", dest="mob_chains",
                    help="Mobile chains, e.g. 'A'")
     p.add_argument("--mode", default="auto",
-                   help="auto | seq_guided | seq_free_shape | seq_free_window | flexible")
+                   choices=["auto", "seq_guided", "seq_free_auto",
+                            "seq_free_shape", "seq_free_window", "flexible"],
+                   help="alignment mode (default auto)")
     p.add_argument("--strategy", default="auto", choices=["auto", "global", "local"],
                    help="Multi-chain superposition strategy (default auto)")
-    p.add_argument("--atoms", default="CA", help="CA | backbone | all_heavy")
-    p.add_argument("--min-plddt", "--min_plddt", dest="min_plddt", type=float, default=0.0)
+    p.add_argument("--atoms", default="CA",
+                   choices=["CA", "backbone", "all_heavy"],
+                   help="atoms to superpose (default CA)")
+    p.add_argument("--min-plddt", "--min_plddt", dest="min_plddt", type=float,
+                   default=0.0,
+                   help="pLDDT floor, applied only to a structure whose "
+                        "B-factor column looks like pLDDT")
+    p.add_argument("--min-b-factor", "--min_b_factor", dest="min_b_factor",
+                   type=float, default=0.0,
+                   help="Ca B-factor floor, applied to both structures "
+                        "(use this, not --min-plddt, on experimental models)")
     p.add_argument("-o", "--out", help="Write aligned mobile structure to this file")
     p.add_argument("--plot", nargs="?", const="rmsd.png",
                    help="Write per-residue RMSD plot (default rmsd.png)")
@@ -52,6 +63,10 @@ def build_parser():
     p.add_argument("--report", help="Write the text/JSON report to this file")
     p.add_argument("--csv", help="Write per-residue RMSD table to this CSV")
     p.add_argument("--save", help="Save full result to a .npz for later replotting")
+    p.add_argument("--export-bundle", dest="export_bundle",
+                   help="Write a reproducible bundle (aligned structure, "
+                        "reference, RMSD table, plots, PyMOL/ChimeraX scripts, "
+                        "reports) to this .zip")
     p.add_argument("--json", action="store_true", help="Emit machine-readable JSON to stdout")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
@@ -83,6 +98,7 @@ def main(argv=None) -> int:
                 antibody_chains=args.antibody_chains,
                 antigen_chains=args.antigen_chains,
                 mode=args.mode, atoms=args.atoms, min_plddt=args.min_plddt,
+                min_b_factor=args.min_b_factor,
                 confidence_files=confidence,
             )
         except (ValueError, AlignmentFailedError) as e:
@@ -115,9 +131,15 @@ def main(argv=None) -> int:
         aligner.add_reference(ref, chains=ref_chains)
         aligner.add_mobile(mob, chains=mob_chains)
         res = aligner.align(mode=args.mode, strategy=args.strategy,
-                            atoms=args.atoms, min_plddt=args.min_plddt)
+                            atoms=args.atoms, min_plddt=args.min_plddt,
+                            min_b_factor=args.min_b_factor)
     except Exception as e:
         print(f"Alignment failed: {e}", file=sys.stderr)
+        # A one-line message is right for a bad selection; it is useless for a
+        # bug. -v asks for detail, so -v gets the traceback.
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
         return 1
 
     # Default: stats to terminal. Nothing written unless a flag asks.
@@ -139,6 +161,9 @@ def main(argv=None) -> int:
     if args.save:
         res.save(args.save)
         if not args.json: print(f"Saved result: {args.save}")
+    if args.export_bundle:
+        written = res.export_bundle(args.export_bundle)
+        if not args.json: print(f"Wrote bundle: {written}")
     if args.plot is not None:
         res.plot_rmsd(filename=args.plot)
         if args.show:

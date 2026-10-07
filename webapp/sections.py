@@ -135,7 +135,7 @@ def render_evaluation(ev):
         st.json(ev.to_dict())
 
 
-def render_export(obj, is_ensemble):
+def render_export(obj):
     st.write("One-click reproducible bundle:")
     if st.button("📦 Build bundle (ZIP)"):
         out = os.path.join(tempfile.mkdtemp(), "bundle.zip")

@@ -40,6 +40,7 @@ import numpy as np
 
 from .core import (
     _kabsch,
+    _pair_identity,
     pairs_from_alignment,
     perform_sequence_alignment,
     residue_letter,
@@ -55,6 +56,14 @@ BACKBONE_ATOMS = ("N", "CA", "C", "O")
 PDOCKQ_CUTOFF = 8.0            # A, CB-CB (CA for Gly) contact cutoff
 _PDOCKQ_L, _PDOCKQ_X0, _PDOCKQ_K, _PDOCKQ_B = 0.724, 152.611, 0.052, 0.018
 _MAX_MAPPING_PERMUTATIONS = 720  # cap on the homomultimer fnat search
+# Two chains count as interchangeable copies when they are this similar (%
+# identity over the shorter chain) *and* of comparable length. Byte-identical
+# sequences are the wrong test: copies of one chain in a deposited structure
+# almost always differ by a disordered terminus or loop. The length guard is
+# what keeps a 20-residue fragment out of the class of a 300-residue chain it
+# happens to match perfectly over its own length.
+_INTERCHANGEABLE_IDENTITY = 95.0
+_INTERCHANGEABLE_LENGTH_RATIO = 0.9
 
 
 def capri_class(dockq: float) -> str:
@@ -373,8 +382,8 @@ def compute_dockq(
     # copy belongs to which group, and a search confined within a group cannot
     # resolve it. Geometry is deliberately not used here — half the complex may
     # have moved, which is exactly what is being measured.
-    mapping_options = _joint_mapping_options(
-        rec_pairs, lig_pairs, ref_rec, ref_lig, model_struct)
+    mapping_options = _joint_mapping_options(rec_pairs, lig_pairs,
+                                             ref_rec, ref_lig)
     if not mapping_options:
         mapping_options = [(list(rec_pairs), list(lig_pairs))]
 
@@ -451,7 +460,22 @@ def compute_dockq(
     )
 
 
-def _joint_mapping_options(rec_pairs, lig_pairs, ref_rec, ref_lig, model_struct):
+def _interchangeable(seq_a: str, seq_b: str) -> bool:
+    """True if two reference chains are copies of each other for mapping.
+
+    Near-identity, not equality: see ``_INTERCHANGEABLE_IDENTITY``.
+    """
+    if seq_a == seq_b:
+        return True
+    if not seq_a or not seq_b:
+        return False
+    shorter, longer = sorted((len(seq_a), len(seq_b)))
+    if shorter / longer < _INTERCHANGEABLE_LENGTH_RATIO:
+        return False
+    return _pair_identity(seq_a, seq_b)[1] >= _INTERCHANGEABLE_IDENTITY
+
+
+def _joint_mapping_options(rec_pairs, lig_pairs, ref_rec, ref_lig):
     """Candidate (receptor, ligand) chain mappings, permuting interchangeable
     model chains across BOTH groups.
 
@@ -470,10 +494,19 @@ def _joint_mapping_options(rec_pairs, lig_pairs, ref_rec, ref_lig, model_struct)
     for chain, residues in list(ref_rec.items()) + list(ref_lig.items()):
         seq_of[chain] = "".join(r.letter for r in residues)
 
-    classes: Dict[str, List[str]] = {}
+    # Group the reference chains into classes of interchangeable copies.
+    # Greedy against each class's first member, which is enough for the real
+    # case (N copies of one chain, all mutually near-identical).
+    classes: List[Tuple[str, List[str]]] = []
     for ref_chain, _model_chain in combined:
-        classes.setdefault(seq_of.get(ref_chain, ref_chain), []).append(ref_chain)
-    swappable = [members for members in classes.values() if len(members) > 1]
+        seq = seq_of.get(ref_chain, ref_chain)
+        for rep_seq, members in classes:
+            if _interchangeable(seq, rep_seq):
+                members.append(ref_chain)
+                break
+        else:
+            classes.append((seq, [ref_chain]))
+    swappable = [members for _seq, members in classes if len(members) > 1]
     if not swappable:
         return [(list(rec_pairs), list(lig_pairs))]
 
@@ -494,33 +527,6 @@ def _joint_mapping_options(rec_pairs, lig_pairs, ref_rec, ref_lig, model_struct)
         rec = [(a, remap[a]) for a in rec_refs]
         lig = [(a, remap[a]) for a, _ in lig_pairs]
         options.append((rec, lig))
-    return options
-
-
-def _mapping_permutations(chain_pairs, ref_res_by_chain, mod_res_by_chain):
-    """Alternative (ref, model) chain pairings permuting sequence-identical
-    model chains. Returns at least the input pairing."""
-    seqs = {}
-    for _, mc in chain_pairs:
-        seqs[mc] = "".join(r.letter for r in mod_res_by_chain[mc])
-    classes: Dict[str, List[str]] = {}
-    for mc, s in seqs.items():
-        classes.setdefault(s, []).append(mc)
-    swappable = [v for v in classes.values() if len(v) > 1]
-    if not swappable:
-        return [list(chain_pairs)]
-    n_perms = 1
-    for group in swappable:
-        n_perms *= math.factorial(len(group))
-    if n_perms > _MAX_MAPPING_PERMUTATIONS:
-        return [list(chain_pairs)]
-    options = []
-    perm_sets = [list(itertools.permutations(g)) for g in swappable]
-    for combo in itertools.product(*perm_sets):
-        remap = {}
-        for group, perm in zip(swappable, combo):
-            remap.update(dict(zip(group, perm)))
-        options.append([(rc, remap.get(mc, mc)) for rc, mc in chain_pairs])
     return options
 
 

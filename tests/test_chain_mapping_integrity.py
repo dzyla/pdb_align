@@ -137,3 +137,56 @@ def test_geometry_may_not_pair_chains_of_different_sequence():
         mapping = match_chains(seqs, seqs, st, st, ["A", "B"], ["A", "B", "C", "D"])
     for ref, mob, identity, _score in mapping.pairs:
         assert identity > 90.0, (ref, mob, identity)
+
+
+def _chain_residues(struct, chains, trim=0, trim_chain=None):
+    from pdb_align.core import select_residues
+    out = {}
+    for c in chains:
+        residues = list(select_residues(struct, [c]).residues)
+        if trim and c == trim_chain:
+            residues = residues[trim:]
+        out[c] = residues
+    return out
+
+
+def test_mapping_search_treats_near_identical_copies_as_interchangeable():
+    """Copies of one chain in a real native rarely have identical sequences.
+
+    One copy is always missing a terminus or a disordered loop. Requiring
+    byte-identical sequences before two chains may be swapped switched the
+    fnat-maximising search off on exactly the structures it exists for: on
+    4HHB, removing three modelled residues from one alpha chain dropped the
+    candidate mappings from four to two, and the alpha/alpha swap — the whole
+    point of the search — was no longer among them.
+    """
+    from pdb_align.interface import _joint_mapping_options
+
+    st = gemmi.read_structure(HHB)
+    st.setup_entities()
+    rec_pairs = [("A", "A"), ("B", "B")]
+    lig_pairs = [("C", "C"), ("D", "D")]
+    ref_lig = _chain_residues(st, ["C", "D"])
+
+    identical = _joint_mapping_options(rec_pairs, lig_pairs,
+                                       _chain_residues(st, ["A", "B"]), ref_lig)
+    near = _joint_mapping_options(
+        rec_pairs, lig_pairs,
+        _chain_residues(st, ["A", "B"], trim=3, trim_chain="A"), ref_lig)
+
+    assert len(identical) == 4          # alpha swap x beta swap
+    assert len(near) == len(identical)
+    assert any(dict(rec)["A"] == "C" for rec, _lig in near)
+
+
+def test_mapping_search_never_swaps_chains_of_different_sequence():
+    """Regression guard: an alpha-globin chain is not interchangeable with a
+    beta-globin one, however the grouping is computed."""
+    from pdb_align.interface import _joint_mapping_options
+
+    st = gemmi.read_structure(HHB)
+    st.setup_entities()
+    opts = _joint_mapping_options([("A", "A")], [("B", "B")],
+                                  _chain_residues(st, ["A"]),
+                                  _chain_residues(st, ["B"]))
+    assert opts == [([("A", "A")], [("B", "B")])]

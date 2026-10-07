@@ -30,6 +30,7 @@ from .core import (
     select_residues,
     sequence_independent_alignment_joined_v2,
     superimpose_atoms,
+    write_structure,
 )
 from .exceptions import ChainNotFoundError
 from .metrics import calculate_lddt, tm_optimal_superposition
@@ -62,7 +63,8 @@ class AlignmentResult:
     """
     def __init__(self, chosen: dict, seqguided: dict, seqfree: dict, ref_file: str,
                  mob_file: str, mob_struct, ref_lens: dict, mob_lens: dict,
-                 verbose: bool = False, domains: Optional[List["DomainResult"]] = None):
+                 verbose: bool = False, domains: Optional[List["DomainResult"]] = None,
+                 candidate_failures: Optional[List[str]] = None):
         self._chosen = chosen
         self._seqguided = seqguided
         self._seqfree = seqfree
@@ -73,6 +75,10 @@ class AlignmentResult:
         self.mob_lens = mob_lens
         self.verbose = verbose
         self.domains = domains  # List[DomainResult] or None
+        # Strategies that could not be computed at all. mode="auto" claims to
+        # have compared two candidates; when one of them failed, every number
+        # here rests on one, and the report has to say so.
+        self.candidate_failures = list(candidate_failures or [])
         self.strategy = "single"
         self.chain_mapping = None
         self._per_chain = None  # optional DataFrame set by multi-chain path
@@ -131,6 +137,7 @@ class AlignmentResult:
             "chain_mapping": mapping,
             "chain_mapping_warnings": list(
                 getattr(self.chain_mapping, "warnings", []) or []),
+            "candidate_failures": list(self.candidate_failures),
             "ref_file": self.ref_file,
             "mob_file": self.mob_file,
         }
@@ -174,6 +181,7 @@ class AlignmentResult:
             tm_scope=s.get("tm_scope"),
             tm_normalization_length=s.get("tm_normalization_length"),
             tm_per_chain_available=bool(s.get("tm_score_per_chain")),
+            candidate_failures=s.get("candidate_failures"),
         )
 
     def to_dict(self) -> dict:
@@ -432,27 +440,33 @@ class AlignmentResult:
             return self._chosen["seqfree"].pairs
         return None
 
-    def save_aligned_pdb(self, filename: str, subset_only: bool = False, preserve_bfactor: bool = False):
-        """Saves the aligned mobile structure to a PDB file.
+    def save_aligned_pdb(self, filename: str, subset_only: bool = False,
+                         preserve_bfactor: bool = False) -> str:
+        """Save the aligned mobile structure; return the path actually written.
 
         By default the per-residue alignment distance is written into the
         B-factor column (useful for heat-map colouring). Pass
         ``preserve_bfactor=True`` to keep the input B-factors (e.g. AlphaFold
-        pLDDT) untouched.
+        pLDDT) untouched, and ``subset_only=True`` to write only the residues
+        that took part in the alignment.
+
+        A structure the PDB format cannot hold (a chain name longer than one
+        character, say) is written as mmCIF under the same basename, with a
+        warning; the returned path is the one to open.
         """
         color_by = "bfactor" if preserve_bfactor else "rmsd"
-        out_struct = self._build_aligned_structure(color_by=color_by)
-        if filename.lower().endswith(".cif") or filename.lower().endswith(".mmcif"):
-            out_struct.make_mmcif_document().write_file(filename)
-        else:
-            out_struct.write_pdb(filename)
+        out_struct = self._build_aligned_structure(color_by=color_by,
+                                                   subset_only=subset_only)
+        return write_structure(out_struct, filename)
 
-    def _build_aligned_structure(self, color_by: str = "rmsd"):
+    def _build_aligned_structure(self, color_by: str = "rmsd",
+                                 subset_only: bool = False):
         """Return a transformed clone of the mobile structure.
 
         ``color_by="rmsd"`` writes the per-residue alignment deviation (Å) into
         every atom's ``b_iso``; ``color_by`` in ``{"bfactor", "plddt"}`` leaves the
-        original B-factors untouched. Shared by :meth:`save_aligned_pdb` and
+        original B-factors untouched. ``subset_only=True`` keeps only the
+        residues that were matched. Shared by :meth:`save_aligned_pdb` and
         :meth:`aligned_structure` so file output and in-memory views are identical.
         """
         import numpy as np
@@ -508,6 +522,19 @@ class AlignmentResult:
                        r_ico.strip() if hasattr(r_ico, 'strip') else "")
                 dist_map[key] = float(per_res_rmsd[k])
 
+        # Which mobile residues took part, regardless of the colouring mode:
+        # `dist_map` is only populated when the deviation is being written.
+        matched_keys = set(dist_map)
+        for ma in mob_atoms:
+            r_ico = getattr(ma, 'res_icode', '')
+            matched_keys.add((getattr(ma, 'chain_name', 'A'), ma.res_seq,
+                              r_ico.strip() if hasattr(r_ico, 'strip') else ""))
+
+        if subset_only and not matched_keys:
+            raise ValueError(
+                "subset_only=True was requested but the chosen alignment "
+                "carries no residue-level correspondence to subset by.")
+
         for model in out_struct:
             for chain in model:
                 for residue in chain:
@@ -526,6 +553,17 @@ class AlignmentResult:
                         atom.pos.z = float(new_coord[2])
                         if write_rmsd:
                             atom.b_iso = mapped_bfactor
+
+        if subset_only:
+            for model in out_struct:
+                for chain in model:
+                    for i in range(len(chain) - 1, -1, -1):
+                        res = chain[i]
+                        key = (chain.name, res.seqid.num,
+                               str(res.seqid.icode).strip())
+                        if key not in matched_keys:
+                            del chain[i]
+            out_struct.setup_entities()
         return out_struct
 
     def aligned_structure(self, color_by: str = "rmsd"):
@@ -587,14 +625,23 @@ class AlignmentResult:
         # bundle must therefore contain both. It previously shipped only the
         # aligned mobile and loaded it twice, so the side-by-side view the
         # scripts promise was impossible to reproduce.
+        #
+        # Both structures go through write_structure(), so a complex the PDB
+        # format cannot hold (chain names longer than one character) lands as
+        # mmCIF and the scripts name whatever was really written. Hard-coding
+        # "aligned.pdb" made export_bundle() raise gemmi's "chain name too
+        # long" on exactly the assemblies it is most useful for.
+        aligned_name = "aligned.pdb"
         ref_name = "reference.pdb"
         workdir = tempfile.mkdtemp(prefix="pdb_align_bundle_")
         try:
             if "aligned" in components:
-                self.aligned_structure(color_by="rmsd").write_pdb(
-                    os.path.join(workdir, "aligned.pdb"))
+                aligned_name = os.path.basename(write_structure(
+                    self.aligned_structure(color_by="rmsd"),
+                    os.path.join(workdir, aligned_name)))
             if "reference" in components:
-                self._write_reference_copy(os.path.join(workdir, ref_name))
+                ref_name = os.path.basename(
+                    self._write_reference_copy(os.path.join(workdir, ref_name)))
             if "rmsd_csv" in components:
                 self.get_rmsd_df().to_csv(os.path.join(workdir, "rmsd.csv"),
                                           index=False)
@@ -602,14 +649,19 @@ class AlignmentResult:
                 try:
                     self.plot_summary(os.path.join(workdir, "summary.png"))
                     self.plot_rmsd(filename=os.path.join(workdir, "rmsd.png"))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # A bundle missing a component it promised must say so;
+                    # silence left the caller to discover it from the zip.
+                    warnings.warn(
+                        f"export_bundle: the plots could not be written "
+                        f"({exc}); the rest of the bundle is complete.",
+                        UserWarning, stacklevel=2)
             if "pymol" in components:
                 self._write_pymol_script(os.path.join(workdir, "view.pml"),
-                                         "aligned.pdb", ref_name)
+                                         aligned_name, ref_name)
             if "chimerax" in components:
                 self._write_chimerax_script(os.path.join(workdir, "view.cxc"),
-                                            "aligned.pdb", ref_name)
+                                            aligned_name, ref_name)
             if "report" in components:
                 with open(os.path.join(workdir, "report.txt"), "w") as f:
                     f.write(self.report(fmt="text") + "\n")
@@ -629,17 +681,17 @@ class AlignmentResult:
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
-    def _write_reference_copy(self, path):
-        """Write the reference structure into a bundle as PDB.
+    def _write_reference_copy(self, path) -> str:
+        """Write the reference structure into a bundle; return the path written.
 
         Re-reading and re-writing (rather than copying bytes) normalises mmCIF
         input to the PDB the viewer scripts expect and drops anything the
-        viewers cannot use.
+        viewers cannot use. A structure the PDB format cannot hold stays mmCIF.
         """
         import gemmi
         struct = gemmi.read_structure(self.ref_file)
         struct.setup_entities()
-        struct.write_pdb(path)
+        return write_structure(struct, path)
 
     def get_log(self) -> str:
         lines = []
@@ -917,114 +969,31 @@ class AlignmentResult:
                 plt.show()
         return fig
 
-    def save_pymol_script(self, filename: str, aligned_mobile_filename: str = "aligned_mobile.pdb"):
+    def save_pymol_script(self, filename: str,
+                          aligned_mobile_filename: str = "aligned_mobile.pdb"):
+        """Write a PyMOL ``.pml`` loading the reference and the aligned mobile.
+
+        The aligned file must have been written with
+        :meth:`save_aligned_pdb`, whose B-factor column already holds the
+        per-residue deviation the script colours by. This is the same script
+        :meth:`export_bundle` ships: there used to be a second, divergent
+        implementation here that re-injected the deviations with one ``alter``
+        command per residue on a different colour scale.
         """
-        Generates a .pml script for PyMOL to easily visualize the alignment.
-        This assumes you have saved the aligned mobile structure using `save_aligned_pdb`.
-        """
-        script = f"""# PyMOL Script for visualizing alignment
-# Load structures
-load {self.ref_file}, reference
-load {aligned_mobile_filename}, mobile
-
-# Hide defaults, show cartoons
-hide everything
-show cartoon, reference
-show cartoon, mobile
-
-# Color structures
-color white, reference
-color cyan, mobile
-
-# Extract RMSD data and inject it into B-factors
-# We map RMSD to the mobile structure for visualization
-"""
-
-        # Add B-factor injection logic
-        df = self.get_rmsd_df(on="mobile")
-        if not df.empty:
-            script += "\n# Update B-factors with RMSD values for heatmapping\nalter mobile, b=0.0\n"
-            for _, row in df.iterrows():
-                try:
-                    res_parts = row["Residue"].split(":")
-                    if len(res_parts) == 2:
-                        chain = res_parts[0]
-                        res_id = res_parts[1]
-
-                        # Handle insertion codes
-                        import re
-                        match = re.match(r"(\d+)([a-zA-Z]*)", res_id)
-                        if match:
-                            res_num = match.group(1)
-                            # PyMOL alter syntax for specific residues
-                            script += f"alter mobile and chain {chain} and resi {res_num}, b={row['RMSD']:.3f}\n"
-                except Exception:
-                    pass
-
-            script += """
-# Color by B-factor (RMSD)
-spectrum b, blue_white_red, mobile, minimum=0, maximum=10
-"""
-
-        script += """
-# Center and orient
-zoom
-center
-"""
-        with open(filename, "w") as f:
-            f.write(script)
+        self._write_pymol_script(filename, aligned_mobile_filename,
+                                 os.path.basename(self.ref_file or "reference.pdb"))
         if self.verbose:
             print(f"Saved PyMOL script to {filename}")
 
-    def save_chimerax_script(self, filename: str, aligned_mobile_filename: str = "aligned_mobile.pdb"):
+    def save_chimerax_script(self, filename: str,
+                             aligned_mobile_filename: str = "aligned_mobile.pdb"):
+        """Write a ChimeraX ``.cxc`` loading the reference and aligned mobile.
+
+        The counterpart of :meth:`save_pymol_script`; see it for why both now
+        share one implementation with the bundle.
         """
-        Generates a .cxc script for ChimeraX to easily visualize the alignment.
-        This assumes you have saved the aligned mobile structure using `save_aligned_pdb`.
-        """
-        script = f"""# ChimeraX Script for visualizing alignment
-# Load structures
-open {self.ref_file}
-open {aligned_mobile_filename}
-
-# Hide atoms, show cartoon
-hide atoms
-show cartoons
-
-# Color structures
-color #1 white
-color #2 cyan
-
-# Update B-factors with RMSD values for heatmapping
-"""
-
-        df = self.get_rmsd_df(on="mobile")
-        if not df.empty:
-            for _, row in df.iterrows():
-                try:
-                    res_parts = row["Residue"].split(":")
-                    if len(res_parts) == 2:
-                        chain = res_parts[0]
-                        res_id = res_parts[1]
-                        import re
-                        match = re.match(r"(\d+)([a-zA-Z]*)", res_id)
-                        if match:
-                            res_num = match.group(1)
-                            # ChimeraX setattr syntax
-                            script += f"setattr #2/{chain}:{res_num} atoms bfactor {row['RMSD']:.3f}\n"
-                except Exception:
-                    pass
-
-            script += """
-# Color by B-factor (RMSD)
-color byattribute bfactor #2 palette blue:white:red range 0,10
-"""
-
-        script += """
-# Center and orient
-view
-"""
-        with open(filename, "w") as f:
-            f.write(script)
+        self._write_chimerax_script(filename, aligned_mobile_filename,
+                                    os.path.basename(self.ref_file or "reference.pdb"))
         if self.verbose:
             print(f"Saved ChimeraX script to {filename}")
 
@@ -1098,11 +1067,50 @@ class LoadedResult:
         return dict(self._meta)
 
     def get_rmsd_df(self, on="reference"):
+        if on != "reference":
+            raise ValueError(
+                "A saved result carries the reference-numbered per-residue "
+                f"table only, so on={on!r} cannot be served; re-run the "
+                "alignment to get the mobile numbering. (Returning the "
+                "reference table here would label every residue with the "
+                "wrong structure's numbering.)")
         return self._rmsd_df.copy()
 
     @property
     def per_chain(self):
         return self._per_chain
+
+    @property
+    def tm_pvalue(self):
+        return self._meta.get("tm_pvalue")
+
+    @property
+    def domains(self):
+        return None
+
+    @property
+    def quality(self):
+        """The saved verdict, recomputed from the saved numbers.
+
+        `report()` is shared with AlignmentResult and asks for this; without it
+        a reloaded result raised AttributeError on the one method it exists for.
+        """
+        from pdb_align.interpretation import assess
+        df = self._rmsd_df
+        s = self._meta
+        return assess(
+            tm_score=s.get("tm_score"), rmsd=s.get("rmsd"),
+            coverage_pct=s.get("coverage_pct"), n_aligned=s.get("n_aligned"),
+            per_residue=list(zip(df["Chain"], df["Residue"], df["RMSD"])),
+            chain_mapping=s.get("chain_mapping"),
+            candidate_rmsds=[s.get("rmsd")],
+            tm_pvalue=s.get("tm_pvalue"),
+            mapping_warnings=s.get("chain_mapping_warnings"),
+            tm_scope=s.get("tm_scope"),
+            tm_normalization_length=s.get("tm_normalization_length"),
+            tm_per_chain_available=bool(s.get("tm_score_per_chain")),
+            candidate_failures=s.get("candidate_failures"),
+        )
 
     # Reuse the exact rendering logic from AlignmentResult by delegation.
     report = AlignmentResult.report
@@ -1220,6 +1228,15 @@ class EnsembleResult:
         self._cluster_labels = km.fit_predict(mat)
         return self._cluster_labels
 
+    def _short_labels(self) -> List[str]:
+        """Model names for figure annotations.
+
+        ``self.labels`` holds whatever the caller passed, which is normally a
+        path; annotating a scatter with absolute paths makes the figure
+        unreadable. Tables keep the full label.
+        """
+        return [os.path.basename(str(lbl)) or str(lbl) for lbl in self.labels]
+
     def plot_pca(self, color_by: str = "cluster", save_path: Optional[str] = None):
         """
         2D PCA of per-residue RMSD vectors, one point per model.
@@ -1262,7 +1279,7 @@ class EnsembleResult:
         ax.set_xlabel(f"PC1 ({var[0]*100:.1f}%)" if len(var) > 0 else "PC1")
         ax.set_ylabel(f"PC2 ({var[1]*100:.1f}%)" if len(var) > 1 else "PC2")
         ax.set_title("Structural Ensemble PCA")
-        for i, lbl in enumerate(self.labels):
+        for i, lbl in enumerate(self._short_labels()):
             ax.annotate(lbl, (coords[i, 0], coords[i, 1]), fontsize=6, alpha=0.6,
                         ha="center", va="bottom")
         if save_path:
@@ -1277,7 +1294,8 @@ class EnsembleResult:
         mat = self._get_feature_matrix()
         Z = linkage(mat, method="ward")
         fig, ax = plt.subplots(figsize=(max(8, len(self.labels) * 0.4), 5))
-        dendrogram(Z, labels=self.labels, ax=ax, leaf_rotation=90, leaf_font_size=8)
+        dendrogram(Z, labels=self._short_labels(), ax=ax, leaf_rotation=90,
+                   leaf_font_size=8)
         ax.set_title("Structural Ensemble Dendrogram (Ward)")
         ax.set_ylabel("Distance")
         fig.tight_layout()
@@ -1854,7 +1872,10 @@ class PDBAligner:
               seq_gap_extend: float = -0.5, atoms: str = "CA",
               min_plddt: float = 0.0, min_b_factor: float = 0.0,
               hinge_threshold: float = 3.0, hinge_window: int = 15,
-              domain_min_residues: int = 30, strategy: str = "auto", **kwargs):
+              domain_min_residues: int = 30, strategy: str = "auto",
+              recycles: int = 0, keep_fraction: float = 1.0,
+              shape_nbins: int = 24, shape_gap_penalty: float = 2.0,
+              shape_band_frac: float = 0.20):
         """
         Run the alignment.
 
@@ -1873,6 +1894,23 @@ class PDBAligner:
         :param min_b_factor: B-factor floor, applied symmetrically.
         :param strategy: multi-chain superposition strategy, ``"auto"``,
             ``"global"`` or ``"local"``.
+        :param recycles: rounds of outlier rejection in the Kabsch fit. The
+            reported RMSD is then over the surviving (inlier) pairs while
+            ``n_aligned`` still counts every matched residue, so leave it at 0
+            unless a core-only RMSD is what you want.
+        :param keep_fraction: smallest fraction of pairs outlier rejection may
+            keep.
+        :param shape_nbins: distance-histogram bins of the sequence-free shape
+            descriptor.
+        :param shape_gap_penalty: gap penalty of the sequence-free shape
+            alignment.
+        :param shape_band_frac: band width (fraction of the shorter chain) the
+            sequence-free shape search is confined to.
+
+        These parameters are explicit on purpose: they used to be swallowed by
+        ``**kwargs`` and forwarded to the sequence-free path, where a typo
+        raised a ``TypeError`` that was caught and logged — so ``mode="auto"``
+        silently compared one candidate instead of two.
         :returns: an :class:`AlignmentResult`.
         :raises AlignmentFailedError: when the requested mode cannot produce an
             alignment. It never returns a result whose metrics are all ``None``.
@@ -1883,7 +1921,9 @@ class PDBAligner:
                 atoms=atoms, min_plddt=min_plddt, min_b_factor=min_b_factor,
                 hinge_threshold=hinge_threshold, hinge_window=hinge_window,
                 domain_min_residues=domain_min_residues, strategy=strategy,
-                **kwargs)
+                recycles=recycles, keep_fraction=keep_fraction,
+                shape_nbins=shape_nbins, shape_gap_penalty=shape_gap_penalty,
+                shape_band_frac=shape_band_frac)
 
         if not self.ref_file or not self.mob_file:
             raise ValueError("Both reference and mobile structures must be set "
@@ -1937,9 +1977,8 @@ class PDBAligner:
                 ref_atoms, mob_atoms = paired_atoms(ref_sel, mob_sel, pairs,
                                                     atoms=atoms)
                 si = superimpose_atoms(
-                    ref_atoms, mob_atoms,
-                    recycles=int(kwargs.get("recycles", 0)),
-                    keep_fraction=float(kwargs.get("keep_fraction", 1.0)),
+                    ref_atoms, mob_atoms, recycles=int(recycles),
+                    keep_fraction=float(keep_fraction),
                     n_total=ref_sel.n_residues)
                 if si:
                     seqguided = dict(aln=aln, ref_atoms=ref_atoms,
@@ -1964,10 +2003,13 @@ class PDBAligner:
                 seqfree = sequence_independent_alignment_joined_v2(
                     file_ref=self.ref_file, file_mob=self.mob_file,
                     method=sf_method, atoms=atoms,
-                    ref_selection=ref_sel, mob_selection=mob_sel, **kwargs)
+                    ref_selection=ref_sel, mob_selection=mob_sel,
+                    recycles=recycles, keep_fraction=keep_fraction,
+                    shape_nbins=shape_nbins,
+                    shape_gap_penalty=shape_gap_penalty,
+                    shape_band_frac=shape_band_frac)
             except Exception as exc:
-                logger.warning("Sequence-free alignment failed: %s", exc,
-                               exc_info=True)
+                logger.warning("Sequence-free alignment failed: %s", exc)
                 failures.append(f"sequence-free: {exc}")
 
         if mode in ("auto", "Auto (best RMSD)"):
@@ -2012,7 +2054,7 @@ class PDBAligner:
             ref_file=self.ref_file, mob_file=self.mob_file,
             mob_struct=self.mob_struct,
             ref_lens=dict(ref_sel.lens), mob_lens=dict(mob_sel.lens),
-            verbose=self.verbose)
+            verbose=self.verbose, candidate_failures=failures)
         result_obj.ref_selection = ref_sel
         result_obj.mob_selection = mob_sel
 

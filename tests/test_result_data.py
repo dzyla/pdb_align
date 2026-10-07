@@ -74,3 +74,32 @@ def test_loaded_result_plot_summary(result, tmp_path):
     out = tmp_path / "summary.png"
     loaded.plot_summary(filename=str(out))
     assert out.exists()
+
+
+def test_loaded_result_can_report(result, tmp_path):
+    """A saved result is documented as still being able to `report()`; it
+    raised AttributeError: 'LoadedResult' object has no attribute 'quality'
+    because the shared renderer asks for the quality verdict."""
+    p = tmp_path / "run.npz"
+    result.save(str(p))
+    from pdb_align import AlignmentResult
+    loaded = AlignmentResult.load(str(p))
+
+    text = loaded.report(fmt="text")
+
+    assert "RMSD" in text
+    assert "Quality" in text
+    assert loaded.quality.band == result.quality.band
+
+
+def test_loaded_result_refuses_the_mobile_numbering(result, tmp_path):
+    """save() stores the reference-numbered table only. Returning it for
+    on='mobile' mislabels every residue with the wrong structure's numbering,
+    so the saved view says what it cannot do."""
+    p = tmp_path / "run.npz"
+    result.save(str(p))
+    from pdb_align import AlignmentResult
+    loaded = AlignmentResult.load(str(p))
+
+    with pytest.raises(ValueError, match="mobile"):
+        loaded.get_rmsd_df(on="mobile")

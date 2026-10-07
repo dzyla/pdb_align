@@ -30,6 +30,7 @@ def _apply_opts(kwargs: dict, opts: dict) -> dict:
         seq_gap_extend=opts.get("seq_gap_extend", -0.5),
         atoms=opts.get("atoms", "CA"),
         min_plddt=opts.get("min_plddt", 0.0),
+        min_b_factor=opts.get("min_b_factor", 0.0),
     )
     return kwargs
 

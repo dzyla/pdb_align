@@ -63,3 +63,34 @@ def test_to_dict_roundtrips():
                candidate_rmsds=[0.2, 0.2])
     d = q.to_dict()
     assert d["band"] == "excellent" and "verdict" in d and "flagged_regions" in d
+
+
+def test_short_alignment_is_flagged_and_cannot_claim_high_confidence():
+    """A dozen residues superimposing at 0.3 A is arithmetic, not evidence of a
+    shared fold: TM-score's normalisation (d0 is clamped at 0.5 A) stops being
+    meaningful for very short alignments, so the number must not be reported as
+    an excellent match with high confidence."""
+    q = assess(tm_score=0.9, rmsd=0.3, coverage_pct=100.0, n_aligned=12,
+               per_residue=_uniform("A", 12, 0.3), chain_mapping=None,
+               candidate_rmsds=[0.3, 0.31])
+    assert any("12" in w for w in q.warnings), q.warnings
+    assert q.confidence != "high"
+
+
+def test_normal_length_alignment_is_not_flagged_as_short():
+    q = assess(tm_score=0.9, rmsd=0.3, coverage_pct=100.0, n_aligned=120,
+               per_residue=_uniform("A", 120, 0.3), chain_mapping=None,
+               candidate_rmsds=[0.3, 0.31])
+    assert not q.warnings
+    assert q.confidence == "high"
+
+
+def test_a_candidate_that_failed_is_warned_about_and_lowers_confidence():
+    """`mode="auto"` claims to have compared two strategies. If one could not
+    run, the agreement check behind "high confidence" never happened."""
+    q = assess(tm_score=0.9, rmsd=0.5, coverage_pct=95.0, n_aligned=95,
+               per_residue=_uniform("A", 95, 0.5), chain_mapping=None,
+               candidate_rmsds=[0.5],
+               candidate_failures=["sequence-free: needs O(N^2) memory"])
+    assert any("sequence-free" in w for w in q.warnings)
+    assert q.confidence != "high"

@@ -25,6 +25,8 @@ from __future__ import annotations
 import itertools
 import logging
 import math
+import os
+import warnings
 from dataclasses import dataclass, field
 from functools import lru_cache, wraps
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -1366,7 +1368,6 @@ def _as_structure(x: Union[str, gemmi.Structure]) -> gemmi.Structure:
 
 
 def _name_of(x: Union[str, gemmi.Structure]) -> str:
-    import os
     if isinstance(x, gemmi.Structure):
         return x.name or "structure"
     return os.path.basename(str(x))
@@ -1375,7 +1376,46 @@ def _name_of(x: Union[str, gemmi.Structure]) -> str:
 def _parse_path(path: str) -> gemmi.Structure:
     st = gemmi.read_structure(str(path))
     st.setup_entities()
+    if len(st) > 1:
+        # A multi-model file (an NMR ensemble, a multi-model prediction, MD
+        # snapshots) is compared on its first model only. Silence here means a
+        # user who handed over 20 conformers never learns that 19 were ignored.
+        warnings.warn(
+            f"{os.path.basename(str(path))} contains {len(st)} models; only "
+            f"the first is used. Split the file (or pass the models to "
+            f"align_ensemble) to compare the others.",
+            UserWarning, stacklevel=3)
     return st
+
+
+def write_structure(st: gemmi.Structure, path: str) -> str:
+    """Write *st* to *path*, returning the path actually written.
+
+    mmCIF is written for a ``.cif``/``.mmcif`` name. Otherwise the PDB format
+    is attempted and, when the structure cannot be represented in it — a chain
+    name longer than one character is the common case, and routine in large
+    assemblies and in RCSB mmCIF downloads — the same basename is written as
+    mmCIF instead and a warning names the file. Renaming the chains would be
+    worse than changing the format: every label in the per-residue table, the
+    report and the viewer scripts refers to the original names.
+    """
+    if str(path).lower().endswith((".cif", ".mmcif")):
+        st.make_mmcif_document().write_file(str(path))
+        return str(path)
+    try:
+        st.write_pdb(str(path))
+        return str(path)
+    except (RuntimeError, ValueError) as exc:
+        alt = os.path.splitext(str(path))[0] + ".cif"
+        st.make_mmcif_document().write_file(alt)
+        # gemmi can leave a partial file behind when it refuses mid-write.
+        if os.path.exists(str(path)) and str(path) != alt:
+            os.remove(str(path))
+        warnings.warn(
+            f"{os.path.basename(str(path))} could not be written in the PDB "
+            f"format ({exc}); wrote {os.path.basename(alt)} instead.",
+            UserWarning, stacklevel=2)
+        return alt
 
 
 # ---------------------------------------------------------------------------

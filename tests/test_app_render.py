@@ -38,7 +38,7 @@ with tabs[1]:
 with tabs[2]:
     S.render_per_residue(res)
 with tabs[3]:
-    S.render_export(res, is_ensemble=False)
+    S.render_export(res)
 """
 
 
@@ -56,7 +56,7 @@ best = min(ens.results, key=lambda r: r.rmsd if r.rmsd is not None else 1e9)
 st.session_state["_ref_pdb_str"] = open(REF).read()
 S.render_header(best)
 S.render_ensemble(ens)
-S.render_export(ens, is_ensemble=True)
+S.render_export(ens)
 """
 
 

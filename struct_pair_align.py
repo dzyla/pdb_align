@@ -73,7 +73,15 @@ with st.sidebar:
             seq_gap_open=st.slider("Gap open", -20, -1, -10),
             seq_gap_extend=st.slider("Gap extend", -20.0, -0.1, -0.5, 0.1),
             atoms=st.selectbox("Atoms", ["CA", "backbone", "all_heavy"]),
-            min_plddt=st.number_input("Min pLDDT", 0.0, 100.0, 0.0),
+            min_plddt=st.number_input(
+                "Min pLDDT", 0.0, 100.0, 0.0,
+                help="Confidence floor; applied only to a structure whose "
+                     "B-factor column looks like pLDDT."),
+            min_b_factor=st.number_input(
+                "Min B-factor", 0.0, 1000.0, 0.0,
+                help="Ca B-factor floor, applied to both structures. Use this "
+                     "for experimental models, where a low B-factor means "
+                     "well ordered."),
         )
     run = st.button("🚀 Run", use_container_width=True)
 
@@ -146,7 +154,7 @@ if kind == "ensemble":
         with tabs[4]:
             S.render_evaluation(evaluation)
     with tabs[-1]:
-        S.render_export(obj, is_ensemble=True)
+        S.render_export(obj)
 else:
     S.render_header(obj)
     names = ["Overview", "3D", "Per-residue"]
@@ -163,4 +171,4 @@ else:
         with tabs[3]:
             S.render_evaluation(evaluation)
     with tabs[-1]:
-        S.render_export(obj, is_ensemble=False)
+        S.render_export(obj)

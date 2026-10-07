@@ -140,3 +140,51 @@ def test_no_junction_warning_when_both_sides_are_multi_chain():
         warnings.simplefilter("error", UserWarning)
         res = pdb_align.align("tests/data/4hhb_bb.pdb", "tests/data/4hhb_bb.pdb")
     assert res.strategy in ("global", "local")
+
+
+def test_auto_reports_a_candidate_it_could_not_compute(monkeypatch):
+    """`mode="auto"` compares two strategies and keeps the better one. When one
+    of them cannot run, the result must say so: silence left the report, the
+    JSON and the quality verdict describing a two-candidate comparison that
+    never happened.
+    """
+    from pdb_align import core
+    monkeypatch.setattr(core, "MAX_SEQFREE_RESIDUES", 5)
+
+    res = pdb_align.align(UBQ, CRN)
+
+    failures = res.summary_stats()["candidate_failures"]
+    assert any("sequence-free" in f for f in failures), failures
+    assert "sequence-free" in res.report(fmt="text")
+    assert any("sequence-free" in w for w in res.quality.warnings)
+
+
+def test_unknown_align_keyword_raises_instead_of_dropping_a_strategy():
+    """A mistyped keyword was forwarded to the sequence-free path, raised a
+    TypeError there, and was caught and logged — so `mode="auto"` quietly
+    compared one candidate instead of two and still called itself auto."""
+    al = PDBAligner()
+    al.add_reference(UBQ)
+    al.add_mobile(CRN)
+    with pytest.raises(TypeError, match="recycle"):
+        al.align(mode="auto", recycle=5)
+
+
+def test_multi_model_file_warns_that_only_the_first_model_is_used(tmp_path):
+    """An NMR ensemble or a multi-model prediction is compared on model 1. A
+    user who hands over 20 conformers must not silently get one."""
+    lines = [ln for ln in open(UBQ) if ln.startswith(("ATOM", "TER"))]
+
+    def shifted(ln, dx):
+        if not ln.startswith("ATOM"):
+            return ln
+        return ln[:30] + f"{float(ln[30:38]) + dx:8.3f}" + ln[38:]
+
+    two = tmp_path / "two_models.pdb"
+    two.write_text("".join(["MODEL        1\n"] + lines + ["ENDMDL\n",
+                                                           "MODEL        2\n"]
+                           + [shifted(ln, 30.0) for ln in lines]
+                           + ["ENDMDL\n", "END\n"]))
+
+    with pytest.warns(UserWarning, match="2 models"):
+        pdb_align.align(str(two), UBQ)

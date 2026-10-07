@@ -19,6 +19,10 @@ RMSD_FLAG_ABS = 2.0
 RMSD_FLAG_REL = 2.0
 LOW_COVERAGE = 50.0
 CANDIDATE_DISAGREE = 1.0
+# Below this many matched residues the fold-similarity numbers stop carrying
+# their usual meaning: TM-score's d0 is clamped at 0.5 A for short chains, and
+# a handful of residues superimpose well by arithmetic rather than by homology.
+SHORT_ALIGNMENT = 30
 
 
 @dataclass
@@ -113,7 +117,8 @@ def _flag_deviation_regions(per_residue) -> List[FlaggedRegion]:
     return regions
 
 
-def _confidence(coverage_pct, tm_pvalue, candidate_rmsds) -> str:
+def _confidence(coverage_pct, tm_pvalue, candidate_rmsds, n_aligned=None,
+                candidate_failures=None) -> str:
     score = 2  # start "high"
     if coverage_pct is not None and coverage_pct < LOW_COVERAGE:
         score -= 1
@@ -121,6 +126,12 @@ def _confidence(coverage_pct, tm_pvalue, candidate_rmsds) -> str:
     if len(rs) >= 2 and (max(rs) - min(rs)) > CANDIDATE_DISAGREE:
         score -= 1
     if tm_pvalue is not None and tm_pvalue > 0.05:
+        score -= 1
+    if n_aligned is not None and n_aligned < SHORT_ALIGNMENT:
+        score -= 1
+    # "High" rests in part on two independent strategies agreeing. If one of
+    # them could not run, that check never happened and must not be implied.
+    if candidate_failures:
         score -= 1
     return {2: "high", 1: "medium"}.get(max(score, 0), "low")
 
@@ -147,14 +158,16 @@ def assess(*, tm_score, rmsd, coverage_pct, n_aligned, per_residue,
            chain_mapping, candidate_rmsds, hinge_regions=None,
            tm_pvalue=None, mapping_warnings=None,
            tm_scope=None, tm_normalization_length=None,
-           tm_per_chain_available=False) -> AlignmentQuality:
+           tm_per_chain_available=False,
+           candidate_failures=None) -> AlignmentQuality:
     """Turn raw alignment numbers into a plain-language quality assessment.
 
     ``per_residue`` is a list of ``(chain, residue_label, rmsd)`` tuples;
     ``candidate_rmsds`` a list of the seq-guided/seq-free RMSDs (may hold None);
     ``hinge_regions`` an optional list of ``(chain, start_label, end_label)``;
     ``mapping_warnings`` the notes the chain-matching step produced, which
-    belong in the verdict a user reads rather than only in the warning stream.
+    belong in the verdict a user reads rather than only in the warning stream;
+    ``candidate_failures`` the strategies that could not be computed at all.
     """
     band = _band(tm_score, rmsd)
     regions = _flag_deviation_regions(per_residue)
@@ -168,6 +181,14 @@ def assess(*, tm_score, rmsd, coverage_pct, n_aligned, per_residue,
         warnings.append(f"Low coverage: only {coverage_pct:.0f}% of residues aligned.")
     if tm_score is None:
         warnings.append("TM-score unavailable; quality band derived from RMSD.")
+    if n_aligned is not None and n_aligned < SHORT_ALIGNMENT:
+        warnings.append(
+            f"Only {n_aligned} residues matched: below ~{SHORT_ALIGNMENT} "
+            f"residues TM-score and the quality band are not meaningful "
+            f"measures of fold similarity.")
+    for failed in (candidate_failures or []):
+        warnings.append(f"A candidate strategy could not be computed ({failed}), "
+                        f"so this result rests on one strategy only.")
     if chain_mapping is not None and len(chain_mapping) == 1:
         warnings.append("Only one chain pair aligned; multi-chain agreement not assessed.")
     if tm_scope == "complex":
@@ -182,7 +203,9 @@ def assess(*, tm_score, rmsd, coverage_pct, n_aligned, per_residue,
             f"{hint}")
     for msg in (mapping_warnings or []):
         warnings.append(msg)
-    confidence = _confidence(coverage_pct, tm_pvalue, candidate_rmsds)
+    confidence = _confidence(coverage_pct, tm_pvalue, candidate_rmsds,
+                             n_aligned=n_aligned,
+                             candidate_failures=candidate_failures)
     # A correspondence that sequence cannot support undermines every number
     # derived from it, so it caps confidence regardless of how good the fit is.
     if any(m.startswith("Chain correspondence rests") for m in (mapping_warnings or [])):
