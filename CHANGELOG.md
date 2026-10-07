@@ -4,6 +4,96 @@ All notable changes to this project are documented here. Versions follow
 [semantic versioning](https://semver.org/); entries that change a reported
 number are marked **[affects results]**.
 
+## [0.4.1] — 2026-10-07
+
+A follow-up to the 0.4.0 audit: the paths that silently did the wrong thing,
+or nothing at all. One change affects a reported number (DockQ on near-
+identical chain copies); the rest make failures visible or unblock exports
+that used to crash.
+
+### Fixed — chain correspondence for DockQ **[affects results]**
+
+- **Interchangeable chains were found by exact sequence equality.** Copies of
+  one chain in a deposited structure almost always differ by a disordered
+  terminus or loop, so the fnat-maximizing permutation search added in 0.4.0
+  switched itself off on precisely the structures it exists for. On 4HHB,
+  removing three modelled residues from one α chain dropped the candidate
+  mappings from four to two and lost the α/α swap. Two chains now count as
+  copies at ≥95% identity over the shorter chain with a length ratio ≥0.9;
+  the length guard keeps a short fragment out of the class of a long chain it
+  matches perfectly over its own length. Agreement with the official `DockQ`
+  package is unchanged (`tests/test_golden_crossvalidation.py`).
+
+### Fixed — exports
+
+- **Every PDB export died on chain names longer than one character** — raw
+  `RuntimeError: chain name too long for the PDB format` out of
+  `save_aligned_pdb()`, `export_bundle()` and the CLI's `-o`, on exactly the
+  large assemblies and RCSB mmCIF downloads they are most useful for. Such a
+  structure is now written as mmCIF under the same basename, with a warning;
+  `save_aligned_pdb()` returns the path actually written, and the bundle's
+  PyMOL/ChimeraX scripts name the files it really contains.
+- **`save_aligned_pdb(subset_only=True)` was accepted and ignored**, writing
+  the whole mobile structure. It now writes only the residues that were
+  matched.
+- **`export_bundle()` swallowed a plot failure silently**, shipping an archive
+  missing the figures it promised. It warns.
+- **One implementation of the viewer scripts.** `save_pymol_script()` /
+  `save_chimerax_script()` were a second, untested pair that had drifted from
+  the ones the bundle ships: a different colour scale, and one `alter` command
+  per residue re-injecting a B-factor column the aligned file already carries.
+  They now delegate to the bundle's writers.
+
+### Fixed — silent degradation
+
+- **`mode="auto"` could compare one candidate and still call itself auto.** A
+  sequence-free failure was logged and forgotten; the report, the JSON and the
+  quality verdict all described a two-strategy comparison that never happened.
+  The reasons are now carried as `summary_stats()["candidate_failures"]`,
+  printed in the report, added to `quality.warnings`, and they cap confidence.
+- **A mistyped keyword silently disabled the sequence-free path.**
+  `align(**kwargs)` forwarded everything, so `align(recycle=5)` raised a
+  `TypeError` inside that path, which was caught and logged. `align()` now
+  declares `recycles`, `keep_fraction`, `shape_nbins`, `shape_gap_penalty` and
+  `shape_band_frac` explicitly, and an unknown keyword raises.
+- **A multi-model file was truncated to model 1 in silence.** An NMR ensemble,
+  a multi-model prediction or MD snapshots now raise a `UserWarning` naming
+  the model count.
+- **`LoadedResult.get_rmsd_df(on="mobile")` ignored `on`** and returned the
+  reference-numbered table, labelling every residue with the wrong structure's
+  numbering. It raises and explains instead.
+
+### Fixed — other
+
+- **`LoadedResult.report()` raised `AttributeError`** — the one method a saved
+  result exists for. It now carries the quality verdict, recomputed from the
+  saved numbers.
+- Ensemble figures labelled every point with the full model path; they use the
+  model name (the tables keep the path).
+- The example notebook imported `pdb_align.structure`, a module that has not
+  existed for several releases, and died on its first cell. A test now checks
+  every module the notebook imports.
+- `pdb_align/aligner.py.bak`, a stale 37 KB copy, was tracked inside the
+  package directory. Removed.
+- Dead parameters removed (`_joint_mapping_options(model_struct)`,
+  `_mapping_permutations` in full — it had no callers,
+  `render_export(is_ensemble)`).
+
+### Added
+
+- **`--min-b-factor`** on the CLI and a **Min B-factor** input in the app. The
+  library has filtered on B-factors since 0.4.0 and the pLDDT warning tells
+  users to use it, but neither front end exposed it.
+- **`--export-bundle FILE.zip`** on the CLI: the reproducible bundle that was
+  previously API- and GUI-only.
+- `--mode` and `--atoms` validate their values (`--mode seqguided` was reaching
+  the aligner and coming back as "produced no alignment. unknown mode"), and
+  `-v` prints a traceback on failure instead of one opaque line.
+- The quality layer warns below 30 matched residues, where TM-score's d0 is
+  clamped and the band stops meaning what it says, and caps confidence there.
+- README figures: app screenshots, the summary and per-residue plots, and the
+  ensemble PCA, all generated by the code they document.
+
 ## [0.4.0] — 2026-10-05
 
 A correctness and maturity release. Several fixes change numbers that earlier

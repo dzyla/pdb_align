@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdb_align"
-version = "0.4.0"
+version = "0.4.1"
 description = "Protein structure alignment and prediction-model assessment (TM-score, lDDT, GDT, DockQ, epitope metrics, pDockQ)."
 readme = "README.md"
 requires-python = ">=3.10"

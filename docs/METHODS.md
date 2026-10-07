@@ -37,6 +37,10 @@ Selection rules:
   ranges (`"A:10-150"`). A named chain that is absent, or a range that selects
   nothing, raises — it never silently compares something else.
 - **Alternate conformations**: the first altloc of each atom name wins.
+- **Multi-model files**: the first model is used (an NMR ensemble, a
+  multi-model prediction, MD snapshots). A file carrying more than one model
+  raises a `UserWarning` naming the count — compare the others by splitting
+  the file, or hand them to `align_ensemble()`.
 
 ### B-factor and pLDDT filters
 
@@ -111,6 +115,13 @@ one that superimposes the whole protein well; at equal coverage it reduces to
 preferring the lower RMSD. The chosen method and the reason are on the result
 (`.method`, `.reason`) and in the report. The same formula picks between the
 global and local multi-chain superpositions.
+
+If one of the two candidates cannot be computed at all — the sequence-free
+path refuses a selection above `MAX_SEQFREE_RESIDUES` (20000), say — the run
+continues on the other, and says so: the reason is carried on the result as
+`summary_stats()["candidate_failures"]`, printed in the report and added to
+`quality.warnings`, and it caps the confidence, because the agreement between
+two independent strategies is part of what "high confidence" means here.
 
 ---
 
@@ -296,7 +307,15 @@ reference — there is then no native interface to score.
 
 **Symmetric chains.** The mapping that is correct for DockQ is the one that
 best reproduces the native interface contacts, so candidate mappings are
-enumerated over sequence-identical chains and ranked by fnat. The enumeration
+enumerated over interchangeable chains and ranked by fnat. Two reference
+chains count as interchangeable copies at **≥ 95 % identity over the shorter
+chain and a length ratio ≥ 0.9**, not at byte-identical sequences: copies of
+one chain in a deposited structure almost always differ by a disordered
+terminus or loop, and requiring equality switched the search off on exactly
+those structures (on 4HHB, dropping three modelled residues from one α chain
+took the candidate mappings from four to two and lost the α/α swap). The
+length guard is what keeps a short fragment out of the class of a long chain
+it happens to match perfectly over its own length. The enumeration
 spans **both groups at once**: when the same sequence appears on the receptor
 and the ligand side — a dimer of heterodimers, an antibody against a
 homodimeric antigen — the ambiguity is about which copy belongs to which
@@ -402,9 +421,12 @@ reviewable in one place.
 
 Bands come from TM-score when available (> 0.9 / > 0.5 / > 0.3), else RMSD
 (< 1 / < 2.5 / < 5 Å). Confidence starts high and drops for coverage below
-50%, for the two candidate strategies disagreeing by more than 1 Å, and for a
-TM-score p-value above 0.05; a chain correspondence resting on chance-level
-identity forces it to low.
+50%, for the two candidate strategies disagreeing by more than 1 Å, for a
+TM-score p-value above 0.05, for fewer than 30 matched residues
+(`SHORT_ALIGNMENT`: below that, TM-score's d0 is clamped and a handful of
+residues superimpose well by arithmetic rather than by homology), and for a
+candidate strategy that could not be computed at all; a chain correspondence
+resting on chance-level identity forces it to low.
 
 Regions are flagged where the per-residue deviation exceeds
 `max(2 Å, 2 × median)` in a contiguous run, broken at chain boundaries.
@@ -416,7 +438,11 @@ Regions are flagged where the per-residue deviation exceeds
 - `AlignmentResult.export_bundle()` writes the aligned structure, the
   reference, the per-residue CSV, both plots, ready-to-run PyMOL (`.pml`) and
   ChimeraX (`.cxc`) scripts, and the report in text and JSON — everything
-  needed to reproduce a figure.
+  needed to reproduce a figure. A structure the PDB format cannot represent
+  (a chain name longer than one character, routine in large assemblies and in
+  RCSB mmCIF downloads) is written as mmCIF instead, with a warning, and the
+  viewer scripts name the files actually written: renaming the chains would
+  desynchronise every label in the report and the per-residue table.
 - `AlignmentResult.save()` / `.load()` round-trip through a versioned `.npz`
   that carries no gemmi dependency, so a saved result can be re-reported and
   re-plotted later without the original files.

@@ -19,8 +19,10 @@ dist/
 *.zip
 *.npz
 
-# Notebooks and scratch output
+# Notebooks and scratch output. The plot names are anchored to the repo root:
+# that is where a CLI run drops them, and an unanchored pattern also hid
+# docs/images/summary.png from the README.
 *.ipynb
-rmsd.png
-summary.png
+/rmsd.png
+/summary.png
 .superpowers/
